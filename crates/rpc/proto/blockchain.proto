@@ -1,0 +1,74 @@
+syntax = "proto3";
+package blockchain;
+
+message BlockHeader {
+  uint64 timestamp = 1;
+  string prev_block_hash = 2;
+  string block_hash = 3;
+  string merkle_root = 4;
+  uint64 height = 5;
+  string public = 6;
+  string params = 7;
+  uint64 gas_limit = 8;
+}
+
+message Block {
+  BlockHeader header = 1;
+  repeated Transaction transactions = 2;
+}
+
+message Transaction {
+  string hash = 1;
+  string address = 2;
+  string receiver = 3;
+  uint64 gas = 4;
+  uint64 nonce = 5;
+  string event = 6;
+  string opt = 7;
+  string state = 8;
+  string data = 9;
+  uint64 expire = 10;
+  uint64 timestamp = 11;
+  string public = 12;
+  string signature = 13;
+  uint64 height = 14;
+  string block_hash = 15;
+  uint64 index = 16;
+}
+
+message GetBlockReq {
+  uint64 number = 1;
+  string hash = 2;
+  bool full = 3;
+}
+
+message GetBlockResp {
+  uint64 timestamp = 1;
+  Block body = 2;
+}
+
+message GetTransactionReq {
+  string hash = 1;
+}
+
+message GetTransactionResp {
+  Transaction body = 2;
+}
+
+message SendTransactionReq {
+  string type = 1;
+  string receiver = 2;
+  string key = 3;
+  string value = 4;
+}
+
+message SendTransactionResp {
+  string tx_hash = 1;
+}
+
+service BlockchainService {
+  rpc GetBlockByHash(GetBlockReq) returns (GetBlockResp);
+  rpc GetBlockByNumber(GetBlockReq) returns (GetBlockResp);
+  rpc GetTransactionByHash(GetTransactionReq) returns (GetTransactionResp);
+  rpc SendTransaction(SendTransactionReq) returns (SendTransactionResp);
+}

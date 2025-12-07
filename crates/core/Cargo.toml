@@ -1,0 +1,22 @@
+[package]
+name = "norn-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+rs_merkle = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+dashmap = "5.5" # No workspace for this
+moka = { workspace = true }
+norn-common = { workspace = true }
+norn-crypto = { workspace = true }
+norn-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+num-bigint = { workspace = true }
+async-trait = { workspace = true }

@@ -1,0 +1,12 @@
+[package]
+name = "norn-storage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rocksdb = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+norn-common = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "norn-node"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+norn-common = { workspace = true }
+norn-core = { workspace = true }
+norn-network = { workspace = true }
+norn-storage = { workspace = true }
+norn-rpc = { workspace = true }
+libp2p = { workspace = true }
+serde = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "norn-crypto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+k256 = { workspace = true }
+p256 = { workspace = true }
+rand_core = { workspace = true }
+num-bigint = { workspace = true }
+num-traits = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }

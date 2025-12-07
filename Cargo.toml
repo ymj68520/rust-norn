@@ -1,0 +1,68 @@
+[workspace]
+resolver = "2"
+members = [
+    "bin/norn",
+    "crates/*",
+]
+
+[workspace.dependencies]
+# Async Runtime & Utilities
+tokio = { version = "1.36", features = ["full"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+
+# Web Framework (Replacing Gin)
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+
+# RPC & Serialization (Replacing gRPC/Protobuf/Karmem)
+tonic = "0.11"
+prost = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# P2P Networking (Replacing go-libp2p)
+libp2p = { version = "0.53", features = ["tokio", "gossipsub", "kad", "macros", "noise", "tcp", "yamux", "dns", "identify", "ping"] }
+
+# Database (Replacing GoLevelDB)
+rocksdb = { version = "0.21", features = ["snappy", "lz4"] }
+
+# Logging & Tracing (Replacing Logrus)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Cryptography (Replacing x/crypto)
+k256 = { version = "0.13", features = ["ecdsa", "serde"] } # ECDSA secp256k1
+p256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
+rand_core = { version = "0.6", features = ["std"] }
+num-bigint = { version = "0.4", features = ["rand"] }
+num-traits = "0.2"
+sha2 = "0.10"
+schnorrkel = "0.10" # VRF (Ristretto255), popular in Rust implementations
+rand = "0.8"
+hex = "0.4"
+bs58 = "0.5" # Base58 for addressing commonly used in libp2p
+
+# Metrics (Replacing prometheus/client_golang)
+prometheus = { version = "0.13", features = ["process"] }
+
+# Utilities
+config = "0.13" # Replacing gookit/config
+clap = { version = "4.4", features = ["derive", "env"] } # CLI parsing
+anyhow = "1.0" # Error handling
+thiserror = "1.0"
+chrono = { version = "0.4", features = ["serde"] } # Time
+moka = { version = "0.12", features = ["future"] } # High performance cache (replacing golang-lru)
+rs_merkle = { version = "1.4" }
+
+# Internal crate dependencies
+norn-common = { path = "crates/common" }
+norn-crypto = { path = "crates/crypto" }
+norn-storage = { path = "crates/storage" }
+norn-core = { path = "crates/core" }
+norn-network = { path = "crates/network" }
+norn-rpc = { path = "crates/rpc" }
+norn-node = { path = "crates/node" }

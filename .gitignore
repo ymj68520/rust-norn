@@ -1,0 +1,47 @@
+# Compiled executables and object files
+target/
+
+# IDE-specific files
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Operating System files
+.directory
+
+# Rust-specific
+**/*.rs.bk
+*.profraw
+*.profdata
+*.gcno
+*.gcda
+*.gcov
+*.d
+
+# Windows specific
+*.exe
+*.pdb
+
+# Dependencies for bindgen (if they are generated in the project dir)
+# For libclang/zstd-sys error, these might be present
+# target/debug/build/*/out/
+
+# Log files
+*.log
+
+# Temp files
+*.tmp
+
+# Configuration files that might contain sensitive data or be user-specific
+config.toml
+
+# Data directory (Database, keys, etc.)
+data/
+
+# Key files (Private keys should NEVER be committed)
+*.key
+*.pem
+*.der
+*.p8
