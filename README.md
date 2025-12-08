@@ -1,4 +1,4 @@
-# go-norn-rs: A Norn Blockchain Node in Rust
+# rust-norn: A Norn Blockchain Node in Rust
 
 This repository contains a Rust port of the `go-norn` blockchain node, aiming to replicate its Proof of Verifiable Function (PoVF) consensus mechanism and core functionalities in a robust, performant, and idiomatic Rust environment.
 
