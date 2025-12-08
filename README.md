@@ -43,12 +43,12 @@ You can start the node using the generated executable. A `config.toml` is expect
 1.  **Generate a default `config.toml` (example):**
     You'll need a `config.toml`. An example might look like this (create this file in the `go-norn-rs` root):
     ```toml
-    data_dir = "data" # Where node data (DB, keypair) will be stored
-   # gRPC 服务监听地址，用于接收客户端（如 grpcurl）的请求
-   rpc_address = "127.0.0.1:50051"
-   [core]
-   # 核心配置部分，根据文档说明，在实际运行中可能需要共识密钥。
-   # 但对于初始本地测试，通常配合 data_dir 自动生成的密钥即可。
+ 	   data_dir = "data" # Where node data (DB, keypair) will be stored
+ 	  # gRPC 服务监听地址，用于接收客户端（如 grpcurl）的请求
+ 	  rpc_address = "127.0.0.1:50051"
+ 	  [core]
+ 	  # 核心配置部分，根据文档说明，在实际运行中可能需要共识密钥。
+ 	  # 但对于初始本地测试，通常配合 data_dir 自动生成的密钥即可。
 	   [core.consensus]
        # 这里预填了一组测试用的 dummy keys (格式为 Hex 字符串)
        # 公钥通常是 66 字符 (33字节压缩格式)
@@ -56,20 +56,19 @@ You can start the node using the generated executable. A `config.toml` is expect
        # 私钥通常是 64 字符 (32字节)
        prv_key = "0000000000000000000000000000000000000000000000000000000000000001"
 
-   [network]
-   # P2P 网络监听地址
-   # "/ip4/0.0.0.0/tcp/0" 表示监听所有接口，并随机选择一个可用端口
-   # 如果你想固定端口（方便手动连接），可以将 0 改为具体的端口号，例如 4001
-   listen_address = "/ip4/0.0.0.0/tcp/0"
+	   [network]
+ 	  	# P2P 网络监听地址
+ 	  	# "/ip4/0.0.0.0/tcp/0" 表示监听所有接口，并随机选择一个可用端口
+	  	 # 如果你想固定端口（方便手动连接），可以将 0 改为具体的端口号，例如 4001
+	   	listen_address = "/ip4/0.0.0.0/tcp/0"
 
-   # 引导节点列表
-   # 本地单节点运行时可以为空
-   bootstrap_peers = []
+	   # 引导节点列表
+	   # 本地单节点运行时可以为空
+	   bootstrap_peers = []
    
-   # 是否开启 mDNS 本地节点发现
-   # 本地局域网测试建议开启，可以自动发现局域网内的其他节点
-   mdns = true
-
+ 	  # 是否开启 mDNS 本地节点发现
+	   # 本地局域网测试建议开启，可以自动发现局域网内的其他节点
+	   mdns = true
     ```
     _Note_: The `CoreConfig` structure will also require details for `consensus.pub_key` and `consensus.prv_key` in a real scenario. For initial testing, you might need to fill these or generate a dummy.
 
