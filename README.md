@@ -4,7 +4,7 @@ This repository contains a Rust port of the `go-norn` blockchain node, aiming to
 
 ## Project Overview
 
-`go-norn-rs` is a blockchain node re-implemented in Rust. It features a modular architecture, leveraging Rust's type safety and concurrency primitives. Key components include:
+`rust-norn` is a blockchain node re-implemented in Rust. It features a modular architecture, leveraging Rust's type safety and concurrency primitives. Key components include:
 
 *   **`norn-common`**: Shared data structures, types, and utility functions.
 *   **`norn-crypto`**: Cryptographic primitives, including custom P-256 VRF and ECDSA.
