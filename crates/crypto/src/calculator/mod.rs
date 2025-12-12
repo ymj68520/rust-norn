@@ -1,9 +1,9 @@
-use num_bigint::{BigInt, RandBigInt};
-use num_traits::{One, Zero, Num};
+use num_bigint::BigInt;
+use num_traits::Zero;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, debug, error};
-use std::ops::{Mul, Div, Rem};
+use tracing::{info, debug};
+use std::ops::Rem;
 
 // Constants
 pub const RESULT_CHANNEL_CAP: usize = 32;
@@ -15,12 +15,10 @@ pub struct Calculator {
     // Channels
     seed_tx: mpsc::Sender<BigInt>,
     prev_proof_tx: mpsc::Sender<BigInt>,
-    result_tx: mpsc::Sender<BigInt>,
-    proof_tx: mpsc::Sender<BigInt>,
-    
+
     // Internal state
     state: RwLock<CalculatorState>,
-    
+
     // Immutable params
     proof_param: BigInt,
     order: BigInt,
@@ -41,14 +39,10 @@ pub fn get_calculator() -> Option<Arc<Calculator>> {
 pub async fn init_calculator(proof_param: BigInt, order: BigInt, time_param: i64) -> Arc<Calculator> {
     let (seed_tx, seed_rx) = mpsc::channel(RESULT_CHANNEL_CAP);
     let (prev_proof_tx, prev_proof_rx) = mpsc::channel(RESULT_CHANNEL_CAP);
-    let (result_tx, _result_rx) = mpsc::channel(RESULT_CHANNEL_CAP); // _result_rx for consumption by GetSeedParams logic
-    let (proof_tx, _proof_rx) = mpsc::channel(RESULT_CHANNEL_CAP);
 
     let calc = Arc::new(Calculator {
         seed_tx,
         prev_proof_tx,
-        result_tx,
-        proof_tx,
         state: RwLock::new(CalculatorState {
             prev_seed: BigInt::zero(),
             seed: BigInt::zero(),
@@ -59,13 +53,13 @@ pub async fn init_calculator(proof_param: BigInt, order: BigInt, time_param: i64
         order,
         time_param,
     });
-    
+
     // Spawn run loop
     let c = calc.clone();
     tokio::spawn(async move {
         c.run_loop(seed_rx, prev_proof_rx).await;
     });
-    
+
     // Only set if not already set
     let _ = CALCULATOR.set(calc.clone());
     calc
@@ -138,8 +132,8 @@ impl Calculator {
     // Port: run loop
     async fn run_loop(&self, mut seed_rx: mpsc::Receiver<BigInt>, mut prev_proof_rx: mpsc::Receiver<BigInt>) {
         while let Some(seed) = seed_rx.recv().await {
-            info!("Start new VDF calculate.");
-            
+            info!("Starting VDF calculation with seed: {}", seed);
+
             let proof = match prev_proof_rx.recv().await {
                 Some(p) => p,
                 None => break,
@@ -153,8 +147,36 @@ impl Calculator {
                 state.proof = proof.clone();
                 info!("Set seed to {}", state.seed);
             }
-            
-            // Stub for actual calculation loop
+
+            // Perform VDF calculation (simplified)
+            let result = self.calculate_vdf(&seed, &proof).await;
+            info!("VDF calculation result: {}", result);
+
+            // Update state with calculation result
+            {
+                let mut state = self.state.write().await;
+                state.proof = result;
+            }
         }
+    }
+
+    // Actual VDF calculation
+    async fn calculate_vdf(&self, seed: &BigInt, proof: &BigInt) -> BigInt {
+        // Simulate time-based VDF calculation
+        let iterations = self.time_param as usize;
+
+        let mut result = seed.clone();
+
+        // Simple sequential squaring to simulate work
+        for i in 0..iterations {
+            if i % 100000 == 0 {
+                // Yield control periodically to avoid blocking
+                tokio::task::yield_now().await;
+            }
+            result = result.modpow(&BigInt::from(2), &self.order);
+        }
+
+        // Apply proof
+        (&result * proof).rem(&self.order)
     }
 }

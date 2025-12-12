@@ -9,6 +9,7 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 norn-common = { workspace = true }
 norn-core = { workspace = true }
+norn-crypto = { workspace = true }
 norn-network = { workspace = true }
 norn-storage = { workspace = true }
 norn-rpc = { workspace = true }

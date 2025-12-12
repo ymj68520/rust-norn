@@ -2,7 +2,6 @@ use p256::ecdsa::{SigningKey, VerifyingKey, Signature, signature::Signer};
 use p256::ecdsa::signature::Verifier;
 use rand_core::OsRng;
 use thiserror::Error;
-use std::str::FromStr;
 
 #[derive(Error, Debug)]
 pub enum EcdsaError {

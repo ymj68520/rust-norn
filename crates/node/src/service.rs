@@ -1,7 +1,6 @@
 use anyhow::Result;
 use norn_core::blockchain::Blockchain;
 use norn_core::txpool::TxPool;
-use norn_core::data_processor::DataProcessor;
 use norn_network::NetworkService;
 use norn_storage::RocksDB;
 use norn_common::types::Block;
@@ -58,7 +57,7 @@ impl NornNode {
         let rx = std::mem::replace(&mut network_svc.event_rx, tokio::sync::mpsc::channel(1).1); // Dummy channel replace
         let network = Arc::new(network_svc);
         
-        let peer_manager = Arc::new(PeerManager::new(blockchain.clone(), network.clone()));
+        let peer_manager = Arc::new(PeerManager::new(blockchain.clone(), tx_pool.clone(), network.clone()));
         let syncer = Arc::new(BlockSyncer::new(blockchain.clone(), network.clone()));
         let tx_handler = Arc::new(TxHandler::new(tx_pool.clone()));
         

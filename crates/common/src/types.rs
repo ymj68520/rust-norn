@@ -1,6 +1,5 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
-use std::str::FromStr;
 
 pub const HASH_LENGTH: usize = 32;
 pub const ADDRESS_LENGTH: usize = 20;
