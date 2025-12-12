@@ -45,3 +45,7 @@ data/
 *.pem
 *.der
 *.p8
+/CHANGELOG.md
+/nul
+/.claude/settings.local.json
+/TESTING_REPORT.md
