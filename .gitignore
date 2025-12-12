@@ -1,5 +1,6 @@
 # Compiled executables and object files
 target/
+data/
 
 # IDE-specific files
 .idea/
