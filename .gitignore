@@ -50,3 +50,20 @@ data/
 /nul
 /.claude/settings.local.json
 /TESTING_REPORT.md
+
+# Test files and directories
+test_client/
+tests/
+mock_persistence_test/
+
+# Test reports and outputs
+*test_report*.md
+*test*.log
+*test*.dat
+*test*.out
+
+# Documentation
+docs/
+*.md
+!README.md
+!CLAUDE.md

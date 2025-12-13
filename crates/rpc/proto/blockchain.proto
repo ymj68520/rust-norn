@@ -55,6 +55,20 @@ message GetTransactionResp {
   Transaction body = 2;
 }
 
+message BlockNumberResp {
+  uint64 number = 1;
+}
+
+message Empty {}
+
+message ReadContractAddressReq {
+  string address = 1;
+}
+
+message ReadContractAddressResp {
+  string value = 1;
+}
+
 message SendTransactionReq {
   string type = 1;
   string receiver = 2;
@@ -66,9 +80,22 @@ message SendTransactionResp {
   string tx_hash = 1;
 }
 
+message SendTransactionWithDataReq {
+  Transaction transaction = 1;
+}
+
+message SendTransactionWithDataResp {
+  string tx_hash = 1;
+}
+
 service BlockchainService {
+  rpc GetBlockNumber(Empty) returns (BlockNumberResp);
   rpc GetBlockByHash(GetBlockReq) returns (GetBlockResp);
   rpc GetBlockByNumber(GetBlockReq) returns (GetBlockResp);
   rpc GetTransactionByHash(GetTransactionReq) returns (GetTransactionResp);
+  rpc GetTransactionByBlockHashAndIndex(GetTransactionReq) returns (GetTransactionResp);
+  rpc GetTransactionByBlockNumberAndIndex(GetTransactionReq) returns (GetTransactionResp);
+  rpc ReadContractAddress(ReadContractAddressReq) returns (ReadContractAddressResp);
   rpc SendTransaction(SendTransactionReq) returns (SendTransactionResp);
+  rpc SendTransactionWithData(SendTransactionWithDataReq) returns (SendTransactionWithDataResp);
 }

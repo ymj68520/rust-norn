@@ -4,6 +4,7 @@ use crate::ecdsa::{KeyPair, verify};
 use sha2::{Sha256, Digest};
 use anyhow::Result;
 use thiserror::Error;
+use p256::ecdsa::VerifyingKey;
 
 #[derive(Error, Debug)]
 pub enum TxError {
@@ -184,7 +185,7 @@ fn create_signing_message(body: &TransactionBody) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn public_key_to_address(public_key: &p256::ecdsa::VerifyingKey) -> Address {
+fn public_key_to_address(public_key: &VerifyingKey) -> Address {
     let mut hasher = Sha256::new();
     hasher.update(public_key.to_encoded_point(true).as_bytes());
     let hash = hasher.finalize();

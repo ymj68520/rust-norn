@@ -1,0 +1,13 @@
+data_dir = "production_test_data"
+rpc_address = "127.0.0.1:50051"
+
+[core.consensus]
+# 程序会自动从 production_test_data/node.key 加载密钥
+# 这个字段仅用于配置验证，实际密钥从文件读取
+pub_key = "loaded_from_file"
+prv_key = "loaded_from_file"
+
+[network]
+listen_address = "/ip4/0.0.0.0/tcp/0"
+bootstrap_peers = []
+mdns = true

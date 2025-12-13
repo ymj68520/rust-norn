@@ -1,0 +1,10 @@
+[package]
+name = "test_sled_integration"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+norn-storage = { workspace = true }
+norn-common = { workspace = true }
+tempfile = "3.8"
+tokio = { workspace = true }

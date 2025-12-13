@@ -6,3 +6,4 @@ pub mod data_processor;
 pub mod config;
 pub mod consensus;
 pub mod metrics;
+pub mod validation;

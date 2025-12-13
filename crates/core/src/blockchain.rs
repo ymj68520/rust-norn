@@ -29,15 +29,24 @@ pub struct Blockchain {
     pub buffer: BlockBuffer,
     pub data_processor: Arc<DataProcessor>,
 
-    // Genesis
-    genesis_params: Option<GenesisParams>,
+    // Genesis parameters (now fixed)
+    genesis_params: GenesisParams,
 
     // Internal
     pop_rx: tokio::sync::Mutex<mpsc::Receiver<Block>>,
 }
 
 impl Blockchain {
-    pub async fn new(db: Arc<dyn DBInterface>, genesis: Block) -> Arc<Self> {
+    /// Create blockchain with fixed genesis block (recommended approach)
+    /// This ensures all nodes use the same genesis block
+    pub async fn new_with_fixed_genesis(db: Arc<dyn DBInterface>) -> Arc<Self> {
+        let genesis = norn_common::genesis::get_genesis_block();
+        Self::new_with_genesis(db, genesis).await
+    }
+
+    /// Create blockchain with existing blockchain data
+    /// Loads existing chain or initializes with given genesis
+    pub async fn new_with_genesis(db: Arc<dyn DBInterface>, genesis: Block) -> Arc<Self> {
         let (pop_tx, pop_rx) = mpsc::channel(128);
         let dp = DataProcessor::new(db.clone());
 
@@ -45,33 +54,44 @@ impl Blockchain {
         let mut loaded_from_db = false;
 
         // Try load latest from DB
-        // We can't call self methods yet, so we just use db directly or helper
-        // But we need the caches initialized if we use methods.
-        // Let's create the struct first with temporary state, then update it.
-        // But BlockBuffer needs the *correct* latest block for initialization.
-
-        // Manual load logic
         let latest_key = b"latest";
         if let Ok(Some(hash_bytes)) = db.get(latest_key).await {
-             if let Ok(block_bytes) = db.get(&norn_common::utils::db_keys::block_hash_to_db_key(&Hash({   
-                 let mut h = [0u8; 32];
-                 if hash_bytes.len() == 32 {
-                     h.copy_from_slice(&hash_bytes);
-                     h
-                 } else {
-                     [0u8; 32]
-                 }
-             }))).await {
-                 if let Some(b_bytes) = block_bytes {
-                     if let Ok(loaded) = norn_common::utils::codec::deserialize::<Block>(&b_bytes) {      
-                         latest_block = loaded;
-                         loaded_from_db = true;
-                     }
-                 }
-             }
+            if hash_bytes.len() == 32 {
+                let mut hash = Hash::default();
+                hash.0.copy_from_slice(&hash_bytes);
+
+                if let Ok(block_bytes) = db.get(&norn_common::utils::db_keys::block_hash_to_db_key(&hash)).await {
+                    if let Some(b_bytes) = block_bytes {
+                        if let Ok(loaded) = norn_common::utils::codec::deserialize::<Block>(&b_bytes) {
+                            latest_block = loaded;
+                            loaded_from_db = true;
+                        }
+                    }
+                }
+            }
         }
-        
+
+        // If not loaded from DB, this is a new chain
+        if !loaded_from_db {
+            // Verify genesis block is correct
+            if !norn_common::genesis::is_valid_genesis_block(&genesis) {
+                error!("Invalid genesis block provided!");
+            }
+        }
+
         let buffer = BlockBuffer::new(latest_block.clone(), pop_tx).await;
+
+        // Extract genesis parameters
+        let genesis_params = if genesis.header.height == 0 {
+            norn_common::genesis::get_genesis_params()
+        } else {
+            // If we loaded from DB, try to get genesis block to extract params
+            if let Some(g_block) = get_block_by_height_from_db(&db, 0).await {
+                extract_genesis_params(&g_block)
+            } else {
+                norn_common::genesis::get_genesis_params()
+            }
+        };
 
         let chain = Arc::new(Self {
             db,
@@ -81,27 +101,22 @@ impl Blockchain {
             latest_block: Arc::new(RwLock::new(latest_block.clone())),
             buffer,
             data_processor: dp,
-            genesis_params: None, // TODO: Load genesis params if loaded_from_db
+            genesis_params,
             pop_rx: tokio::sync::Mutex::new(pop_rx),
         });
 
-        // If fresh chain, save genesis?
+        // If fresh chain, save genesis
         if !loaded_from_db {
-             // Save genesis block
-             if let Err(e) = chain.save_block(&genesis).await {
-                 error!("Failed to save genesis block: {}", e);
-             }
-             // Update latest key
-             if let Err(e) = chain.save_latest_index(&genesis.header.block_hash).await {
-                  error!("Failed to save latest index: {}", e);
-             }
-        } else {
-            // Load genesis (height 0) to get params
-            if let Some(g_block) = chain.get_block_by_height(0).await {
-                 // chain.genesis_params = ... (need interior mutability if we want to set it now)        
-                 // But we put it in Arc. So we can't mutate safely unless we use RwLock for genesis_params too.
-                 // Or just load it on demand.
+            info!("Initializing new blockchain with genesis block");
+            if let Err(e) = chain.save_block(&genesis).await {
+                error!("Failed to save genesis block: {}", e);
+            } else {
+                if let Err(e) = chain.save_latest_index(&genesis.header.block_hash).await {
+                    error!("Failed to save latest index: {}", e);
+                }
             }
+        } else {
+            info!("Loaded existing blockchain, latest height: {}", latest_block.header.height);
         }
 
         let c = chain.clone();
@@ -110,6 +125,13 @@ impl Blockchain {
         });
 
         chain
+    }
+
+    /// Legacy method for backward compatibility
+    /// Note: This method is deprecated as it can cause genesis block inconsistencies
+    #[deprecated(note = "Use new_with_fixed_genesis instead to ensure consistent genesis blocks")]
+    pub async fn new(db: Arc<dyn DBInterface>, genesis: Block) -> Arc<Self> {
+        Self::new_with_genesis(db, genesis).await
     }
 
     async fn save_latest_index(&self, hash: &Hash) -> anyhow::Result<()> {
@@ -250,6 +272,27 @@ use async_trait::async_trait;
 impl ChainReader for Blockchain {
     async fn get_transaction_by_hash(&self, hash: &Hash) -> Option<Transaction> {
         self.get_transaction_by_hash(hash).await
+    }
+}
+
+// Helper functions
+async fn get_block_by_height_from_db(db: &Arc<dyn DBInterface>, height: i64) -> Option<Block> {
+    if height != 0 {
+        return None;
+    }
+
+    // For genesis block (height 0), use the fixed genesis block
+    Some(norn_common::genesis::get_genesis_block())
+}
+
+fn extract_genesis_params(block: &Block) -> norn_common::types::GenesisParams {
+    if block.header.params.is_empty() {
+        return norn_common::genesis::get_genesis_params();
+    }
+
+    match norn_common::utils::codec::deserialize::<norn_common::types::GenesisParams>(&block.header.params) {
+        Ok(params) => params,
+        Err(_) => norn_common::genesis::get_genesis_params(),
     }
 }
 

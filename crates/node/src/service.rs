@@ -2,7 +2,7 @@ use anyhow::Result;
 use norn_core::blockchain::Blockchain;
 use norn_core::txpool::TxPool;
 use norn_network::NetworkService;
-use norn_storage::RocksDB;
+use norn_storage::SledDB;
 use norn_common::types::Block;
 use libp2p::identity::Keypair;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use crate::config::NodeConfig;
 use crate::manager::PeerManager;
 use crate::syncer::BlockSyncer;
 use crate::tx_handler::TxHandler;
-use norn_rpc::start_rpc_server;
+// use norn_rpc::start_rpc_server;  // Temporarily disabled
 use tokio::signal;
 use tracing::{info, error};
 
@@ -30,9 +30,8 @@ pub struct NornNode {
 
 impl NornNode {
     pub async fn new(config: NodeConfig, keypair: Keypair) -> Result<Self> {
-        let db = Arc::new(RocksDB::new(&config.data_dir)?);
-        let genesis = Block::default(); 
-        let blockchain = Blockchain::new(db.clone(), genesis).await;
+        let db = Arc::new(SledDB::new(&config.data_dir)?);
+        let blockchain = Blockchain::new_with_fixed_genesis(db.clone()).await;
         let tx_pool = Arc::new(TxPool::new());
         
         // Extract receiver
@@ -76,14 +75,16 @@ impl NornNode {
     pub async fn start(mut self) -> Result<()> {
         info!("Starting Norn Node...");
         
-        let rpc_addr = self.config.rpc_address;
-        let chain_ref = self.blockchain.clone();
-        tokio::spawn(async move {
-            info!("RPC Server listening on {}", rpc_addr);
-            if let Err(e) = start_rpc_server(rpc_addr, chain_ref).await {
-                error!("RPC Server failed: {}", e);
-            }
-        });
+        // Temporarily disable RPC server
+        // let rpc_addr = self.config.rpc_address;
+        // let chain_ref = self.blockchain.clone();
+        // tokio::spawn(async move {
+        //     info!("RPC Server listening on {}", rpc_addr);
+        //     if let Err(e) = start_rpc_server(rpc_addr, chain_ref).await {
+        //         error!("RPC Server failed: {}", e);
+        //     }
+        // });
+        info!("RPC Server temporarily disabled");
         
         let syncer = self.syncer.clone();
         tokio::spawn(async move {
