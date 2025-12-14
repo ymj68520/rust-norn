@@ -12,6 +12,6 @@ norn-core = { workspace = true }
 norn-crypto = { workspace = true }
 norn-network = { workspace = true }
 norn-storage = { workspace = true }
-# norn-rpc = { workspace = true }  # Temporarily disabled due to compilation issues
+norn-rpc = { workspace = true }  # Re-enable RPC
 libp2p = { workspace = true }
 serde = { workspace = true }

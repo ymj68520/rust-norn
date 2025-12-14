@@ -2517,6 +2517,7 @@ dependencies = [
  "norn-core",
  "norn-crypto",
  "norn-network",
+ "norn-rpc",
  "norn-storage",
  "serde",
  "tokio",
@@ -2549,26 +2550,6 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
-]
-
-[[package]]
-name = "norn-test-client"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "hex",
- "num_cpus",
- "prost",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "tokio",
- "tonic",
- "tonic-build",
- "tracing",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

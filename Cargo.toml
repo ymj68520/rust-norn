@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "bin/norn",
     "crates/*",
-    "test_client",
     "test_integration",
     "db_test",
     "scalability_test",

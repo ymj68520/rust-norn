@@ -10,7 +10,7 @@ use crate::config::NodeConfig;
 use crate::manager::PeerManager;
 use crate::syncer::BlockSyncer;
 use crate::tx_handler::TxHandler;
-// use norn_rpc::start_rpc_server;  // Temporarily disabled
+use norn_rpc::start_rpc_server;  // Re-enable RPC server
 use tokio::signal;
 use tracing::{info, error};
 
@@ -74,27 +74,28 @@ impl NornNode {
 
     pub async fn start(mut self) -> Result<()> {
         info!("Starting Norn Node...");
-        
-        // Temporarily disable RPC server
-        // let rpc_addr = self.config.rpc_address;
-        // let chain_ref = self.blockchain.clone();
-        // tokio::spawn(async move {
-        //     info!("RPC Server listening on {}", rpc_addr);
-        //     if let Err(e) = start_rpc_server(rpc_addr, chain_ref).await {
-        //         error!("RPC Server failed: {}", e);
-        //     }
-        // });
-        info!("RPC Server temporarily disabled");
-        
+
+        // Start RPC server
+        let rpc_addr = self.config.rpc_address.clone();
+        let chain_ref = self.blockchain.clone();
+        let tx_pool_ref = self.tx_pool.clone();
+        tokio::spawn(async move {
+            info!("RPC Server listening on {}", rpc_addr);
+            if let Err(e) = start_rpc_server(rpc_addr, chain_ref, tx_pool_ref).await {
+                error!("RPC Server failed: {}", e);
+            }
+        });
+        info!("RPC Server started");
+
         let syncer = self.syncer.clone();
         tokio::spawn(async move {
             syncer.start().await;
         });
-        
+
         if let Some(rx) = self.network_rx.take() {
             self.run_loop(rx).await;
         }
-        
+
         Ok(())
     }
     

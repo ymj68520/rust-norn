@@ -1,4 +1,3 @@
-use crate::proto;
 use crate::proto::blockchain_service_server::BlockchainService;
 use crate::proto::{
     GetBlockReq, GetBlockResp, GetTransactionReq, GetTransactionResp,
@@ -9,17 +8,19 @@ use crate::proto::{
 use tonic::{Request, Response, Status};
 use std::sync::Arc;
 use norn_core::blockchain::Blockchain;
+use norn_core::txpool::TxPool;
 use norn_common::types::{Hash, Transaction};
 use hex;
 use tracing::{info, error};
 
 pub struct BlockchainRpcImpl {
     chain: Arc<Blockchain>,
+    tx_pool: Arc<TxPool>,
 }
 
 impl BlockchainRpcImpl {
-    pub fn new(chain: Arc<Blockchain>) -> Self {
-        Self { chain }
+    pub fn new(chain: Arc<Blockchain>, tx_pool: Arc<TxPool>) -> Self {
+        Self { chain, tx_pool }
     }
 }
 
@@ -123,7 +124,8 @@ impl BlockchainService for BlockchainRpcImpl {
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<BlockNumberResp>, Status> {
-        let number = self.chain.get_latest_height().await as u64;
+        let latest_block = self.chain.latest_block.read().await;
+        let number = latest_block.header.height as u64;
         Ok(Response::new(BlockNumberResp { number }))
     }
 
@@ -204,7 +206,7 @@ impl BlockchainService for BlockchainRpcImpl {
         let req = request.into_inner();
 
         // Convert proto transaction to internal type
-        let tx = req.body.ok_or_else(|| Status::invalid_argument("Missing transaction body"))?;
+        let tx = req.transaction.ok_or_else(|| Status::invalid_argument("Missing transaction"))?;
 
         // Convert to internal Transaction type
         let internal_tx: Transaction = tx.into();
@@ -213,9 +215,9 @@ impl BlockchainService for BlockchainRpcImpl {
         match norn_crypto::transaction::verify_transaction(&internal_tx) {
             Ok(()) => {
                 // Add to transaction pool
-                self.chain.tx_pool.add(internal_tx.clone()).await;
+                self.tx_pool.add(internal_tx.clone());
 
-                let tx_hash_str = hex::encode(internal_tx.hash.0);
+                let tx_hash_str = hex::encode(internal_tx.body.hash.0);
                 info!("Submitted transaction with data: {}", tx_hash_str);
 
                 Ok(Response::new(SendTransactionWithDataResp { tx_hash: tx_hash_str }))

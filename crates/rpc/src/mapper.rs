@@ -1,5 +1,6 @@
 use crate::proto;
-use norn_common::types::{Block, Transaction};
+use norn_common::types::{Block, Transaction, TransactionBody, Hash};
+use hex;
 
 impl From<Block> for proto::Block {
     fn from(b: Block) -> Self {
@@ -22,6 +23,28 @@ impl From<Transaction> for proto::Transaction {
         proto::Transaction {
             hash: hex::encode(t.body.hash.0),
             // Fill others
+            ..Default::default()
+        }
+    }
+}
+
+// Reverse conversions
+impl From<proto::Transaction> for Transaction {
+    fn from(p: proto::Transaction) -> Self {
+        let mut hash = Hash::default();
+        if let Ok(hash_bytes) = hex::decode(&p.hash) {
+            if hash_bytes.len() == 32 {
+                hash.0.copy_from_slice(&hash_bytes);
+            }
+        }
+
+        Transaction {
+            body: TransactionBody {
+                hash,
+                // Fill other fields with defaults for now
+                ..Default::default()
+            },
+            // Fill signature and other fields
             ..Default::default()
         }
     }
