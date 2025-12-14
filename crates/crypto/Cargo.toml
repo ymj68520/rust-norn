@@ -17,3 +17,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
 chrono = { workspace = true }
+curve25519-dalek = "4.1"
+rand = "0.8"
+serde = { workspace = true }
+async-trait = { workspace = true }

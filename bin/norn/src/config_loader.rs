@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use norn_node::NodeConfig;
 use std::path::Path;
 use norn_common::utils::config::load_config;

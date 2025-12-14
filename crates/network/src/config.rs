@@ -1,5 +1,4 @@
 use serde::Deserialize;
-use std::time::Duration;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct NetworkConfig {

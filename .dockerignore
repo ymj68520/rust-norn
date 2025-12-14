@@ -1,0 +1,18 @@
+target/
+Dockerfile
+.dockerignore
+.git
+.github
+*.md
+.gitignore
+Cargo.lock
+**/*.rs.bk
+# Data directories
+data/
+node*_data/
+# IDE files
+.vscode/
+.idea/
+# OS files
+.DS_Store
+Thumbs.db

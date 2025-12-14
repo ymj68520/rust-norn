@@ -1,0 +1,43 @@
+# Coverage configuration for rust-norn
+
+[llvm-cov]
+# Exclude test files from coverage
+exclude = [
+    "tests/*",
+    "*/tests/*",
+    "benches/*",
+    "*/benches/*",
+    "examples/*",
+    "*/examples/*",
+]
+
+# Exclude specific lines
+exclude-line = [
+    "debug_assert!",
+    "unreachable!",
+    "panic!",
+    "#[derive(",
+    "#[cfg(test)",
+    "#[test]",
+]
+
+# Workspace configuration
+workspace = true
+
+# Generate HTML report
+html = true
+
+# Generate LCOV format for CI
+lcov = true
+
+# Output directory
+output-dir = "target/coverage"
+
+# Fail if coverage is below threshold (optional)
+# fail-under = 80
+
+# Include only source files, not dependencies
+include-ffi = false
+
+# Ignore panics in coverage
+ignore-panics = true

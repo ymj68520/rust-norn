@@ -102,7 +102,7 @@ pub fn build_merkle_tree(txs: &[Transaction]) -> Hash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use norn_common::types::{Transaction, TransactionBody, Hash};
+    use norn_common::types::{Transaction, Hash};
 
     fn create_tx(byte: u8) -> Transaction {
         let mut tx = Transaction::default();
@@ -131,7 +131,7 @@ mod tests {
         hasher.update(&[]);
         let expected_bytes = hasher.finalize();
         
-        assert_eq!(root.0.as_slice(), expected_bytes.as_slice());
+        assert_eq!(&root.0[..], &expected_bytes[..]);
     }
 
     #[test]
@@ -146,7 +146,7 @@ mod tests {
         hasher.update(&tx2.body.hash.0);
         let expected_bytes = hasher.finalize();
 
-        assert_eq!(root.0.as_slice(), expected_bytes.as_slice());
+        assert_eq!(&root.0[..], &expected_bytes[..]);
     }
     
     #[test]
@@ -176,6 +176,6 @@ mod tests {
         hr.update(&n2_data);
         let expected_root = hr.finalize();
         
-        assert_eq!(root.0.as_slice(), expected_root.as_slice());
+        assert_eq!(&root.0[..], &expected_root[..]);
     }
 }

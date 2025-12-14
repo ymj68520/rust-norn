@@ -3,17 +3,19 @@ mod keys;
 mod config_loader;
 
 use clap::Parser;
-use tracing::{info, error};
-use tracing_subscriber::EnvFilter;
+use tracing::info;
 use norn_node::NornNode;
+use norn_common::utils::logging::{init_logging, LoggingConfig};
 use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 1. Setup Logging
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
-        .init();
+    let log_config = LoggingConfig::default();
+    if let Err(e) = init_logging(&log_config) {
+        eprintln!("Failed to initialize logging: {}", e);
+        std::process::exit(1);
+    }
 
     // 2. Parse CLI
     let args = cli::Cli::parse();

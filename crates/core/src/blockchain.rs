@@ -3,10 +3,10 @@ use crate::data_processor::DataProcessor;
 use crate::txpool::ChainReader;
 use moka::future::Cache;
 use norn_common::traits::DBInterface;
-use norn_common::types::{Block, Hash, Transaction, GenesisParams};
+use norn_common::types::{Block, Hash, Transaction};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
 // Constants
 const MAX_BLOCK_CACHE: u64 = 64;
@@ -29,8 +29,7 @@ pub struct Blockchain {
     pub buffer: BlockBuffer,
     pub data_processor: Arc<DataProcessor>,
 
-    // Genesis parameters (now fixed)
-    genesis_params: GenesisParams,
+
 
     // Internal
     pop_rx: tokio::sync::Mutex<mpsc::Receiver<Block>>,
@@ -82,7 +81,7 @@ impl Blockchain {
         let buffer = BlockBuffer::new(latest_block.clone(), pop_tx).await;
 
         // Extract genesis parameters
-        let genesis_params = if genesis.header.height == 0 {
+        let _genesis_params = if genesis.header.height == 0 {
             norn_common::genesis::get_genesis_params()
         } else {
             // If we loaded from DB, try to get genesis block to extract params
@@ -101,7 +100,6 @@ impl Blockchain {
             latest_block: Arc::new(RwLock::new(latest_block.clone())),
             buffer,
             data_processor: dp,
-            genesis_params,
             pop_rx: tokio::sync::Mutex::new(pop_rx),
         });
 
@@ -276,7 +274,7 @@ impl ChainReader for Blockchain {
 }
 
 // Helper functions
-async fn get_block_by_height_from_db(db: &Arc<dyn DBInterface>, height: i64) -> Option<Block> {
+async fn get_block_by_height_from_db(_db: &Arc<dyn DBInterface>, height: i64) -> Option<Block> {
     if height != 0 {
         return None;
     }
@@ -351,9 +349,9 @@ mod tests {
     #[tokio::test]
     async fn test_blockchain_init() {
         let db = Arc::new(MockDB::new());
-        let genesis = Block::default();
+        let _genesis = Block::default();
         
-        let chain = Blockchain::new(db.clone(), genesis.clone()).await;
+        let chain = Blockchain::new_with_fixed_genesis(db.clone()).await;
         
         let latest = chain.latest_block.read().await;
         assert_eq!(latest.header.block_hash, genesis.header.block_hash);
@@ -368,7 +366,7 @@ mod tests {
     async fn test_blockchain_save_get() {
         let db = Arc::new(MockDB::new());
         let genesis = Block::default();
-        let chain = Blockchain::new(db, genesis.clone()).await;
+        let chain = Blockchain::new_with_fixed_genesis(db).await;
         
         let mut b1 = Block::default();
         b1.header.height = 1;

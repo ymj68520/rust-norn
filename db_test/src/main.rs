@@ -1,6 +1,5 @@
 use norn_storage::SledDB;
 use norn_common::traits::DBInterface;
-use chrono::Utc;
 use std::time::Instant;
 use tokio;
 

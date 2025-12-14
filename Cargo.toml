@@ -53,6 +53,10 @@ bs58 = "0.5" # Base58 for addressing commonly used in libp2p
 # Metrics (Replacing prometheus/client_golang)
 prometheus = { version = "0.13", features = ["process"] }
 
+# Testing & Coverage
+cargo-llvm-cov = "0.6"
+tarpaulin = "0.27"
+
 # Utilities
 config = "0.13" # Replacing gookit/config
 clap = { version = "4.4", features = ["derive", "env"] } # CLI parsing

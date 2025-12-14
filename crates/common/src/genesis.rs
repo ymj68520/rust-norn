@@ -4,7 +4,7 @@ use crate::types::{Block, BlockHeader, Hash, GenesisParams, PublicKey};
 ///
 /// 确保所有节点使用相同的创世块，这对于网络同步至关重要
 pub fn get_genesis_block() -> Block {
-    let mut header = BlockHeader {
+    let header = BlockHeader {
         timestamp: GENESIS_TIMESTAMP,
         prev_block_hash: Hash::default(), // 创世块的前一个区块哈希为全零
         block_hash: GENESIS_BLOCK_HASH,
@@ -93,7 +93,7 @@ pub fn is_valid_genesis_block(block: &Block) -> bool {
 
 /// 检查区块链是否从正确的创世块开始
 pub async fn validate_genesis_start<F, Fut>(
-    db: &F,
+    _db: &F,
     get_block: F,
 ) -> Result<bool, Box<dyn std::error::Error>>
 where

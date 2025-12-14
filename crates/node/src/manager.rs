@@ -11,6 +11,7 @@ use tracing::{info, warn};
 pub struct PeerManager {
     chain: Arc<Blockchain>,
     tx_pool: Arc<TxPool>,
+    #[allow(dead_code)]
     network: Arc<NetworkService>,
 }
 

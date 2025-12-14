@@ -1,0 +1,41 @@
+# Logging Configuration for rust-norn
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Whether to write logs to file
+file_logging = true
+
+# Log directory
+log_dir = "logs"
+
+# Log file name
+log_file = "norn.log"
+
+# Whether to log to console
+console_logging = true
+
+# Log format: json, pretty, compact
+format = "pretty"
+
+# Maximum log file size in MB
+max_file_size = 100
+
+# Maximum number of log files to keep
+max_files = 10
+
+# Whether to include timestamps
+include_timestamps = true
+
+# Whether to include target/module
+include_target = true
+
+# Whether to include span events
+include_spans = false
+
+# Module-specific log levels
+[logging.module_levels]
+# "norn_core" = "debug"
+# "norn_network" = "warn"
+# "norn_crypto" = "error"

@@ -1,11 +1,12 @@
 use std::sync::Arc;
 use norn_core::blockchain::Blockchain;
 use norn_network::NetworkService;
-use tokio::sync::mpsc;
-use tracing::{info};
+use tracing::info;
 
 pub struct BlockSyncer {
+    #[allow(dead_code)]
     chain: Arc<Blockchain>,
+    #[allow(dead_code)]
     network: Arc<NetworkService>,
 }
 

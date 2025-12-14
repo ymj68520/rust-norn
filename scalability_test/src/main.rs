@@ -1,7 +1,7 @@
 use norn_storage::SledDB;
 use norn_common::traits::DBInterface;
 use norn_crypto::transaction::TransactionSigner;
-use norn_common::types::{Transaction, TransactionBody, Address, Hash};
+use norn_common::types::{Address, Transaction};
 use std::time::Instant;
 use tokio;
 

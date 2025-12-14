@@ -1,0 +1,14 @@
+# Metrics Configuration for rust-norn
+
+[metrics]
+# Whether metrics collection is enabled
+enabled = true
+
+# Metrics HTTP server bind address
+bind_address = "0.0.0.0:9090"
+
+# Metrics collection interval in seconds
+collection_interval = 10
+
+# Whether to include process metrics
+include_process_metrics = true

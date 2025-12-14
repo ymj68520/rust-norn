@@ -2,7 +2,7 @@ use crate::types::Hash;
 
 const BLOCK_PREFIX: &[u8] = b"block#";
 const TX_PREFIX: &[u8] = b"tx#";
-const DATA_PREFIX: &[u8] = b"data#";
+// const DATA_PREFIX: &[u8] = b"data#";
 
 pub fn block_hash_to_db_key(hash: &Hash) -> Vec<u8> {
     let mut key = Vec::with_capacity(BLOCK_PREFIX.len() + hash.0.len());

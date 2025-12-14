@@ -3,7 +3,7 @@ use norn_core::blockchain::Blockchain;
 use norn_core::txpool::TxPool;
 use norn_network::NetworkService;
 use norn_storage::SledDB;
-use norn_common::types::Block;
+
 use libp2p::identity::Keypair;
 use std::sync::Arc;
 use crate::config::NodeConfig;
@@ -18,6 +18,7 @@ pub struct NornNode {
     config: NodeConfig,
     blockchain: Arc<Blockchain>,
     tx_pool: Arc<TxPool>,
+    #[allow(dead_code)]
     network: Arc<NetworkService>,
     
     peer_manager: Arc<PeerManager>,

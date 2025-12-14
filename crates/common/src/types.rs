@@ -48,6 +48,15 @@ impl<'de> Deserialize<'de> for Hash {
     }
 }
 
+impl Hash {
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        let mut arr = [0u8; HASH_LENGTH];
+        let len = bytes.len().min(HASH_LENGTH);
+        arr[..len].copy_from_slice(&bytes[..len]);
+        Hash(arr)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Address(pub [u8; ADDRESS_LENGTH]);
 

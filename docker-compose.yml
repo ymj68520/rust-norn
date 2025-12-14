@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  norn-node1:
+    build: .
+    container_name: norn-node1
+    ports:
+      - "4001:4001"
+      - "50051:50051"
+    volumes:
+      - ./node1_config.toml:/etc/norn/config.toml:ro
+      - node1_data:/data
+    environment:
+      - RUST_LOG=info
+    networks:
+      - norn-network
+
+  norn-node2:
+    build: .
+    container_name: norn-node2
+    ports:
+      - "4002:4002"
+      - "50052:50051"
+    volumes:
+      - ./node2_config.toml:/etc/norn/config.toml:ro
+      - node2_data:/data
+    environment:
+      - RUST_LOG=info
+    networks:
+      - norn-network
+
+  norn-node3:
+    build: .
+    container_name: norn-node3
+    ports:
+      - "4003:4003"
+      - "50053:50051"
+    volumes:
+      - ./production_config.toml:/etc/norn/config.toml:ro
+      - node3_data:/data
+    environment:
+      - RUST_LOG=info
+    networks:
+      - norn-network
+
+volumes:
+  node1_data:
+  node2_data:
+  node3_data:
+
+networks:
+  norn-network:
+    driver: bridge

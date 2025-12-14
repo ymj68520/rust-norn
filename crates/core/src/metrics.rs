@@ -1,4 +1,4 @@
-use tracing::{info, debug};
+use tracing::debug;
 
 // Stub implementation for metrics
 // In a real implementation, this would use the `prometheus` crate to register counters/gauges.

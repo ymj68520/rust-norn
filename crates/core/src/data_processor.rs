@@ -1,11 +1,10 @@
 use norn_common::traits::DBInterface;
 use norn_common::types::Hash;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, broadcast};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 // Constants
 const TASK_CHANNEL_SIZE: usize = 10240;
