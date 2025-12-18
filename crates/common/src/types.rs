@@ -91,7 +91,7 @@ impl<'de> Deserialize<'de> for Address {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 
 pub struct PublicKey(pub [u8; PUBLIC_KEY_LENGTH]);
 

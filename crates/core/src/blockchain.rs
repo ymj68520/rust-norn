@@ -349,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn test_blockchain_init() {
         let db = Arc::new(MockDB::new());
-        let _genesis = Block::default();
+        let genesis = norn_common::genesis::get_genesis_block();
         
         let chain = Blockchain::new_with_fixed_genesis(db.clone()).await;
         

@@ -50,6 +50,9 @@ impl ErrorHandler {
             NornError::Validation(validation_err) => {
                 warn!("Validation error in '{}': {}", operation, validation_err);
             }
+            NornError::ConsensusError(consensus_err) => {
+                warn!("Consensus error in '{}': {}", operation, consensus_err);
+            }
             NornError::Config(config_err) => {
                 error!("Configuration error in '{}': {}", operation, config_err);
             }

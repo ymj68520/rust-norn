@@ -7,3 +7,8 @@ pub mod config;
 pub mod consensus;
 pub mod metrics;
 pub mod validation;
+pub mod state;
+pub mod execution;
+pub mod fee;
+pub mod wallet;
+pub mod events;

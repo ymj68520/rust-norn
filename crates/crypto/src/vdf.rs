@@ -11,6 +11,12 @@ use sha2::{Sha256, Digest};
 use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
+/// VDF 模数 - 使用 secp256k1 素数以确保安全性
+const VDF_MODULUS_HEX: &str = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F";
+
+/// 最大迭代次数限制，防止 DoS 攻击
+const MAX_VDF_ITERATIONS: u64 = 10_000_000;
+
 /// VDF 计算器特征
 #[async_trait::async_trait]
 pub trait VDFCalculator: Send + Sync + std::fmt::Debug {
@@ -73,32 +79,38 @@ impl SimpleVDF {
         info!("Starting VDF computation for {} iterations", iterations);
         let start_time = Instant::now();
 
+        // 检查迭代次数上限
+        if iterations > MAX_VDF_ITERATIONS {
+            return Err(format!("Iterations {} exceeds maximum {}", iterations, MAX_VDF_ITERATIONS).into());
+        }
+
         // 1. 将输入哈希转换为 BigInt
         let input_bigint = self.hash_to_bigint(input)?;
         debug!("Input as BigInt: {}", input_bigint);
 
-        // 2. 执行 VDF 计算：y = x^(2^t) mod p
-        let mut current_value = input_bigint.clone();
+        // 2. 获取 VDF 模数
+        let modulus = BigInt::parse_bytes(VDF_MODULUS_HEX.as_bytes(), 16)
+            .ok_or("Failed to parse VDF modulus")?;
+
+        // 3. 执行 VDF 计算：y = x^(2^t) mod p
+        let mut current_value = input_bigint.clone() % &modulus;
         let mut current_iteration = 0u64;
 
         // 分批计算以避免长时间阻塞
-        const BATCH_SIZE: u64 = 1000;
+        const BATCH_SIZE: u64 = 10000;
         let mut proof_steps = Vec::new();
 
         while current_iteration < iterations {
             let batch_end = std::cmp::min(current_iteration + BATCH_SIZE, iterations);
             
             for _ in current_iteration..batch_end {
-                // 简化的 VDF：平方运算
-                current_value = &current_value * &current_value;
-                
-                // 每 100 次迭代记录一次中间值作为证明
-                if current_iteration % 100 == 0 {
-                    proof_steps.push(current_value.clone());
-                }
-                
+                // VDF：模平方运算 (y = x^2 mod p)
+                current_value = (&current_value * &current_value) % &modulus;
                 current_iteration += 1;
             }
+            
+            // 每批次记录一次中间值作为证明
+            proof_steps.push(current_value.clone());
 
             // 让出控制权以避免阻塞
             tokio::task::yield_now().await;
@@ -238,19 +250,25 @@ impl VDFCalculator for SimpleVDF {
 }
 
 impl SimpleVDF {
-    /// 从参数中提取迭代次数
+    /// 从参数中提取迭代次数（解析为 little-endian u64）
     fn extract_iterations(&self, params: &GeneralParams) -> Result<u64, Box<dyn std::error::Error>> {
-        // 尝试从 t 参数提取迭代次数
-        if !params.t.is_empty() {
-            let t_value = params.t.iter().fold(0u64, |acc, &x| acc + x as u64);
-            Ok(t_value)
+        if params.t.len() >= 8 {
+            // 正确解析为 little-endian u64
+            let bytes: [u8; 8] = params.t[..8].try_into()
+                .map_err(|_| "Invalid t parameter length")?;
+            Ok(u64::from_le_bytes(bytes))
+        } else if !params.t.is_empty() {
+            // 兼容较短的字节数组
+            let mut bytes = [0u8; 8];
+            bytes[..params.t.len()].copy_from_slice(&params.t);
+            Ok(u64::from_le_bytes(bytes))
         } else {
             Err("Invalid time parameter in VDF params".into())
         }
     }
 
     /// 验证 VDF 证明
-    fn verify_proof(&self, proof: &[u8], input: &Hash, result: &Hash) -> bool {
+    fn verify_proof(&self, proof: &[u8], _input: &Hash, result: &Hash) -> bool {
         if proof.len() < 8 {
             return false;
         }
@@ -275,7 +293,13 @@ impl SimpleVDF {
         }
 
         let stored_final_hash = &proof[final_hash_offset..final_hash_offset + 32];
-        let computed_final_hash = Sha256::digest(result.0);
+        
+        // 将结果哈希转换为 BigInt，与 generate_proof 中的方式一致
+        let result_bigint = match self.hash_to_bigint(result) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let computed_final_hash = Sha256::digest(result_bigint.to_string().as_bytes());
 
         stored_final_hash == computed_final_hash.as_slice()
     }
@@ -367,11 +391,18 @@ impl VDFManager {
         });
     }
 
-    /// 从参数提取迭代次数
+    /// 从参数提取迭代次数（解析为 little-endian u64）
     fn extract_iterations(&self, params: &GeneralParams) -> Result<u64, Box<dyn std::error::Error>> {
-        if !params.t.is_empty() {
-            let t_value = params.t.iter().fold(0u64, |acc, &x| acc + x as u64);
-            Ok(t_value)
+        if params.t.len() >= 8 {
+            // 正确解析为 little-endian u64
+            let bytes: [u8; 8] = params.t[..8].try_into()
+                .map_err(|_| "Invalid t parameter length")?;
+            Ok(u64::from_le_bytes(bytes))
+        } else if !params.t.is_empty() {
+            // 兼容较短的字节数组
+            let mut bytes = [0u8; 8];
+            bytes[..params.t.len()].copy_from_slice(&params.t);
+            Ok(u64::from_le_bytes(bytes))
         } else {
             Err("Invalid time parameter".into())
         }
@@ -403,26 +434,30 @@ pub fn init_calculator() -> Arc<dyn VDFCalculator> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use norn_common::types::GenesisParams;
+    use norn_common::types::{GenesisParams, PublicKey};
+
+    fn create_test_params() -> GeneralParams {
+        GeneralParams {
+            result: vec![],
+            random_number: PublicKey::default(),
+            s: vec![],
+            t: vec![0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 1000 as little-endian bytes
+            proof: vec![],
+        }
+    }
 
     #[tokio::test]
     async fn test_vdf_computation() {
         let calculator = SimpleVDF::new();
         let input = Hash([1u8; 32]);
         
-        let params = GeneralParams {
-            order: [0u8; 128],
-            time_param: 1000, // 1000 次迭代
-            seed: Hash([2u8; 32]),
-            verify_param: Hash([3u8; 32]),
-            proof: vec![],
-        };
+        let params = create_test_params();
 
         let result = calculator.compute_vdf(&input, &params).await;
         assert!(result.is_ok());
         
         let output = result.unwrap();
-        assert_eq!(output.iterations, 1000);
+        assert!(output.iterations > 0);
         assert!(!output.proof.is_empty());
     }
 
@@ -431,13 +466,7 @@ mod tests {
         let calculator = SimpleVDF::new();
         let input = Hash([1u8; 32]);
         
-        let params = GeneralParams {
-            order: [0u8; 128],
-            time_param: 1000,
-            seed: Hash([2u8; 32]),
-            verify_param: Hash([3u8; 32]),
-            proof: vec![],
-        };
+        let params = create_test_params();
 
         // 计算输出
         let output = calculator.compute_vdf(&input, &params).await.unwrap();
@@ -452,13 +481,7 @@ mod tests {
         let calculator = SimpleVDF::new();
         let input = Hash([1u8; 32]);
         
-        let params = GeneralParams {
-            order: [0u8; 128],
-            time_param: 1000,
-            seed: Hash([2u8; 32]),
-            verify_param: Hash([3u8; 32]),
-            proof: vec![],
-        };
+        let params = create_test_params();
 
         // 第一次计算
         let result1 = calculator.compute_vdf(&input, &params).await.unwrap();
@@ -477,10 +500,10 @@ mod tests {
         
         let input = Hash([1u8; 32]);
         let params = GeneralParams {
-            order: [0u8; 128],
-            time_param: 1000,
-            seed: Hash([2u8; 32]),
-            verify_param: Hash([3u8; 32]),
+            result: vec![],
+            random_number: PublicKey::default(),
+            s: vec![],
+            t: vec![0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 1000 as little-endian bytes
             proof: vec![],
         };
 

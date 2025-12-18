@@ -1,8 +1,11 @@
 use anyhow::Result;
 use norn_core::blockchain::Blockchain;
 use norn_core::txpool::TxPool;
+use norn_core::consensus::povf::{PoVFEngine, PoVFConfig};
 use norn_network::NetworkService;
 use norn_storage::SledDB;
+use norn_crypto::vdf::SimpleVDF;
+use norn_crypto::vrf::VRFKeyPair;
 
 use libp2p::identity::Keypair;
 use std::sync::Arc;
@@ -10,9 +13,9 @@ use crate::config::NodeConfig;
 use crate::manager::PeerManager;
 use crate::syncer::BlockSyncer;
 use crate::tx_handler::TxHandler;
-use norn_rpc::start_rpc_server;  // Re-enable RPC server
+use norn_rpc::start_rpc_server;
 use tokio::signal;
-use tracing::{info, error};
+use tracing::{info, error, warn};
 
 pub struct NornNode {
     config: NodeConfig,
@@ -20,6 +23,10 @@ pub struct NornNode {
     tx_pool: Arc<TxPool>,
     #[allow(dead_code)]
     network: Arc<NetworkService>,
+    
+    /// Consensus engine for PoVF consensus
+    #[allow(dead_code)]
+    consensus: Arc<PoVFEngine>,
     
     peer_manager: Arc<PeerManager>,
     syncer: Arc<BlockSyncer>,
@@ -35,26 +42,26 @@ impl NornNode {
         let blockchain = Blockchain::new_with_fixed_genesis(db.clone()).await;
         let tx_pool = Arc::new(TxPool::new());
         
-        // Extract receiver
+        // Initialize VRF key pair for this node
+        let vrf_key_pair = VRFKeyPair::generate();
+        info!("Generated VRF key pair");
+        
+        // Initialize consensus engine with default config
+        let vdf_calculator = Arc::new(SimpleVDF::new());
+        let consensus_config = PoVFConfig::default();
+        let consensus = Arc::new(PoVFEngine::new(
+            consensus_config,
+            vdf_calculator,
+            vrf_key_pair,
+        ));
+        info!("Initialized PoVF consensus engine");
+        
+        // Extract network receiver
         let mut network_svc = NetworkService::start(config.network.clone(), keypair).await?;
-        // We need to swap out receiver or clone struct without it? 
-        // `NetworkService` struct fields are pub.
-        // We can't move out field from Arc if we wrap it.
-        // So we split here.
         
         // Hack: NetworkService struct assumes it holds rx.
-        // Ideally `start` returns `(Arc<NetworkService>, Receiver)`.
-        // Since `NetworkService` is in another crate and we defined it to hold `event_rx`, we are stuck unless we modify `NetworkService`.
-        // Assuming `NetworkService` allows us to take `event_rx` out? No, fields are pub but struct moved into Arc later.
-        
-        // Let's modify `NetworkService::start` signature in next step or use `Mutex<Option<Rx>>` in `NetworkService`.
-        // But `NetworkService` is already done.
-        // I will assume `NetworkService` in `node` uses a workaround: 
-        // We construct `NetworkService` then steal `event_rx` using `std::mem::replace` or similar if we could mutably access it.
-        // But we want `Arc<NetworkService>` for `PeerManager`.
-        
-        // Let's just take the field out before Arcing.
-        let rx = std::mem::replace(&mut network_svc.event_rx, tokio::sync::mpsc::channel(1).1); // Dummy channel replace
+        // We construct `NetworkService` then steal `event_rx` using `std::mem::replace`
+        let rx = std::mem::replace(&mut network_svc.event_rx, tokio::sync::mpsc::channel(1).1);
         let network = Arc::new(network_svc);
         
         let peer_manager = Arc::new(PeerManager::new(blockchain.clone(), tx_pool.clone(), network.clone()));
@@ -66,6 +73,7 @@ impl NornNode {
             blockchain,
             tx_pool,
             network,
+            consensus,
             peer_manager,
             syncer,
             tx_handler,
@@ -88,10 +96,18 @@ impl NornNode {
         });
         info!("RPC Server started");
 
+        // Start syncer
         let syncer = self.syncer.clone();
         tokio::spawn(async move {
             syncer.start().await;
         });
+
+        // Start consensus engine (for block production in future)
+        // TODO: Add block production loop based on consensus
+        // let consensus = self.consensus.clone();
+        // tokio::spawn(async move {
+        //     consensus.run_consensus_loop().await;
+        // });
 
         if let Some(rx) = self.network_rx.take() {
             self.run_loop(rx).await;
@@ -112,6 +128,10 @@ impl NornNode {
                                 }
                                 norn_network::service::NetworkEvent::TransactionReceived(data) => {
                                     self.tx_handler.handle_tx_data(data).await;
+                                }
+                                norn_network::service::NetworkEvent::ConsensusMessageReceived(data) => {
+                                    // Handle consensus messages
+                                    warn!("Received consensus message ({} bytes) - TODO: implement handling", data.len());
                                 }
                                 _ => {}
                             }

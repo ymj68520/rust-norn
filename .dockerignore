@@ -5,7 +5,6 @@ Dockerfile
 .github
 *.md
 .gitignore
-Cargo.lock
 **/*.rs.bk
 # Data directories
 data/

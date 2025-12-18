@@ -19,6 +19,10 @@ pub enum NornError {
     #[error("Validation error: {0}")]
     Validation(#[from] ValidationError),
 
+    /// Consensus errors
+    #[error("Consensus error: {0}")]
+    ConsensusError(String),
+
     /// Configuration errors
     #[error("Configuration error: {0}")]
     Config(String),

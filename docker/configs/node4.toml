@@ -1,0 +1,24 @@
+# Node 4 Configuration
+# Connects to Node 1 as bootstrap peer
+
+data_dir = "/data"
+rpc_address = "0.0.0.0:50051"
+
+[core]
+    [core.consensus]
+    # Keys will be auto-generated on first startup
+    pub_key = "loaded_from_file"
+    prv_key = "loaded_from_file"
+
+[network]
+# Listen on port 4004 for P2P connections
+listen_address = "/ip4/0.0.0.0/tcp/4004"
+
+# Connect to Node 1 as bootstrap peer
+# Note: Using Docker service name for DNS resolution
+bootstrap_peers = [
+    "/dns4/norn-node1/tcp/4001"
+]
+
+# Disable mDNS in Docker (unreliable)
+mdns = false

@@ -1,3 +1,9 @@
+//! Syncer module
+//! 
+//! Provides blockchain synchronization functionality.
+
 pub mod syncer;
 pub mod reorg_handler;
-pub mod chain_manager;
+
+pub use syncer::BlockSyncer;
+pub use reorg_handler::ReorgHandler;
