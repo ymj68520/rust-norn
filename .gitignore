@@ -4,6 +4,8 @@ data/
 
 # IDE-specific files
 .idea/
+.claude
+.github
 .vscode/
 *.iml
 .DS_Store
@@ -31,9 +33,11 @@ Thumbs.db
 
 # Log files
 *.log
+logs
 
 # Temp files
 *.tmp
+node1_data
 
 # Configuration files that might contain sensitive data or be user-specific
 config.toml
@@ -55,6 +59,7 @@ data/
 test_client/
 tests/
 mock_persistence_test/
+tps_test_results
 
 # Test reports and outputs
 *test_report*.md
@@ -64,6 +69,7 @@ mock_persistence_test/
 
 # Documentation
 docs/
+doc/
 *.md
 !README.md
-!CLAUDE.md
+CLAUDE.md

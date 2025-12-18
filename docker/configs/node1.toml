@@ -1,0 +1,21 @@
+# Node 1 Configuration - Bootstrap Node
+# This is the first node that other nodes will connect to
+
+data_dir = "/data"
+rpc_address = "0.0.0.0:50051"
+
+[core]
+    [core.consensus]
+    # Keys will be auto-generated on first startup
+    pub_key = "loaded_from_file"
+    prv_key = "loaded_from_file"
+
+[network]
+# Listen on port 4001 for P2P connections
+listen_address = "/ip4/0.0.0.0/tcp/4001"
+
+# Bootstrap node - no peers to connect to initially
+bootstrap_peers = []
+
+# Disable mDNS in Docker (unreliable)
+mdns = false

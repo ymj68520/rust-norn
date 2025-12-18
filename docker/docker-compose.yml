@@ -1,0 +1,126 @@
+# Multi-node deployment for Norn Blockchain
+# This configuration creates a 4-node blockchain network
+
+services:
+  # Node 1 - Bootstrap Node
+  # Other nodes will connect to this node first
+  norn-node1:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: norn-node1
+    hostname: norn-node1
+    ports:
+      - "14001:4001"   # P2P port (host:container)
+      - "50051:50051" # RPC port
+    volumes:
+      - ./configs/node1.toml:/etc/norn/config.toml:ro
+      - node1_data:/data
+    environment:
+      - RUST_LOG=info
+      - NODE_NAME=norn-node1
+      - RPC_ADDRESS=0.0.0.0:50051
+      - P2P_PORT=4001
+    networks:
+      norn-network:
+        ipv4_address: 172.28.0.10
+    restart: unless-stopped
+
+  # Node 2
+  norn-node2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: norn-node2
+    hostname: norn-node2
+    ports:
+      - "14002:4002"   # P2P port (host:container)
+      - "50052:50051" # RPC port
+    volumes:
+      - ./configs/node2.toml:/etc/norn/config.toml:ro
+      - node2_data:/data
+    environment:
+      - RUST_LOG=info
+      - NODE_NAME=norn-node2
+      - RPC_ADDRESS=0.0.0.0:50051
+      - P2P_PORT=4002
+      - WAIT_FOR_NODE=norn-node1:4001
+    networks:
+      norn-network:
+        ipv4_address: 172.28.0.11
+    depends_on:
+      - norn-node1
+    restart: unless-stopped
+
+  # Node 3
+  norn-node3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: norn-node3
+    hostname: norn-node3
+    ports:
+      - "14003:4003"   # P2P port (host:container)
+      - "50053:50051" # RPC port
+    volumes:
+      - ./configs/node3.toml:/etc/norn/config.toml:ro
+      - node3_data:/data
+    environment:
+      - RUST_LOG=info
+      - NODE_NAME=norn-node3
+      - RPC_ADDRESS=0.0.0.0:50051
+      - P2P_PORT=4003
+      - WAIT_FOR_NODE=norn-node1:4001
+    networks:
+      norn-network:
+        ipv4_address: 172.28.0.12
+    depends_on:
+      - norn-node1
+    restart: unless-stopped
+
+  # Node 4
+  norn-node4:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: norn-node4
+    hostname: norn-node4
+    ports:
+      - "14004:4004"   # P2P port (host:container)
+      - "50054:50051" # RPC port
+    volumes:
+      - ./configs/node4.toml:/etc/norn/config.toml:ro
+      - node4_data:/data
+    environment:
+      - RUST_LOG=info
+      - NODE_NAME=norn-node4
+      - RPC_ADDRESS=0.0.0.0:50051
+      - P2P_PORT=4004
+      - WAIT_FOR_NODE=norn-node1:4001
+    networks:
+      norn-network:
+        ipv4_address: 172.28.0.13
+    depends_on:
+      - norn-node1
+    restart: unless-stopped
+
+# Persistent volumes for each node
+volumes:
+  node1_data:
+    name: norn_node1_data
+  node2_data:
+    name: norn_node2_data
+  node3_data:
+    name: norn_node3_data
+  node4_data:
+    name: norn_node4_data
+
+# Custom bridge network with fixed subnet
+networks:
+  norn-network:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1

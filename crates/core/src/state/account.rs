@@ -212,7 +212,7 @@ impl AccountStateManager {
         
         // 检查账户数量限制
         if old_account.is_none() && accounts.len() >= self.config.max_accounts {
-            return Err(NornError::ValidationError("Maximum account limit reached".to_string()));
+            return Err(NornError::Internal("Maximum account limit reached".to_string()));
         }
 
         let change = if old_account.is_none() {
@@ -288,13 +288,13 @@ impl AccountStateManager {
         
         // 检查存储项数量限制
         if !account_storage.contains_key(&key) && account_storage.len() >= self.config.max_storage_items {
-            return Err(NornError::ValidationError("Maximum storage limit reached".to_string()));
+            return Err(NornError::Internal("Maximum storage limit reached".to_string()));
         }
 
         let old_value = account_storage.get(&key).map(|item| item.value.clone());
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| NornError::ValidationError(format!("Time error: {}", e)))?
+            .map_err(|e| NornError::Internal(format!("Time error: {}", e)))?
             .as_secs();
 
         let change = if old_value.is_none() {
@@ -415,7 +415,7 @@ impl AccountStateManager {
         let current_balance = account.map(|a| a.balance).unwrap_or_else(|| BigUint::zero());
         
         if current_balance < *amount {
-            return Err(NornError::ValidationError("Insufficient balance".to_string()));
+            return Err(NornError::Internal("Insufficient balance".to_string()));
         }
         
         let new_balance = current_balance - amount;

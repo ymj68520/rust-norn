@@ -1,0 +1,11 @@
+[package]
+name = "test_tx_gen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+norn-crypto = { workspace = true }
+norn-common = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+prost = { workspace = true }

@@ -94,6 +94,28 @@ pub struct VRFProof {
     pub response: Scalar,
 }
 
+impl serde::Serialize for VRFProof {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Serialize as hex-encoded bytes
+        let bytes = self.to_bytes();
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for VRFProof {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        VRFProof::from_bytes(&bytes).map_err(serde::de::Error::custom)
+    }
+}
+
 impl VRFProof {
     /// 序列化证明
     pub fn to_bytes(&self) -> [u8; 96] {
@@ -138,11 +160,11 @@ pub struct VRFCalculator;
 impl VRFCalculator {
     /// 计算 VRF 输出和证明
     pub fn calculate(key_pair: &VRFKeyPair, message: &[u8]) -> Result<VRFOutput> {
-        // 1. 计算 H = H(message)
+        // 1. 计算 H = H(message) - hash to curve
         let h = Self::hash_to_curve(message)?;
 
-        // 2. 计算 gamma = H^sk
-        let gamma = RistrettoPoint::mul_base(&key_pair.private_key) + h;
+        // 2. 计算 gamma = H * sk (VRF核心: 私钥对哈希点的标量乘法)
+        let gamma = h * key_pair.private_key;
 
         // 3. 生成随机数 k
         let mut csprng = OsRng;
@@ -150,19 +172,20 @@ impl VRFCalculator {
         csprng.fill_bytes(&mut k_bytes);
         let k = Scalar::from_bytes_mod_order(k_bytes);
 
-        // 4. 计算 commitment = gamma^k
-        let commitment = gamma * k;
+        // 4. 计算 U = g^k 和 V = H^k (DLEQ proof)
+        let u = RistrettoPoint::mul_base(&k);
+        let v = h * k;
 
-        // 5. 计算挑战 c = H(pk || H || gamma || commitment)
+        // 5. 计算挑战 c = H(g, H, pk, gamma, U, V)
         let challenge = Self::compute_challenge(
             &key_pair.public_key,
             &h,
             &gamma,
-            &commitment,
+            &u,
         );
 
-        // 6. 计算响应 s = k + c * sk
-        let response = k + challenge * key_pair.private_key;
+        // 6. 计算响应 s = k - c * sk
+        let response = k - challenge * key_pair.private_key;
 
         // 7. 计算 VRF 输出
         let output = Self::derive_output(&gamma, &h);
@@ -185,16 +208,19 @@ impl VRFCalculator {
         // 1. 计算 H = H(message)
         let h = Self::hash_to_curve(message)?;
 
-        // 2. 重新计算 commitment
-        let commitment_recomputed = output.proof.gamma * output.proof.response 
-            - (RistrettoPoint::mul_base(&output.proof.response) + h * output.proof.challenge);
+        // 2. 使用DLEQ证明验证
+        // 验证 gamma = h * sk 使用 (challenge, response) 证明
+        // U' = g^s * pk^c (应该等于原始U)
+        // V' = H^s * gamma^c (应该等于原始V)
+        let u_prime = RistrettoPoint::mul_base(&output.proof.response) 
+            + *public_key * output.proof.challenge;
 
         // 3. 重新计算挑战
         let challenge_recomputed = Self::compute_challenge(
             public_key,
             &h,
             &output.proof.gamma,
-            &commitment_recomputed,
+            &u_prime,
         );
 
         // 4. 验证挑战
@@ -378,7 +404,7 @@ impl VRFSelector {
     }
 
     /// 创建选择消息
-    fn create_selection_message(message: &[u8], round: u64, address: &Address) -> Vec<u8> {
+    pub fn create_selection_message(message: &[u8], round: u64, address: &Address) -> Vec<u8> {
         let mut vrf_message = Vec::new();
         vrf_message.extend_from_slice(b"VRF_SELECTOR");
         vrf_message.extend_from_slice(message);

@@ -137,20 +137,29 @@ impl Blockchain {
         Ok(())
     }
 
+    /// Commit block to chain: save to DB, update in-memory state, and update latest index
+    pub async fn commit_block(&self, block: &Block) -> anyhow::Result<()> {
+        self.save_block(block).await?;
+
+        {
+            let mut latest = self.latest_block.write().await;
+            // Only update if height is greater (simple fork choice)
+            // Or if we trust the caller (like BlockProducer)
+            if block.header.height > latest.header.height {
+                *latest = block.clone();
+                drop(latest); // Unlock
+                self.save_latest_index(&block.header.block_hash).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn finalize_loop(&self) {
         let mut rx = self.pop_rx.lock().await;
         while let Some(block) = rx.recv().await {
             info!("Finalizing block height={}", block.header.height);
-            if let Err(e) = self.save_block(&block).await {
-                error!("Failed to save block: {}", e);
-            } else {
-                let mut latest = self.latest_block.write().await;
-                *latest = block.clone();
-                drop(latest); // Unlock before saving index
-
-                if let Err(e) = self.save_latest_index(&block.header.block_hash).await {
-                     error!("Failed to save latest index: {}", e);
-                }
+            if let Err(e) = self.commit_block(&block).await {
+                error!("Failed to commit block: {}", e);
             }
         }
     }
@@ -349,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn test_blockchain_init() {
         let db = Arc::new(MockDB::new());
-        let _genesis = Block::default();
+        let genesis = norn_common::genesis::get_genesis_block();
         
         let chain = Blockchain::new_with_fixed_genesis(db.clone()).await;
         

@@ -1,5 +1,5 @@
 data_dir = "node1_data"
-rpc_address = "127.0.0.1:50051"
+rpc_address = "127.0.0.1:50055"
 
 [core]
     [core.consensus]

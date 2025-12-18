@@ -6,6 +6,8 @@ members = [
     "test_integration",
     "db_test",
     "scalability_test",
+    "tps_test",
+    "test_tx_gen",
 ]
 
 [workspace.dependencies]
