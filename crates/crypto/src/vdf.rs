@@ -17,6 +17,12 @@ const VDF_MODULUS_HEX: &str = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 /// 最大迭代次数限制，防止 DoS 攻击
 const MAX_VDF_ITERATIONS: u64 = 10_000_000;
 
+/// VDF 模数 - 使用 secp256k1 素数以确保安全性
+const VDF_MODULUS_HEX: &str = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F";
+
+/// 最大迭代次数限制，防止 DoS 攻击
+const MAX_VDF_ITERATIONS: u64 = 10_000_000;
+
 /// VDF 计算器特征
 #[async_trait::async_trait]
 pub trait VDFCalculator: Send + Sync + std::fmt::Debug {
@@ -84,6 +90,11 @@ impl SimpleVDF {
             return Err(format!("Iterations {} exceeds maximum {}", iterations, MAX_VDF_ITERATIONS).into());
         }
 
+        // 检查迭代次数上限
+        if iterations > MAX_VDF_ITERATIONS {
+            return Err(format!("Iterations {} exceeds maximum {}", iterations, MAX_VDF_ITERATIONS).into());
+        }
+
         // 1. 将输入哈希转换为 BigInt
         let input_bigint = self.hash_to_bigint(input)?;
         debug!("Input as BigInt: {}", input_bigint);
@@ -94,9 +105,16 @@ impl SimpleVDF {
 
         // 3. 执行 VDF 计算：y = x^(2^t) mod p
         let mut current_value = input_bigint.clone() % &modulus;
+        // 2. 获取 VDF 模数
+        let modulus = BigInt::parse_bytes(VDF_MODULUS_HEX.as_bytes(), 16)
+            .ok_or("Failed to parse VDF modulus")?;
+
+        // 3. 执行 VDF 计算：y = x^(2^t) mod p
+        let mut current_value = input_bigint.clone() % &modulus;
         let mut current_iteration = 0u64;
 
         // 分批计算以避免长时间阻塞
+        const BATCH_SIZE: u64 = 10000;
         const BATCH_SIZE: u64 = 10000;
         let mut proof_steps = Vec::new();
 
@@ -106,8 +124,13 @@ impl SimpleVDF {
             for _ in current_iteration..batch_end {
                 // VDF：模平方运算 (y = x^2 mod p)
                 current_value = (&current_value * &current_value) % &modulus;
+                // VDF：模平方运算 (y = x^2 mod p)
+                current_value = (&current_value * &current_value) % &modulus;
                 current_iteration += 1;
             }
+            
+            // 每批次记录一次中间值作为证明
+            proof_steps.push(current_value.clone());
             
             // 每批次记录一次中间值作为证明
             proof_steps.push(current_value.clone());
@@ -272,6 +295,7 @@ impl SimpleVDF {
 
     /// 验证 VDF 证明
     fn verify_proof(&self, proof: &[u8], _input: &Hash, result: &Hash) -> bool {
+    fn verify_proof(&self, proof: &[u8], _input: &Hash, result: &Hash) -> bool {
         if proof.len() < 8 {
             return false;
         }
@@ -296,6 +320,13 @@ impl SimpleVDF {
         }
 
         let stored_final_hash = &proof[final_hash_offset..final_hash_offset + 32];
+        
+        // 将结果哈希转换为 BigInt，与 generate_proof 中的方式一致
+        let result_bigint = match self.hash_to_bigint(result) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let computed_final_hash = Sha256::digest(result_bigint.to_string().as_bytes());
         
         // 将结果哈希转换为 BigInt，与 generate_proof 中的方式一致
         let result_bigint = match self.hash_to_bigint(result) {
@@ -448,6 +479,17 @@ mod tests {
             proof: vec![],
         }
     }
+    use norn_common::types::{GenesisParams, PublicKey};
+
+    fn create_test_params() -> GeneralParams {
+        GeneralParams {
+            result: vec![],
+            random_number: PublicKey::default(),
+            s: vec![],
+            t: vec![0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 1000 as little-endian bytes
+            proof: vec![],
+        }
+    }
 
     #[tokio::test]
     async fn test_vdf_computation() {
@@ -455,11 +497,13 @@ mod tests {
         let input = Hash([1u8; 32]);
         
         let params = create_test_params();
+        let params = create_test_params();
 
         let result = calculator.compute_vdf(&input, &params).await;
         assert!(result.is_ok());
         
         let output = result.unwrap();
+        assert!(output.iterations > 0);
         assert!(output.iterations > 0);
         assert!(!output.proof.is_empty());
     }
@@ -469,6 +513,7 @@ mod tests {
         let calculator = SimpleVDF::new();
         let input = Hash([1u8; 32]);
         
+        let params = create_test_params();
         let params = create_test_params();
 
         // 计算输出
@@ -484,6 +529,7 @@ mod tests {
         let calculator = SimpleVDF::new();
         let input = Hash([1u8; 32]);
         
+        let params = create_test_params();
         let params = create_test_params();
 
         // 第一次计算
@@ -503,6 +549,10 @@ mod tests {
         
         let input = Hash([1u8; 32]);
         let params = GeneralParams {
+            result: vec![],
+            random_number: PublicKey::default(),
+            s: vec![],
+            t: vec![0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 1000 as little-endian bytes
             result: vec![],
             random_number: PublicKey::default(),
             s: vec![],

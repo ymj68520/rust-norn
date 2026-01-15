@@ -4,6 +4,7 @@ use norn_crypto::vdf::{VDFCalculator, VDFManager};
 use norn_common::error::{NornError, Result};
 use serde::{Serialize, Deserialize};
 use sha2::Digest;
+use sha2::Digest;
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};

@@ -18,6 +18,7 @@ use crate::txpool::TxPool;
 use crate::merkle::build_merkle_tree;
 use crate::consensus::povf::{PoVFConfig, PoVFEngine, ConsensusMessage, BlockProposal, ConsensusResult};
 
+
 /// Block producer configuration
 #[derive(Debug, Clone)]
 pub struct BlockProducerConfig {

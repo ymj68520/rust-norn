@@ -7,6 +7,8 @@ use norn_network::NetworkService;
 use norn_storage::SledDB;
 use norn_crypto::vdf::SimpleVDF;
 use norn_crypto::vrf::VRFKeyPair;
+use norn_crypto::vdf::SimpleVDF;
+use norn_crypto::vrf::VRFKeyPair;
 
 use libp2p::identity::Keypair;
 use std::sync::Arc;
@@ -15,6 +17,7 @@ use crate::config::NodeConfig;
 use crate::manager::PeerManager;
 use crate::syncer::BlockSyncer;
 use crate::tx_handler::TxHandler;
+use norn_rpc::start_rpc_server;
 use norn_rpc::start_rpc_server;
 use tokio::signal;
 use tracing::{info, error, warn};
@@ -99,6 +102,8 @@ impl NornNode {
         // Hack: NetworkService struct assumes it holds rx.
         // We construct `NetworkService` then steal `event_rx` using `std::mem::replace`
         let rx = std::mem::replace(&mut network_svc.event_rx, tokio::sync::mpsc::channel(1).1);
+        // We construct `NetworkService` then steal `event_rx` using `std::mem::replace`
+        let rx = std::mem::replace(&mut network_svc.event_rx, tokio::sync::mpsc::channel(1).1);
         let network = Arc::new(network_svc);
         
         let peer_manager = Arc::new(PeerManager::new(blockchain.clone(), tx_pool.clone(), network.clone()));
@@ -134,6 +139,7 @@ impl NornNode {
         });
         info!("RPC Server started");
 
+        // Start syncer
         // Start syncer
         let syncer = self.syncer.clone();
         tokio::spawn(async move {
