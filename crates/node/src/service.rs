@@ -7,8 +7,6 @@ use norn_network::NetworkService;
 use norn_storage::SledDB;
 use norn_crypto::vdf::SimpleVDF;
 use norn_crypto::vrf::VRFKeyPair;
-use norn_crypto::vdf::SimpleVDF;
-use norn_crypto::vrf::VRFKeyPair;
 
 use libp2p::identity::Keypair;
 use std::sync::Arc;
@@ -17,7 +15,6 @@ use crate::config::NodeConfig;
 use crate::manager::PeerManager;
 use crate::syncer::BlockSyncer;
 use crate::tx_handler::TxHandler;
-use norn_rpc::start_rpc_server;
 use norn_rpc::start_rpc_server;
 use tokio::signal;
 use tracing::{info, error, warn};
@@ -77,6 +74,7 @@ impl NornNode {
             vdf_calculator,
             vrf_key_pair.clone(),
             initial_round,
+            Some(pub_key), // Local validator identity
         ));
         info!("Initialized PoVF consensus engine at round {}", initial_round);
 

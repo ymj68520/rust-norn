@@ -2686,6 +2686,7 @@ dependencies = [
  "norn-rpc",
  "norn-storage",
  "serde",
+ "tempfile",
  "tokio",
  "tracing",
 ]

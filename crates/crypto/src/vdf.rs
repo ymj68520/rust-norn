@@ -17,12 +17,6 @@ const VDF_MODULUS_HEX: &str = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF
 /// 最大迭代次数限制，防止 DoS 攻击
 const MAX_VDF_ITERATIONS: u64 = 10_000_000;
 
-/// VDF 模数 - 使用 secp256k1 素数以确保安全性
-const VDF_MODULUS_HEX: &str = "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F";
-
-/// 最大迭代次数限制，防止 DoS 攻击
-const MAX_VDF_ITERATIONS: u64 = 10_000_000;
-
 /// VDF 计算器特征
 #[async_trait::async_trait]
 pub trait VDFCalculator: Send + Sync + std::fmt::Debug {
@@ -115,23 +109,17 @@ impl SimpleVDF {
 
         // 分批计算以避免长时间阻塞
         const BATCH_SIZE: u64 = 10000;
-        const BATCH_SIZE: u64 = 10000;
         let mut proof_steps = Vec::new();
 
         while current_iteration < iterations {
             let batch_end = std::cmp::min(current_iteration + BATCH_SIZE, iterations);
-            
+
             for _ in current_iteration..batch_end {
-                // VDF：模平方运算 (y = x^2 mod p)
-                current_value = (&current_value * &current_value) % &modulus;
                 // VDF：模平方运算 (y = x^2 mod p)
                 current_value = (&current_value * &current_value) % &modulus;
                 current_iteration += 1;
             }
-            
-            // 每批次记录一次中间值作为证明
-            proof_steps.push(current_value.clone());
-            
+
             // 每批次记录一次中间值作为证明
             proof_steps.push(current_value.clone());
 
@@ -295,7 +283,6 @@ impl SimpleVDF {
 
     /// 验证 VDF 证明
     fn verify_proof(&self, proof: &[u8], _input: &Hash, result: &Hash) -> bool {
-    fn verify_proof(&self, proof: &[u8], _input: &Hash, result: &Hash) -> bool {
         if proof.len() < 8 {
             return false;
         }
@@ -320,14 +307,7 @@ impl SimpleVDF {
         }
 
         let stored_final_hash = &proof[final_hash_offset..final_hash_offset + 32];
-        
-        // 将结果哈希转换为 BigInt，与 generate_proof 中的方式一致
-        let result_bigint = match self.hash_to_bigint(result) {
-            Ok(v) => v,
-            Err(_) => return false,
-        };
-        let computed_final_hash = Sha256::digest(result_bigint.to_string().as_bytes());
-        
+
         // 将结果哈希转换为 BigInt，与 generate_proof 中的方式一致
         let result_bigint = match self.hash_to_bigint(result) {
             Ok(v) => v,
@@ -479,31 +459,18 @@ mod tests {
             proof: vec![],
         }
     }
-    use norn_common::types::{GenesisParams, PublicKey};
-
-    fn create_test_params() -> GeneralParams {
-        GeneralParams {
-            result: vec![],
-            random_number: PublicKey::default(),
-            s: vec![],
-            t: vec![0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 1000 as little-endian bytes
-            proof: vec![],
-        }
-    }
 
     #[tokio::test]
     async fn test_vdf_computation() {
         let calculator = SimpleVDF::new();
         let input = Hash([1u8; 32]);
-        
-        let params = create_test_params();
+
         let params = create_test_params();
 
         let result = calculator.compute_vdf(&input, &params).await;
         assert!(result.is_ok());
-        
+
         let output = result.unwrap();
-        assert!(output.iterations > 0);
         assert!(output.iterations > 0);
         assert!(!output.proof.is_empty());
     }
@@ -512,13 +479,12 @@ mod tests {
     async fn test_vdf_verification() {
         let calculator = SimpleVDF::new();
         let input = Hash([1u8; 32]);
-        
-        let params = create_test_params();
+
         let params = create_test_params();
 
         // 计算输出
         let output = calculator.compute_vdf(&input, &params).await.unwrap();
-        
+
         // 验证输出
         let is_valid = calculator.verify_vdf(&input, &output, &params).await;
         assert!(is_valid);
@@ -528,16 +494,15 @@ mod tests {
     async fn test_vdf_caching() {
         let calculator = SimpleVDF::new();
         let input = Hash([1u8; 32]);
-        
-        let params = create_test_params();
+
         let params = create_test_params();
 
         // 第一次计算
         let result1 = calculator.compute_vdf(&input, &params).await.unwrap();
-        
+
         // 第二次计算应该使用缓存
         let result2 = calculator.compute_vdf(&input, &params).await.unwrap();
-        
+
         assert_eq!(result1.result, result2.result);
         assert_eq!(result1.iterations, result2.iterations);
     }
@@ -546,24 +511,14 @@ mod tests {
     async fn test_vdf_manager() {
         let calculator = Arc::new(SimpleVDF::new());
         let manager = VDFManager::new(calculator);
-        
+
         let input = Hash([1u8; 32]);
-        let params = GeneralParams {
-            result: vec![],
-            random_number: PublicKey::default(),
-            s: vec![],
-            t: vec![0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 1000 as little-endian bytes
-            result: vec![],
-            random_number: PublicKey::default(),
-            s: vec![],
-            t: vec![0xE8, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // 1000 as little-endian bytes
-            proof: vec![],
-        };
+        let params = create_test_params();
 
         // 启动计算
         let result = manager.start_computation(input, params).await;
         assert!(result.is_ok());
-        
+
         // 检查状态
         let state = manager.get_computation_state(&input).await;
         assert!(state.is_some());

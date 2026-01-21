@@ -58,6 +58,7 @@ prometheus = { version = "0.13", features = ["process"] }
 # Testing & Coverage
 cargo-llvm-cov = "0.6"
 tarpaulin = "0.27"
+tempfile = "3.4"
 
 # Utilities
 config = "0.13" # Replacing gookit/config

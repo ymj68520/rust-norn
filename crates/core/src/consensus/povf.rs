@@ -1,9 +1,9 @@
-use norn_common::types::{Block, BlockHeader, Hash, GeneralParams, PublicKey};
+use norn_common::types::{Block, BlockHeader, Hash, GeneralParams, PublicKey, Transaction};
 use norn_crypto::vrf::{VRFKeyPair, VRFSelector, VRFOutput};
 use norn_crypto::vdf::{VDFCalculator, VDFManager};
+use norn_crypto::transaction::verify_transaction;
 use norn_common::error::{NornError, Result};
 use serde::{Serialize, Deserialize};
-use sha2::Digest;
 use sha2::Digest;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -101,36 +101,39 @@ pub enum ConsensusState {
 pub struct PoVFEngine {
     /// 共识配置
     config: PoVFConfig,
-    
+
     /// 当前轮次
     current_round: Arc<RwLock<u64>>,
-    
+
     /// 当前状态
     current_state: Arc<RwLock<ConsensusState>>,
-    
+
     /// 当前提议的区块
     current_proposal: Arc<RwLock<Option<BlockProposal>>>,
-    
+
     /// 收到的投票
     votes: Arc<RwLock<HashMap<Hash, Vec<Vote>>>>,
-    
+
     /// VDF 管理器
     vdf_manager: Arc<VDFManager>,
-    
+
     /// VRF 选择器
     vrf_selector: Arc<VRFSelector>,
-    
+
     /// 验证者集合
     validators: Arc<RwLock<Vec<PublicKey>>>,
-    
+
     /// 权益权重列表
     stake_weights: Arc<RwLock<Vec<u64>>>,
-    
+
     /// 已确认的区块
     finalized_blocks: Arc<RwLock<HashMap<Hash, Block>>>,
-    
+
     /// 当前高度
     current_height: Arc<RwLock<u64>>,
+
+    /// 本地验证者身份（None 表示不是验证者）
+    local_validator_identity: Option<PublicKey>,
 }
 
 /// 区块提议
@@ -170,6 +173,7 @@ impl PoVFEngine {
         vdf_calculator: Arc<dyn VDFCalculator>,
         vrf_key_pair: VRFKeyPair,
         initial_round: u64,
+        local_validator_identity: Option<PublicKey>,
     ) -> Self {
         let vdf_manager = Arc::new(VDFManager::new(vdf_calculator));
         
@@ -177,8 +181,12 @@ impl PoVFEngine {
         let mut vrf_selector = VRFSelector::new();
         
         // 从配置的验证者权益中添加验证者
-        // 注意: 每个验证者应该有自己的 VRF 密钥对，这里暂时使用传入的密钥对
-        // TODO: 在实际应用中，应该从配置或存储中加载每个验证者的密钥对
+        // NOTE: 生产环境实现要求每个验证者有自己的 VRF 密钥对
+        // 当前实现使用共享密钥对用于所有验证者，这在生产环境中是不安全的
+        // 要正确实现，需要：
+        // 1. 从配置文件或密钥库加载每个验证者的 VRF 公钥
+        // 2. 在 VRFSelector 中为每个验证者注册其对应的公钥
+        // 3. 在验证 VRF 时使用正确的验证者公钥进行验证
         for (pub_key, stake) in config.validator_stakes.iter() {
             // 将 PublicKey 转换为 Address (取前20字节)
             let mut address: [u8; 20] = [0u8; 20];
@@ -204,6 +212,7 @@ impl PoVFEngine {
             stake_weights: Arc::new(RwLock::new(stake_weights)),
             finalized_blocks: Arc::new(RwLock::new(HashMap::new())),
             current_height: Arc::new(RwLock::new(0)),
+            local_validator_identity,
         }
     }
 
@@ -392,26 +401,26 @@ impl PoVFEngine {
 
         info!("VDF computation completed, entering voting phase");
 
-        // 5. 自动投票 (如果我是验证者)
-        // 这里的 self.config.validator_stakes 包含了所有验证者
-        // 我们需要知道"我是谁"。但是 PoVFEngine 目前没有存储本地身份。
-        // 作为一个简化，我们遍历所有验证者，并为每一个"本地"验证者投票。
-        // 在真实实现中，应该检查本地密钥库。
-        
-        // HACK: 假设第一个验证者就是本地节点，或者我们在测试模式下为所有配置的验证者自动投票
-        // 为了确保测试通过，我们为配置中的所有验证者投赞成票
-        let validators: Vec<PublicKey> = self.config.validator_stakes.keys().cloned().collect();
-        for validator in validators {
-             // 模拟发送投票
-             info!("Auto-casting vote for validator {:?}", validator);
-             match self.handle_vote(validator, block_hash, round, VoteType::For).await {
-                 Ok(result) => {
-                     if result.is_finalized {
-                         return Ok(result);
-                     }
-                 }
-                 Err(e) => warn!("Auto-vote failed: {}", e),
-             }
+        // 5. 自动投票 (如果本地节点是验证者)
+        if let Some(local_identity) = &self.local_validator_identity {
+            info!("Local validator identity found: {:?}, casting vote", local_identity);
+
+            // 检查本地验证者是否在验证者集合中
+            let validators = self.validators.read().await;
+            if validators.contains(local_identity) {
+                match self.handle_vote(local_identity.clone(), block_hash, round, VoteType::For).await {
+                    Ok(result) => {
+                        if result.is_finalized {
+                            return Ok(result);
+                        }
+                    }
+                    Err(e) => warn!("Local validator vote failed: {}", e),
+                }
+            } else {
+                warn!("Local identity {:?} is not in the validator set", local_identity);
+            }
+        } else {
+            debug!("No local validator identity configured, skipping auto-vote");
         }
         
         // 再次检查最终性（以防投票触发了最终性）
@@ -509,8 +518,29 @@ impl PoVFEngine {
     }
 
     /// 验证交易
-    async fn validate_transaction(&self, _tx: &norn_common::types::Transaction) -> Result<bool> {
-        // TODO: 实现交易验证逻辑
+    async fn validate_transaction(&self, tx: &Transaction) -> Result<bool> {
+        // 1. 验证签名
+        verify_transaction(tx)
+            .map_err(|e| NornError::ConsensusError(format!("Transaction verification failed: {:?}", e)))?;
+
+        // 2. 验证基本字段
+        if tx.body.gas <= 0 {
+            warn!("Transaction has invalid gas limit: {}", tx.body.gas);
+            return Ok(false);
+        }
+
+        // 3. 验证 nonce (nonce 应该是非负的)
+        if tx.body.nonce < 0 {
+            warn!("Transaction has invalid nonce: {}", tx.body.nonce);
+            return Ok(false);
+        }
+
+        // 4. 验证地址格式
+        if tx.body.address.0 == [0u8; 20] {
+            warn!("Transaction has invalid sender address");
+            return Ok(false);
+        }
+
         Ok(true)
     }
 
@@ -550,13 +580,31 @@ impl PoVFEngine {
     }
 
     /// 验证 VDF 输出
-    async fn verify_vdf_output(&self, proposal: &BlockProposal, _vdf_output: &[u8]) -> Result<bool> {
-        let _vdf_params = self.create_vdf_params(&proposal.block);
-        let _vdf_input = proposal.vdf_input;
-        
-        // TODO: 实现完整的 VDF 验证
-        // VDFManager 目前没有 verify_vdf 方法
-        // 可以通过重新计算 VDF 或检查缓存来验证
+    async fn verify_vdf_output(&self, proposal: &BlockProposal, vdf_output: &[u8]) -> Result<bool> {
+        // 基本验证：检查输出长度是否合理
+        let min_expected_size = 32; // 至少应该有32字节的哈希输出
+
+        if vdf_output.len() < min_expected_size {
+            warn!("VDF output too short: {} bytes", vdf_output.len());
+            return Ok(false);
+        }
+
+        // 在生产环境中，这里应该：
+        // 1. 从缓存中查找已计算的 VDF 结果
+        // 2. 或使用 VDFCalculator trait 的 verify_vdf 方法重新验证
+        // 3. 或本地重新计算 VDF (较慢但最可靠)
+
+        // 当前实现进行基本验证
+        debug!("VDF output verification passed (basic checks only)");
+
+        // 检查 VDF 输出是否与预期格式匹配
+        // VDF output should contain: result hash + optional proof
+        if vdf_output.len() > 10 * 1024 * 1024 {
+            // 10MB max VDF output size
+            warn!("VDF output too large: {} bytes", vdf_output.len());
+            return Ok(false);
+        }
+
         Ok(true)
     }
 
@@ -727,7 +775,7 @@ mod tests {
         let vdf_calculator = Arc::new(SimpleVDF::new());
         let vrf_key_pair = VRFKeyPair::generate();
         
-        let engine = PoVFEngine::new(config, vdf_calculator, vrf_key_pair, 1);
+        let engine = PoVFEngine::new(config, vdf_calculator, vrf_key_pair, 1, None);
         
         let (state, round, proposal) = engine.get_state().await;
         assert_eq!(round, 1);
@@ -742,7 +790,7 @@ mod tests {
         
         let vdf_calculator = Arc::new(SimpleVDF::new());
         let vrf_key_pair = VRFKeyPair::generate();
-        let engine = PoVFEngine::new(config, vdf_calculator, vrf_key_pair, 1);
+        let engine = PoVFEngine::new(config, vdf_calculator, vrf_key_pair, 1, None);
         
         // 创建测试区块
         let block = Block {
@@ -780,7 +828,7 @@ mod tests {
         
         let vdf_calculator = Arc::new(SimpleVDF::new());
         let vrf_key_pair = VRFKeyPair::generate();
-        let engine = PoVFEngine::new(config, vdf_calculator, vrf_key_pair, 1);
+        let engine = PoVFEngine::new(config, vdf_calculator, vrf_key_pair, 1, None);
         
         // 首先需要有一个提议才能投票
         // 这里只测试基本创建能力
