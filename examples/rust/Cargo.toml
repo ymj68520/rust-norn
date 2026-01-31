@@ -21,6 +21,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio-tungstenite = "0.21"
 futures = "0.3"
 dotenv = "0.15"
+reqwest = { version = "0.11", features = ["json"] }
+
+[dev-dependencies]
+ctor = "0.2"
 
 [[bin]]
 name = "basic_rpc"
@@ -37,3 +41,19 @@ path = "src/transaction_sender.rs"
 [[bin]]
 name = "websocket_listener"
 path = "src/websocket_listener.rs"
+
+[[bin]]
+name = "contract_interaction"
+path = "src/contract_interaction.rs"
+
+[[bin]]
+name = "batch_rpc_requests"
+path = "src/batch_rpc_requests.rs"
+
+[[bin]]
+name = "health_check_monitoring"
+path = "src/health_check_monitoring.rs"
+
+[[bin]]
+name = "rate_limiting_utilities"
+path = "src/rate_limiting_utilities.rs"

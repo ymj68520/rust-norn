@@ -16,6 +16,11 @@ The examples show how to:
 ```
 examples/
 ├── README.md                       # This file
+├── tests/                          # Integration tests (75+ tests)
+│   ├── README.md                   # Test documentation
+│   ├── integration_tests.rs        # Rust integration tests
+│   ├── test_integration.py         # Python integration tests
+│   └── integration.test.js         # JavaScript integration tests
 ├── rust/                           # Rust examples (9 files)
 │   ├── Cargo.toml
 │   ├── .env.example
@@ -28,6 +33,8 @@ examples/
 │   │   ├── batch_rpc_requests.rs           # Batch RPC calls
 │   │   ├── health_check_monitoring.rs      # Node health monitoring
 │   │   └── rate_limiting_utilities.rs      # Rate limiting patterns
+│   ├── tests/
+│   │   └── integration_tests.rs    # Rust integration tests
 │   └── README.md
 ├── python/                         # Python examples (9 files)
 │   ├── requirements.txt
@@ -40,6 +47,8 @@ examples/
 │   ├── batch_rpc_requests.py
 │   ├── health_check_monitoring.py
 │   ├── rate_limiting_utilities.py
+│   ├── tests/
+│   │   └── test_integration.py     # Python integration tests
 │   └── README.md
 └── javascript/                     # JavaScript/Node.js examples (9 files)
     ├── package.json
@@ -52,6 +61,8 @@ examples/
     ├── batch_rpc_requests.js
     ├── health_check_monitoring.js
     ├── rate_limiting_utilities.js
+    ├── tests/
+    │   └── integration.test.js     # JavaScript integration tests
     └── README.md
 ```
 
@@ -482,7 +493,58 @@ def rate_limit(calls_per_second):
 4. **Caching**: Cache frequently accessed data
 5. **Async Operations**: Use async I/O for non-blocking calls
 
-## Troubleshooting
+## Integration Tests
+
+Comprehensive integration tests (75+ tests) verify that all examples work correctly with a running Norn node.
+
+### Run Tests
+
+**Rust:**
+```bash
+cd examples/rust
+cargo test --test integration_tests -- --test-threads=1 --nocapture
+```
+
+**Python:**
+```bash
+cd examples/python
+pip install pytest requests
+pytest tests/test_integration.py -v -s
+```
+
+**JavaScript:**
+```bash
+cd examples/javascript
+npm install --save-dev jest
+npm test
+```
+
+### Test Coverage
+
+The integration tests verify:
+- ✅ RPC connectivity to node
+- ✅ Response format validation
+- ✅ Error handling
+- ✅ Concurrent request handling
+- ✅ Data consistency
+- ✅ Example-specific requirements
+- ✅ Performance metrics
+
+### Example Test Categories
+
+1. **Basic RPC Operations** - Chain ID, block number, gas price
+2. **Block Information** - Retrieve block by number
+3. **Account Balance** - Query balance, nonce, code
+4. **Error Handling** - Invalid address, invalid block
+5. **Response Parsing** - Various response types
+6. **Connection Handling** - Sequential and concurrent requests
+7. **Data Consistency** - Consistent results
+8. **Example-Specific Tests** - Verify each example works
+9. **Performance Tests** - Response timing and throughput
+
+For detailed test documentation, see [`tests/README.md`](tests/README.md)
+
+
 
 ### Node Not Running
 ```bash
