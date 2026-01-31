@@ -1,0 +1,39 @@
+[package]
+name = "norn-rust-example"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+tokio = { version = "1.36", features = ["full"] }
+jsonrpsee = { version = "0.20", features = ["client", "async-client", "macros"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+hex = "0.4"
+k256 = { version = "0.13", features = ["ecdsa"] }
+rand = "0.8"
+chrono = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tokio-tungstenite = "0.21"
+futures = "0.3"
+dotenv = "0.15"
+
+[[bin]]
+name = "basic_rpc"
+path = "src/basic_rpc.rs"
+
+[[bin]]
+name = "balance_checker"
+path = "src/balance_checker.rs"
+
+[[bin]]
+name = "transaction_sender"
+path = "src/transaction_sender.rs"
+
+[[bin]]
+name = "websocket_listener"
+path = "src/websocket_listener.rs"

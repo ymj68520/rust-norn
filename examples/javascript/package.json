@@ -1,0 +1,20 @@
+{
+  "name": "norn-javascript-examples",
+  "version": "0.1.0",
+  "description": "JavaScript examples for interacting with Norn blockchain node",
+  "main": "basic_rpc.js",
+  "scripts": {
+    "basic-rpc": "node basic_rpc.js",
+    "balance-checker": "node balance_checker.js",
+    "transaction-sender": "node transaction_sender.js",
+    "websocket-listener": "node websocket_listener.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "ws": "^8.14.0",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
