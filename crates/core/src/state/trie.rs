@@ -141,6 +141,17 @@ impl MerklePatriciaTrie {
         }
     }
 
+    /// Create an empty trie placeholder (for breaking circular dependencies)
+    pub fn empty() -> Self {
+        use crate::mocks::MockTrieDB;
+        Self {
+            root: Arc::new(RwLock::new(NodeRef::Inline(Box::new(NodeType::Null)))),
+            db: Arc::new(MockTrieDB::new()),
+            cache: Arc::new(RwLock::new(HashMap::new())),
+            config: TrieConfig::default(),
+        }
+    }
+
     /// 获取值
     pub async fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         debug!("Getting value for key: {:?}", key);

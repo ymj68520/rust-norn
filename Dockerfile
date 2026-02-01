@@ -48,7 +48,7 @@ RUN mkdir -p /data && chown norn:norn /data
 USER norn
 
 # Expose ports
-EXPOSE 4001 50051
+EXPOSE 4001 50051 8545
 
 # Set working directory
 WORKDIR /data

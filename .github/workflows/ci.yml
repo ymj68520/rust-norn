@@ -8,142 +8,194 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
+  # Job 1: Check formatting and linting
+  style:
+    name: Check Style & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          components: rustfmt, clippy
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # Job 2: Run tests
   test:
-    name: Test Suite
+    name: Run Tests
     runs-on: ubuntu-latest
+    needs: style
     strategy:
       matrix:
-        rust:
-          - stable
-          - beta
-          - nightly
-
+        rust: [stable]
+        component:
+          - norn-common
+          - norn-crypto
+          - norn-storage
+          - norn-core
+          - norn-network
+          - norn-rpc
+          - norn-node
     steps:
-    - name: Checkout sources
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Install stable toolchain
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ matrix.rust }}
-        override: true
-        components: rustfmt, clippy
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: ${{ matrix.rust }}
+          override: true
 
-    - name: Cache dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-cargo-
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Install protobuf compiler
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Check formatting
-      run: cargo fmt --all -- --check
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Run clippy
-      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Build ${{ matrix.component }}
+        run: cargo build --package ${{ matrix.component }} --verbose
 
-    - name: Build
-      run: cargo build --verbose --workspace
+      - name: Run tests for ${{ matrix.component }}
+        run: cargo test --package ${{ matrix.component }} --verbose
 
-    - name: Run tests
-      run: cargo test --verbose --workspace
+  # Job 3: Integration tests
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
 
-  coverage:
-    name: Code Coverage
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run integration tests
+        run: cargo test --test integration_enhanced_features --verbose
+
+      - name: Run E2E tests
+        run: cargo test --test e2e_full_workflow_test --verbose
+
+  # Job 4: Security audit
+  security:
+    name: Security Audit
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout sources
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Install stable toolchain
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: stable
-        override: true
-        components: llvm-tools-preview
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
 
-    - name: Install protobuf compiler
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+      - name: Run cargo audit
+        uses: actions-rs/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-    - name: Install cargo-llvm-cov
-      uses: taiki-e/install-action@cargo-llvm-cov
-
-    - name: Generate code coverage
-      run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        files: lcov.info
-        fail_ci_if_error: true
-
-  build:
-    name: Build Release
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: macos-latest
-            target: x86_64-apple-darwin
-
+  # Job 5: Build documentation
+  docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    needs: test
     steps:
-    - name: Checkout sources
-      uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Install stable toolchain
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: stable
-        target: ${{ matrix.target }}
-        override: true
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
 
-    - name: Cache dependencies
-      uses: actions/cache@v4
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-${{ matrix.target }}-cargo-
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Install protobuf compiler (Ubuntu)
-      if: matrix.os == 'ubuntu-latest'
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Install protobuf compiler (macOS)
-      if: matrix.os == 'macos-latest'
-      run: |
-        brew install protobuf
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-doc-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-    - name: Build release
-      run: cargo build --release --target ${{ matrix.target }}
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps --all-features
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: norn-${{ matrix.target }}
-        path: |
-          target/${{ matrix.target }}/release/norn*
-          target/${{ matrix.target }}/release/*.dll
-          target/${{ matrix.target }}/release/*.exe
+      - name: Upload documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: documentation
+          path: target/doc

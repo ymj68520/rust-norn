@@ -1,0 +1,43 @@
+# Norn Testnet Configuration - Validator 2
+# Enhanced features enabled
+
+[node]
+data_dir = "/app/data"
+
+[network]
+listen_address = "/ip4/0.0.0.0/tcp/4002"
+mdns = true
+bootstrap_peers = ["/ip4/172.18.0.11/tcp/4001"]
+
+[core.consensus]
+block_interval = 5
+
+[txpool]
+enabled = true
+enhanced = true
+max_size = 20480
+replacement_enabled = true
+min_fee_increase_bps = 1000
+expiration_seconds = 3600
+cleanup_interval = 300
+
+[sync]
+mode = "fast"
+header_batch_size = 500
+body_batch_size = 100
+checkpoint_interval = 1000
+max_parallel_downloads = 10
+request_timeout_secs = 30
+
+[rpc]
+address = "0.0.0.0:50052"
+
+[monitoring]
+enabled = true
+metrics_port = 9090
+health_check = true
+health_check_port = 8081
+
+[logging]
+level = "debug"
+format = "json"

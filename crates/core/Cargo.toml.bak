@@ -1,0 +1,42 @@
+[package]
+name = "norn-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+rs_merkle = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+dashmap = "5.5" # No workspace for this
+moka = { workspace = true }
+norn-common = { workspace = true }
+norn-crypto = { workspace = true }
+norn-storage = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+num-bigint = { workspace = true }
+num-traits = "0.2"
+async-trait = { workspace = true }
+chrono = { workspace = true }
+once_cell = "1.19"
+bincode = { workspace = true }
+
+# EVM Support
+revm = { workspace = true }
+revm-precompile = "11" # Use revm's precompile implementations
+ethabi = { workspace = true }
+keccak-hash = { workspace = true }
+rlp = { workspace = true }
+ripemd = { workspace = true }
+blake2 = { workspace = true }
+k256 = { workspace = true }
+blst = { workspace = true }
+curve25519-dalek = { workspace = true }
+tiny-keccak = "2.0" # For ABI encoding
+
+[dev-dependencies]
+tempfile = "3"

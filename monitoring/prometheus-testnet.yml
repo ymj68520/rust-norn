@@ -1,0 +1,52 @@
+# Prometheus configuration for Norn testnet
+
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    cluster: 'norn-testnet'
+    environment: 'test'
+
+# Alerting configuration (optional)
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets:
+
+# Rule files
+# rule_files:
+#   - "alerts.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Norn Validator 1
+  - job_name: 'norn-validator1'
+    static_configs:
+      - targets: ['norn-validator1:9090']
+        labels:
+          instance: 'validator1'
+          node_type: 'validator'
+          node_id: '1'
+
+  # Norn Validator 2
+  - job_name: 'norn-validator2'
+    static_configs:
+      - targets: ['norn-validator2:9090']
+        labels:
+          instance: 'validator2'
+          node_type: 'validator'
+          node_id: '2'
+
+  # Norn Validator 3
+  - job_name: 'norn-validator3'
+    static_configs:
+      - targets: ['norn-validator3:9090']
+        labels:
+          instance: 'validator3'
+          node_type: 'validator'
+          node_id: '3'
+
+  # Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

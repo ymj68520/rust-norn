@@ -1,0 +1,132 @@
+version: '3.8'
+
+services:
+  validator1:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        FEATURES: --features production
+    image: norn:testnet-enhanced
+    container_name: norn-validator1
+    command: --config /app/config/validator1.toml
+    ports:
+      - "4001:4001"   # P2P
+      - "50051:50051" # RPC
+      - "9090:9090"   # Metrics
+      - "8080:8080"   # Health
+    volumes:
+      - ./config:/app/config:ro
+      - validator1_data:/app/data
+    environment:
+      - RUST_LOG=info,norn=debug
+      - TXPOOL_ENHANCED=true
+      - SYNC_MODE=fast
+    networks:
+      norn_testnet:
+        ipv4_address: 172.18.0.11
+    restart: unless-stopped
+
+  validator2:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        FEATURES: --features production
+    image: norn:testnet-enhanced
+    container_name: norn-validator2
+    command: --config /app/config/validator2.toml
+    ports:
+      - "4002:4002"
+      - "50052:50052"
+      - "9091:9091"
+      - "8081:8081"
+    volumes:
+      - ./config:/app/config:ro
+      - validator2_data:/app/data
+    environment:
+      - RUST_LOG=info,norn=debug
+      - TXPOOL_ENHANCED=true
+      - SYNC_MODE=fast
+    networks:
+      norn_testnet:
+        ipv4_address: 172.18.0.12
+    restart: unless-stopped
+
+  observer:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      args:
+        FEATURES: --features production
+    image: norn:testnet-enhanced
+    container_name: norn-observer
+    command: --config /app/config/observer.toml
+    ports:
+      - "4003:4003"
+      - "50053:50053"
+      - "9092:9092"
+      - "8082:8082"
+    volumes:
+      - ./config:/app/config:ro
+      - observer_data:/app/data
+    environment:
+      - RUST_LOG=info,norn=debug
+      - TXPOOL_ENHANCED=true
+      - SYNC_MODE=fast
+    networks:
+      norn_testnet:
+        ipv4_address: 172.18.0.13
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: norn-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      norn_testnet:
+        ipv4_address: 172.18.0.10
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: norn-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+    networks:
+      norn_testnet:
+        ipv4_address: 172.18.0.9
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+networks:
+  norn_testnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/16
+
+volumes:
+  validator1_data:
+  validator2_data:
+  observer_data:
+  prometheus_data:
+  grafana_data:

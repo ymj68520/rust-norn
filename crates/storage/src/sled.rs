@@ -120,6 +120,36 @@ impl SledDB {
                 .map_err(|e| anyhow::anyhow!("Failed to check key existence in SledDB: {}", e))
         }).await?
     }
+
+    /// Synchronous insert (for compatibility with persistent state module)
+    pub fn insert_sync(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.db.insert(key, value)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to insert into SledDB: {}", e))
+    }
+
+    /// Synchronous get (for compatibility with persistent state module)
+    pub fn get_sync(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.db.get(key)
+            .map(|v| v.map(|ivec| ivec.to_vec()))
+            .map_err(|e| anyhow::anyhow!("Failed to get from SledDB: {}", e))
+    }
+
+    /// Synchronous remove (for compatibility with persistent state module)
+    pub fn remove_sync(&self, key: &[u8]) -> Result<()> {
+        self.db.remove(key)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Failed to remove from SledDB: {}", e))
+    }
+
+    /// Iterate over keys with a prefix
+    pub fn iter_prefix(&self, prefix: &[u8]) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {
+        self.db.scan_prefix(prefix)
+            .map(|res| {
+                res.map(|(k, v)| (k.to_vec(), v.to_vec()))
+                    .map_err(|e| anyhow::anyhow!("DB iteration error: {}", e))
+            })
+    }
 }
 
 #[cfg(test)]

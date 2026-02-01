@@ -1,3 +1,9 @@
+pub mod sync;
+pub mod compression;
+
+// Re-exports
+pub use compression::{CompressedMessage};
+
 // Placeholders for message structs from Go's Karmem definitions if needed
 // Currently we use raw Vec<u8> in NetworkEvent, but specific structs can go here.
 

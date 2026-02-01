@@ -791,7 +791,7 @@ mod tests {
         let vdf_calculator = Arc::new(SimpleVDF::new());
         let vrf_key_pair = VRFKeyPair::generate();
         let engine = PoVFEngine::new(config, vdf_calculator, vrf_key_pair, 1, None);
-        
+
         // 创建测试区块
         let block = Block {
             header: norn_common::types::BlockHeader {
@@ -799,10 +799,12 @@ mod tests {
                 prev_block_hash: Hash::default(),
                 block_hash: Hash([1u8; 32]),
                 merkle_root: Hash::default(),
+                state_root: Hash::default(),
                 height: 1,
                 public_key: PublicKey::default(),
                 params: vec![],
                 gas_limit: 1000000,
+                base_fee: 1_000_000_000,
             },
             transactions: vec![],
         };

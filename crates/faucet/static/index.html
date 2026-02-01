@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Norn Faucet - Get Test Tokens</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+        }
+
+        h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 32px;
+            text-align: center;
+        }
+
+        .subtitle {
+            color: #666;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 500;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        button {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.4);
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .status {
+            margin-top: 20px;
+            padding: 12px;
+            border-radius: 8px;
+            font-size: 14px;
+            display: none;
+        }
+
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+            display: block;
+        }
+
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+            display: block;
+        }
+
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+            display: block;
+        }
+
+        .info-section {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #e0e0e0;
+        }
+
+        .info-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            font-size: 13px;
+        }
+
+        .info-label {
+            color: #666;
+        }
+
+        .info-value {
+            color: #333;
+            font-weight: 600;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid #ffffff;
+            border-radius: 50%;
+            border-top-color: transparent;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .tx-link {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .tx-link:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚰 Norn Faucet</h1>
+        <p class="subtitle">Get test tokens for development</p>
+
+        <form id="faucetForm">
+            <div class="form-group">
+                <label for="address">Your Ethereum Address</label>
+                <input
+                    type="text"
+                    id="address"
+                    name="address"
+                    placeholder="0x..."
+                    required
+                    pattern="^0x[a-fA-F0-9]{40}$"
+                >
+            </div>
+
+            <button type="submit" id="submitBtn">
+                Request Tokens
+            </button>
+        </form>
+
+        <div id="status" class="status"></div>
+
+        <div class="info-section">
+            <div class="info-item">
+                <span class="info-label">Amount per request:</span>
+                <span class="info-value" id="amount">Loading...</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Rate limit:</span>
+                <span class="info-value" id="rateLimit">Loading...</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Cooldown period:</span>
+                <span class="info-value" id="cooldown">Loading...</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Total dispensed:</span>
+                <span class="info-value" id="totalDispensed">Loading...</span>
+            </div>
+            <div class="info-item">
+                <span class="info-label">Unique addresses:</span>
+                <span class="info-value" id="uniqueAddresses">Loading...</span>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = window.location.origin;
+        const form = document.getElementById('faucetForm');
+        const statusDiv = document.getElementById('status');
+        const submitBtn = document.getElementById('submitBtn');
+
+        // Load faucet status on page load
+        async function loadStatus() {
+            try {
+                const response = await fetch(`${API_URL}/api/status`);
+                const data = await response.json();
+
+                const balance = (parseInt(data.data.balance) / 1e18).toFixed(2);
+                const amount = (parseInt(data.data.dispense_amount) / 1e18).toFixed(2);
+
+                document.getElementById('amount').textContent = `${amount} ETH`;
+                document.getElementById('rateLimit').textContent = '3 requests per hour';
+                document.getElementById('cooldown').textContent = '24 hours';
+                document.getElementById('totalDispensed').textContent =
+                    `${(parseInt(data.data.total_dispensed) / 1e18).toFixed(2)} ETH`;
+                document.getElementById('uniqueAddresses').textContent =
+                    data.data.unique_addresses.toLocaleString();
+            } catch (error) {
+                console.error('Failed to load status:', error);
+            }
+        }
+
+        // Show status message
+        function showStatus(message, type) {
+            statusDiv.textContent = message;
+            statusDiv.className = `status ${type}`;
+        }
+
+        // Handle form submission
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const address = document.getElementById('address').value.trim();
+
+            if (!/^0x[a-fA-F0-9]{40}$/.test(address)) {
+                showStatus('Invalid Ethereum address format', 'error');
+                return;
+            }
+
+            // Disable button and show loading
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<span class="loading"></span>Processing...';
+            showStatus('Processing your request...', 'info');
+
+            try {
+                const response = await fetch(`${API_URL}/api/dispense`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ address }),
+                });
+
+                const data = await response.json();
+
+                if (response.ok) {
+                    const amount = (parseInt(data.data.amount) / 1e18).toFixed(2);
+                    showStatus(
+                        `✓ Successfully sent ${amount} ETH! Transaction: ` +
+                        `<a href="#" class="tx-link">${data.data.tx_hash}</a>`,
+                        'success'
+                    );
+                    form.reset();
+                    loadStatus(); // Reload stats
+                } else {
+                    showStatus(`✗ ${data.message}`, 'error');
+                }
+            } catch (error) {
+                showStatus(`✗ Network error: ${error.message}`, 'error');
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.innerHTML = 'Request Tokens';
+            }
+        });
+
+        // Load status on page load
+        loadStatus();
+    </script>
+</body>
+</html>

@@ -1,5 +1,5 @@
-data_dir = "production_test_data"
-rpc_address = "127.0.0.1:50051"
+data_dir = "/data/node3_data"
+rpc_address = "0.0.0.0:50051"
 
 [core.consensus]
 # 程序会自动从 production_test_data/node.key 加载密钥

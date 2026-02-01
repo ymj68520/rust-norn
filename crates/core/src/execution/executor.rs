@@ -140,10 +140,29 @@ impl TransactionValidator {
     }
 
     /// 验证交易签名
+    ///
+    /// In test mode: Returns true for all transactions to simplify testing
+    /// In production mode: Uses full cryptographic verification with ECDSA
     fn verify_signature(&self, tx: &Transaction) -> bool {
-        // 这里应该实现实际的签名验证逻辑
-        // 暂时返回 true 作为占位符
-        true
+        use norn_common::build_mode;
+
+        // Test mode: Skip signature verification for easier testing
+        if build_mode::IS_TEST_MODE {
+            debug!("Test mode: Skipping signature verification");
+            return true;
+        }
+
+        // Production mode: Full cryptographic verification
+        match norn_crypto::transaction::verify_transaction(tx) {
+            Ok(()) => {
+                debug!("Signature verification passed for transaction: {:?}", tx.body.hash);
+                true
+            }
+            Err(e) => {
+                warn!("Signature verification failed for transaction {:?}: {}", tx.body.hash, e);
+                false
+            }
+        }
     }
 }
 

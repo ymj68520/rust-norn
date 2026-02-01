@@ -10,3 +10,15 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 norn-common = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+
+# Compression libraries
+zstd = { version = "0.13", optional = true }
+snap = "1"  # Use latest compatible version
+serde_bytes = "0.11"
+
+[features]
+default = ["zstd"]
+zstd = ["dep:zstd"]
+snappy = []  # snap is always available but optionally used

@@ -12,6 +12,25 @@ norn-common = { workspace = true }
 norn-core = { workspace = true }
 norn-crypto = { workspace = true }
 hex = { workspace = true }
+jsonrpsee = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+rlp = { workspace = true }
+keccak-hash = { workspace = true }
+anyhow = { workspace = true }
+k256 = { workspace = true }
+spki = { workspace = true }
+num-bigint = { workspace = true }
+axum = { workspace = true }
+futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+norn-storage = { workspace = true }
+tempfile = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.11"

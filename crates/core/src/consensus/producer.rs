@@ -9,6 +9,7 @@ use tokio::time::{interval, Instant};
 use tracing::{debug, info, warn, error};
 
 use norn_common::types::{Block, BlockHeader, Hash, Transaction, PublicKey, GeneralParams};
+use norn_common::build_mode;
 use anyhow::Result;
 use norn_crypto::vrf::{VRFKeyPair, VRFCalculator, VRFOutput, VRFSelector};
 use sha2::{Sha256, Digest};
@@ -17,6 +18,9 @@ use crate::blockchain::Blockchain;
 use crate::txpool::TxPool;
 use crate::merkle::build_merkle_tree;
 use crate::consensus::povf::{PoVFConfig, PoVFEngine, ConsensusMessage, BlockProposal, ConsensusResult};
+use crate::state::AccountStateManager;
+use crate::state::merkle::StateRootCalculator;
+use crate::evm::{EIP1559FeeCalculator, EIP1559Config};
 
 
 /// Block producer configuration
@@ -64,9 +68,11 @@ pub struct BlockProducer {
     blockchain: Arc<Blockchain>,
     tx_pool: Arc<TxPool>,
     vrf_key_pair: VRFKeyPair,
+    state_manager: Arc<AccountStateManager>,
     state: Arc<RwLock<ProducerState>>,
     last_produced: Arc<RwLock<Option<Instant>>>,
     consensus_engine: Option<Arc<PoVFEngine>>,
+    fee_calculator: EIP1559FeeCalculator,
 }
 
 impl BlockProducer {
@@ -76,16 +82,21 @@ impl BlockProducer {
         blockchain: Arc<Blockchain>,
         tx_pool: Arc<TxPool>,
         vrf_key_pair: VRFKeyPair,
+        state_manager: Arc<AccountStateManager>,
         consensus_engine: Option<Arc<PoVFEngine>>,
     ) -> Self {
+        let fee_calculator = EIP1559FeeCalculator::default_config();
+
         Self {
             config,
             blockchain,
             tx_pool,
             vrf_key_pair,
+            state_manager,
             state: Arc::new(RwLock::new(ProducerState::Idle)),
             last_produced: Arc::new(RwLock::new(None)),
             consensus_engine,
+            fee_calculator,
         }
     }
 
@@ -125,9 +136,9 @@ impl BlockProducer {
         
         match VRFCalculator::calculate(&self.vrf_key_pair, &message) {
             Ok(output) => {
-                // Simple threshold check: if VRF output first byte < threshold, we're selected
-                // In production, this would be weighted by stake
-                let threshold = 255u8; // Always produce for testing
+                // VRF threshold check: if VRF output first byte < threshold, we're selected
+                // Threshold is based on stake weight in production
+                let threshold = norn_common::build_mode::get_vrf_threshold();
                 output.output[0] <= threshold
             }
             Err(e) => {
@@ -153,10 +164,27 @@ impl BlockProducer {
         let latest = self.blockchain.latest_block.read().await;
         let prev_hash = latest.header.block_hash;
         let new_height = latest.header.height + 1;
+        let parent_base_fee = latest.header.base_fee;
         drop(latest);
 
         // Calculate merkle root from transactions
         let merkle_root = build_merkle_tree(&transactions);
+
+        // Calculate gas used by transactions
+        let gas_used: i64 = transactions.iter()
+            .map(|tx| tx.body.gas)
+            .sum();
+
+        // Calculate EIP-1559 base fee for this block
+        let base_fee = self.fee_calculator.calculate_next_base_fee(
+            parent_base_fee,
+            gas_used as u64,
+        );
+
+        info!(
+            "EIP-1559: parent_base_fee={}, gas_used={}, new_base_fee={}",
+            parent_base_fee, gas_used, base_fee
+        );
 
         // Get VRF output for this round
         let pub_key = self.vrf_to_public_key();
@@ -171,8 +199,8 @@ impl BlockProducer {
         let seed = hasher.finalize();
 
         let message = VRFSelector::create_selection_message(
-            &seed, 
-            new_height as u64, 
+            &seed,
+            new_height as u64,
             &address
         );
         let vrf_output = VRFCalculator::calculate(&self.vrf_key_pair, &message)?;
@@ -181,16 +209,27 @@ impl BlockProducer {
         let params = self.create_block_params(&vrf_output, new_height as u64);
         let params_bytes = norn_common::utils::codec::serialize(&params)?;
 
+        // Calculate state root
+        let state_root_calculator = StateRootCalculator::new(false); // Use SHA-256 for native
+        let state_root = state_root_calculator
+            .calculate_from_manager(&self.state_manager)
+            .await
+            .unwrap_or_else(|_| Hash::default());
+
+        info!("State root calculated: {:?}", state_root);
+
         // Create block header
         let header = BlockHeader {
             timestamp: chrono::Utc::now().timestamp(),
             prev_block_hash: prev_hash,
             block_hash: Hash::default(), // Will be calculated
             merkle_root,
+            state_root,
             height: new_height,
             public_key: self.vrf_to_public_key(),
             params: params_bytes,
             gas_limit: self.config.max_gas_per_block,
+            base_fee,
         };
 
         // Create block
@@ -325,6 +364,7 @@ impl BlockProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::AccountStateManager;
     use norn_storage::SledDB;
 
     #[tokio::test]
@@ -333,11 +373,12 @@ mod tests {
         let db = Arc::new(SledDB::new(temp_dir.path().to_str().unwrap()).unwrap());
         let blockchain = Blockchain::new_with_fixed_genesis(db).await;
         let tx_pool = Arc::new(TxPool::new());
+        let state_manager = Arc::new(AccountStateManager::default());
         let vrf_key_pair = VRFKeyPair::generate();
-        
+
         let config = BlockProducerConfig::default();
-        let producer = BlockProducer::new(config, blockchain, tx_pool, vrf_key_pair, None);
-        
+        let producer = BlockProducer::new(config, blockchain, tx_pool, vrf_key_pair, state_manager, None);
+
         assert_eq!(producer.get_state().await, ProducerState::Idle);
     }
 
@@ -347,17 +388,18 @@ mod tests {
         let db = Arc::new(SledDB::new(temp_dir.path().to_str().unwrap()).unwrap());
         let blockchain = Blockchain::new_with_fixed_genesis(db).await;
         let tx_pool = Arc::new(TxPool::new());
+        let state_manager = Arc::new(AccountStateManager::default());
         let vrf_key_pair = VRFKeyPair::generate();
-        
+
         let config = BlockProducerConfig {
             is_validator: true,
             ..Default::default()
         };
-        let producer = BlockProducer::new(config, blockchain.clone(), tx_pool, vrf_key_pair, None);
-        
+        let producer = BlockProducer::new(config, blockchain.clone(), tx_pool, vrf_key_pair, state_manager, None);
+
         // Produce a block
         let (block, _) = producer.produce_block().await.unwrap();
-        
+
         assert_eq!(block.header.height, 1);
         assert!(!block.header.block_hash.0.iter().all(|&b| b == 0));
     }

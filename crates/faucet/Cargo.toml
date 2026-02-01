@@ -1,0 +1,69 @@
+[package]
+name = "norn-faucet"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "faucet"
+path = "src/main.rs"
+
+[dependencies]
+# Async Runtime & Utilities
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Web Framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { version = "1.0", features = ["full"] }
+
+# RPC & Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Database
+sled = { workspace = true }
+
+# Logging & Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Cryptography
+k256 = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+keccak-hash = { workspace = true }
+rlp = { workspace = true }
+rand = "0.8"
+
+# Serialization
+bincode = "1.3"
+
+# Time
+chrono = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# HTTP Client (for blockchain RPC)
+reqwest = { version = "0.11", features = ["json"] }
+
+# Configuration
+clap = { workspace = true }
+
+# Rate Limiting
+governor = { version = "0.6", features = ["std"] }
+
+# Caching
+moka = { workspace = true }
+
+# Metrics
+prometheus = { workspace = true }
+
+# Internal dependencies
+norn-common = { workspace = true }
+norn-crypto = { workspace = true }
+norn-rpc = { workspace = true }

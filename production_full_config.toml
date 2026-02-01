@@ -1,0 +1,156 @@
+# Production Configuration for Norn Blockchain Node
+# This configuration is optimized for production deployment
+
+[node]
+# Directory for storing blockchain data
+data_dir = "/var/lib/norn"
+
+# Enable metrics collection
+enable_metrics = true
+
+# Log level: trace, debug, info, warn, error
+# Production recommendation: info for normal operation, debug for troubleshooting
+log_level = "info"
+
+# Node type: validator or full
+node_type = "validator"
+
+[core.consensus]
+# VRF threshold for leader election (0-255)
+# Production: 128 = 50% probability
+# Test: 255 = 100% probability
+vrf_threshold = 128
+
+# Block production interval in seconds
+block_interval = 5
+
+# VDF difficulty (higher = more secure but slower)
+vdf_difficulty = 1000
+
+[txpool]
+# Enable enhanced transaction pool
+enhanced = true
+
+# Maximum number of transactions in pool
+max_size = 10000
+
+# Transaction expiration time in seconds
+expiration_seconds = 3600
+
+# Minimum gas price (in wei)
+min_gas_price = 1000000000
+
+[network]
+# P2P listen address (0 = auto-assign port)
+listen_address = "/ip4/0.0.0.0/tcp/4001"
+
+# Disable mDNS in production (use bootstrap_peers instead)
+mdns = false
+
+# Bootstrap peers (multiaddr format)
+# Example: bootstrap_peers = ["/ip4/1.2.3.4/tcp/4001/p2p/12D3KooW..."]
+bootstrap_peers = []
+
+# Maximum number of peer connections
+max_peers = 50
+
+# Connection timeout in seconds
+connection_timeout = 30
+
+[rpc]
+# Enable gRPC server
+enabled = true
+
+# RPC listen address
+address = "0.0.0.0:50051"
+
+# Maximum concurrent connections
+max_connections = 100
+
+# Request timeout in seconds
+request_timeout = 30
+
+[monitoring]
+# Enable Prometheus metrics
+prometheus_enabled = true
+
+# Prometheus metrics endpoint
+prometheus_address = "0.0.0.0:9090"
+
+# Metrics update interval in seconds
+metrics_update_interval = 15
+
+# Enable health check endpoint
+health_check_enabled = true
+
+# Health check endpoint
+health_check_address = "0.0.0.0:8080"
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Log format: json or pretty
+format = "json"
+
+# Log outputs: stdout, file, both
+outputs = ["stdout", "file"]
+
+# Log file path (when outputs includes "file")
+file_path = "/var/log/norn/node.log"
+
+# Log rotation
+# Maximum log file size in MB before rotation
+max_file_size = 100
+
+# Maximum number of old log files to keep
+max_files = 10
+
+# Compress rotated log files
+compress = true
+
+[storage]
+# Storage backend: sled (currently only option)
+backend = "sled"
+
+# Database cache size in MB
+cache_size = 256
+
+# Enable database compression
+compression = true
+
+# Write-ahead log enabled
+wal_enabled = true
+
+# Snapshot interval in blocks
+snapshot_interval = 1000
+
+[security]
+# Enable TLS for network connections
+tls_enabled = false
+
+# Path to TLS certificate
+tls_cert_path = "/etc/norn/cert.pem"
+
+# Path to TLS private key
+tls_key_path = "/etc/norn/key.pem"
+
+# Maximum request size in MB
+max_request_size = 10
+
+# Rate limiting
+rate_limit_enabled = true
+rate_limit_requests_per_second = 1000
+
+[features]
+# Enable fast sync
+fast_sync_enabled = true
+
+# Fast sync checkpoint interval
+fast_sync_checkpoint_interval = 1000
+
+# Enable state pruning
+state_pruning_enabled = false
+
+# Prune state older than this many blocks
+prune_depth = 10000

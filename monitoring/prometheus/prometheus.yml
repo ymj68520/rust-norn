@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    monitor: 'norn-monitor'
+    cluster: 'enhanced-testnet'
+
+scrape_configs:
+  - job_name: 'norn-validator1'
+    static_configs:
+      - targets: ['norn-validator1:9090']
+    metrics_path: '/metrics'
+
+  - job_name: 'norn-validator2'
+    static_configs:
+      - targets: ['norn-validator2:9090']
+    metrics_path: '/metrics'
+
+# Alerting configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+# Rule files
+rule_files:
+  - "alert_rules.yml"

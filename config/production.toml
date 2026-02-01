@@ -1,0 +1,590 @@
+################################################################################
+# NORN BLOCKCHAIN - PRODUCTION CONFIGURATION
+################################################################################
+# 
+# This is a comprehensive production configuration file for deploying
+# norn nodes in production environments with all optimizations and
+# security best practices enabled.
+#
+# PRODUCTION DEPLOYMENT CHECKLIST:
+# ✓ Use this configuration as a template
+# ✓ Replace all TODO placeholders with actual values
+# ✓ Store sensitive keys in secure key management systems (not in git)
+# ✓ Use environment variable injection for secrets
+# ✓ Enable monitoring and logging for production visibility
+# ✓ Configure backups for the data directory
+# ✓ Set up health checks and alerting
+#
+# VERSION: 1.0.0
+# LAST UPDATED: 2025-01-31
+#
+################################################################################
+
+################################################################################
+# 1. BASIC NODE CONFIGURATION
+################################################################################
+
+# Data directory where blockchain data is stored
+# Production recommendation: Use high-performance SSD storage
+# Example: /mnt/ssd/norn_data (on dedicated SSD)
+data_dir = "/var/lib/norn/data"
+
+# RPC service address for client connections
+# Production recommendation: Use internal network or with reverse proxy
+# Examples:
+#   - Internal only: "127.0.0.1:50051"
+#   - All interfaces: "0.0.0.0:50051" (use with firewall)
+#   - Specific interface: "192.168.1.10:50051"
+rpc_address = "0.0.0.0:50051"
+
+# Node identifier (optional, for logging and monitoring)
+# Helps identify this specific node in multi-node deployments
+node_id = "norn-validator-1"
+
+################################################################################
+# 2. CORE BLOCKCHAIN CONFIGURATION
+################################################################################
+
+[core]
+
+# Consensus mechanism configuration (PoVF - Proof of Verifiable Function)
+[core.consensus]
+# Validator's public key (secp256k1 compressed format, 33 bytes hex)
+# TODO: Replace with actual validator public key
+# Format: 33-byte hex string (66 hex characters)
+# Example: "02abc123def456..."
+pub_key = "TODO_REPLACE_WITH_VALIDATOR_PUBLIC_KEY"
+
+# Validator's private key (secp256k1 format, 32 bytes hex)
+# ⚠️  CRITICAL SECURITY WARNING:
+#     DO NOT hardcode private keys in configuration files!
+#     This is for example only. In production:
+#     - Use environment variables: export NORN_PRIVATE_KEY="..."
+#     - Use key management services (Vault, KMS)
+#     - Restrict file permissions: chmod 600 production.toml
+#     - Never commit this file to version control
+# TODO: Replace with actual validator private key
+# Format: 32-byte hex string (64 hex characters)
+# Recommendation: Load from secure environment variable
+prv_key = "TODO_REPLACE_WITH_VALIDATOR_PRIVATE_KEY"
+
+# Minimum VDF iterations (controls minimum consensus time)
+# Recommendation: Production value 100000 or higher for security
+# Higher value = longer consensus time but better security against time attacks
+min_vdf_iterations = 100000
+
+# Maximum VDF iterations (prevents DoS attacks)
+# Recommendation: 1000000 for production
+# Prevents malicious actors from submitting excessively large VDF challenges
+max_vdf_iterations = 1000000
+
+################################################################################
+# 3. NETWORK CONFIGURATION
+################################################################################
+
+[network]
+
+# P2P network listening address
+# Format: /ip4/{IP}/tcp/{PORT} or /ip6/{IPv6}/tcp/{PORT}
+# Production recommendations:
+#   - Listen on all interfaces: /ip4/0.0.0.0/tcp/4001
+#   - Bind to specific interface: /ip4/192.168.1.10/tcp/4001
+#   - IPv6: /ip6/::/tcp/4001
+listen_address = "/ip4/0.0.0.0/tcp/4001"
+
+# Bootstrap peers for network discovery
+# When the node starts, it connects to these peers to discover the network
+# Format: /ip4/{IP}/tcp/{PORT}/p2p/{PEER_ID}
+#         or /dns/{DOMAIN}/tcp/{PORT}/p2p/{PEER_ID}
+# 
+# Production setup (at least 3 bootstrap nodes for redundancy):
+# bootstrap_peers = [
+#     "/ip4/192.168.1.100/tcp/4001/p2p/12D3KooWJ8jmhP...",
+#     "/ip4/192.168.1.101/tcp/4001/p2p/12D3KooWK9jmhP...",
+#     "/ip4/192.168.1.102/tcp/4001/p2p/12D3KooWL0jmhP...",
+# ]
+# TODO: Replace with actual bootstrap peer multiaddrs
+bootstrap_peers = [
+    # "TODO: Add bootstrap peer multiaddrs here"
+]
+
+# Enable mDNS (Multicast DNS) for local network discovery
+# Production recommendation: false (disable for production networks)
+# - true: Auto-discover nodes in local network (good for testing)
+# - false: Only connect to configured bootstrap peers (recommended for WAN)
+mdns = false
+
+# Maximum number of peer connections
+# Production recommendation: 50-100 for optimal performance
+# - Too low: May miss blocks from network
+# - Too high: Consumes more bandwidth and memory
+max_peers = 50
+
+# Inbound connection limit (simultaneous inbound connections)
+# Production recommendation: 30 (about 60% of max_peers)
+inbound_connection_limit = 30
+
+# Outbound connection limit (simultaneous outbound connections)
+# Production recommendation: 20 (about 40% of max_peers)
+outbound_connection_limit = 20
+
+# Connection timeout in seconds
+# How long to wait for peer connection to establish before giving up
+connection_timeout_secs = 30
+
+# Idle connection timeout in seconds
+# How long to keep idle connections open before closing
+idle_timeout_secs = 300
+
+# Enable protocol encryption (Noise protocol)
+# Production recommendation: true (always enable for security)
+enable_noise_encryption = true
+
+################################################################################
+# 4. CONSENSUS CONFIGURATION
+################################################################################
+
+[core.consensus]
+
+# Block production interval in seconds
+# Controls how frequently new blocks are produced
+# Production value depends on desired transaction throughput
+# - 1s: ~1000 TPS theoretical maximum
+# - 2s: ~500 TPS theoretical maximum
+block_interval_secs = 1
+
+# Maximum validators in consensus (for scalability)
+# Production recommendation: 3-21 for optimal Byzantine Fault Tolerance (BFT)
+# - With 3 validators: can tolerate 1 failure
+# - With 21 validators: can tolerate 7 failures
+max_validators = 21
+
+# Consensus finality depth (number of blocks for final confirmation)
+# Production recommendation: 2-4
+# After this many blocks, transactions are irreversible
+finality_depth = 2
+
+# Round timeout in seconds (how long to wait for consensus round)
+# Prevents network from getting stuck if some nodes are offline
+round_timeout_secs = 10
+
+################################################################################
+# 5. BLOCK PRODUCER CONFIGURATION
+################################################################################
+
+[core.producer]
+
+# Enable block production on this node
+# Set to true only if this node is a validator
+# Set to false for read-only full nodes
+is_validator = true
+
+# Preferred block size in bytes
+# Block producer will try to fill blocks up to this size
+# Default: 1MB - 100KB overhead for headers
+preferred_block_size = 1044480  # ~1MB
+
+# Maximum block size limit (hard limit, cannot exceed)
+# Prevents buggy code from creating oversized blocks
+max_block_size = 10485760  # 10MB
+
+# Transaction gas limit per block
+# Controls computational complexity per block
+# Recommendation: 30,000,000 for typical production
+tx_gas_limit_per_block = 30000000
+
+# Maximum transactions per block
+# Helps prevent extremely large block sizes
+max_txs_per_block = 10000
+
+# Coinbase (block reward) recipient address
+# TODO: Replace with actual coinbase address
+# This account receives block rewards and transaction fees
+coinbase_address = "TODO_REPLACE_WITH_COINBASE_ADDRESS"
+
+# Block reward in Wei (smallest unit)
+# Example: 1 Norn = 1e18 Wei
+# Production value depends on economic model (typically 1-10 tokens per block)
+block_reward_wei = 1000000000000000000  # 1 token
+
+################################################################################
+# 6. TRANSACTION POOL CONFIGURATION (Enhanced Features)
+################################################################################
+
+[txpool]
+
+# Enable transaction pool
+# Should be true for all production nodes
+enabled = true
+
+# Enable enhanced transaction pool features
+# This flag is set by the 'enhanced_txpool' feature in production build
+# - true: Binary heap priority queue, EIP-1559 support, advanced fee estimation
+# - false: Simple FIFO queue (lower overhead but less efficient)
+enhanced = true
+
+# Maximum transaction pool size
+# Production recommendation: 10,000-100,000 transactions
+# - Larger: More throughput but higher memory usage
+# - Smaller: Lower memory but may reject transactions during traffic spikes
+max_size = 50000
+
+# Transaction expiration time in seconds
+# Transactions sitting in pool longer than this are discarded
+# Production recommendation: 3600 (1 hour) to 86400 (24 hours)
+expiration_seconds = 3600
+
+# Minimum transaction fee (Wei per transaction)
+# Transactions with lower fees may be rejected during network congestion
+# Production value: depends on token economics
+min_tx_fee = 1000000000000000  # 0.001 token
+
+# Price bumping percentage for replacement transactions
+# When replacing a transaction, new gas price must be higher by at least this %
+price_bump_percentage = 10
+
+# Enable EIP-1559 style dynamic fee calculation
+# Recommended: true for modern blockchain implementations
+enable_eip1559 = true
+
+# Base fee multiplier (for EIP-1559)
+# Controls how aggressively base fee adjusts to network congestion
+base_fee_multiplier = 12
+
+# Max priority fee per block (for EIP-1559)
+# Maximum premium users pay above base fee
+max_priority_fee = 2000000000000000000  # 2 tokens
+
+################################################################################
+# 7. SYNCHRONIZATION CONFIGURATION (Fast Sync Mode)
+################################################################################
+
+[sync]
+
+# Synchronization mode
+# Options: "fast" or "full"
+# - "fast": Sync headers first, then bodies in parallel (recommended for production)
+# - "full": Verify every block in sequence (slower but more thorough)
+mode = "fast"
+
+# Number of block headers to request per batch during sync
+# Larger batches = faster sync but higher network load
+# Production recommendation: 500-1000
+header_batch_size = 500
+
+# Number of block bodies to request per batch during sync
+# Typically smaller than header batch due to body size
+# Production recommendation: 100-200
+body_batch_size = 100
+
+# Checkpoint interval for state root verification
+# Every N blocks, verify state root against trusted checkpoint
+# Prevents undetected state corruption
+# Production recommendation: 1000 blocks
+checkpoint_interval = 1000
+
+# Sync timeout in seconds (for each sync batch request)
+# If peer doesn't respond within this time, try another peer
+sync_timeout_secs = 30
+
+# Maximum concurrent sync requests
+# Higher = faster but more resource intensive
+max_concurrent_sync_requests = 10
+
+################################################################################
+# 8. MONITORING AND METRICS CONFIGURATION
+################################################################################
+
+[monitoring]
+
+# Enable Prometheus metrics collection
+# Exposes blockchain and node metrics for monitoring dashboards
+prometheus_enabled = true
+
+# Prometheus metrics endpoint address
+# Format: {IP}:{PORT}
+# Recommendation: Restrict to internal network or use firewall
+prometheus_address = "0.0.0.0:9090"
+
+# Metrics collection interval in seconds
+# How frequently metrics are updated
+metrics_interval_secs = 10
+
+# Enable health check endpoint
+# Provides simple health status for load balancers and monitoring systems
+health_check_enabled = true
+
+# Health check endpoint address
+# Returns 200 OK if node is healthy, 503 if unhealthy
+health_check_address = "0.0.0.0:8080"
+
+# Health check interval in seconds
+# How frequently health status is updated
+health_check_interval_secs = 5
+
+# Enable detailed metrics
+# When enabled, collects additional detailed metrics (may impact performance)
+# Recommendation: true for debugging, false for high-load production
+enable_detailed_metrics = false
+
+################################################################################
+# 9. LOGGING CONFIGURATION
+################################################################################
+
+[logging]
+
+# Log level: trace, debug, info, warn, error
+# Production recommendation: "info" or "warn"
+# - trace/debug: Maximum verbosity, high performance impact
+# - info: Balanced - shows important events
+# - warn: Shows only warnings and errors (recommended for high-load production)
+# - error: Only errors and fatal issues
+level = "info"
+
+# Log format: "json" or "pretty"
+# - "json": Structured JSON output for log aggregation systems (recommended)
+# - "pretty": Human-readable output
+format = "json"
+
+# Log outputs (can include multiple)
+# - "stdout": Standard output (useful for Docker/Kubernetes)
+# - "file": Write to file (useful for persistent logging)
+outputs = ["stdout", "file"]
+
+# Log file path (if file output is enabled)
+# Production recommendation: /var/log/norn/norn.log with log rotation
+file_path = "/var/log/norn/norn.log"
+
+# Maximum log file size in MB before rotation
+# When log file exceeds this size, it's rotated
+# Recommendation: 100-500 MB depending on disk space
+max_file_size = 100
+
+# Maximum number of rotated log files to keep
+# Older files are deleted to prevent filling the disk
+# Recommendation: 10-30 files
+max_files = 30
+
+# Enable log compression for rotated files
+# Compressed logs save significant disk space
+compress = true
+
+# Include module information in log lines
+# Helps identify which module is logging
+include_module = true
+
+# Include file and line number information
+# Useful for debugging but adds overhead
+include_file_location = false
+
+################################################################################
+# 10. DATABASE/STORAGE CONFIGURATION
+################################################################################
+
+[storage]
+
+# Storage backend type
+# Options: "sled" (embedded database, recommended)
+storage_type = "sled"
+
+# Database compression
+# Reduces storage size at cost of CPU usage
+compression_enabled = true
+
+# Database page cache size in MB
+# Larger cache = better performance but higher memory usage
+# Production recommendation: 500-2000 MB
+cache_size_mb = 1000
+
+# Enable database integrity checks
+# Periodically verify database consistency
+integrity_check_enabled = true
+
+# Integrity check interval in hours
+# How often to run database integrity checks
+integrity_check_interval_hours = 24
+
+# Automatic backup settings
+enable_backups = true
+backup_interval_hours = 24
+backup_path = "/var/lib/norn/backups"
+
+################################################################################
+# 11. SECURITY CONFIGURATION
+################################################################################
+
+[security]
+
+# Enable account authentication (if applicable)
+require_auth = false
+
+# Maximum connections per IP address
+# Prevents single IP from monopolizing connections
+# Helps mitigate connection-based DoS
+max_connections_per_ip = 10
+
+# Enable rate limiting on RPC endpoints
+# Prevents abuse of public RPC endpoints
+enable_rpc_rate_limit = true
+
+# RPC rate limit: requests per second per IP
+# Recommendation: 100-1000 depending on use case
+rpc_rate_limit_per_sec = 100
+
+# Enable transaction signature verification cache
+# Caches signature verification results for performance
+cache_signature_verification = true
+
+# TLS/SSL Configuration for RPC (optional)
+# Production deployment should use TLS for client connections
+# If you're using a reverse proxy (nginx, etc.), enable TLS there instead
+enable_tls = false
+
+# TLS certificate path (if enabled)
+# tls_cert_path = "/etc/norn/certs/server.crt"
+
+# TLS private key path (if enabled)
+# tls_key_path = "/etc/norn/certs/server.key"
+
+################################################################################
+# 12. PERFORMANCE TUNING
+################################################################################
+
+[performance]
+
+# Enable transaction parallelization
+# Process multiple transactions in parallel (when safe to do so)
+enable_tx_parallelization = true
+
+# Number of worker threads for transaction processing
+# Recommendation: Number of CPU cores - 1
+tx_worker_threads = 7
+
+# Enable memory pooling
+# Reduces allocation overhead by reusing memory
+enable_memory_pooling = true
+
+# Network I/O buffer size in KB
+# Larger buffers = better throughput but higher memory
+network_buffer_size_kb = 256
+
+# State trie node cache size
+# Controls how many trie nodes are cached in memory
+state_trie_cache_size = 100000
+
+################################################################################
+# 13. NETWORK RESILIENCE
+################################################################################
+
+[resilience]
+
+# Enable automatic peer reconnection
+# Automatically reconnects to disconnected peers
+enable_auto_reconnect = true
+
+# Reconnection backoff multiplier
+# Wait time increases exponentially with each failed attempt
+# First retry: 1s, Second: 2s, Third: 4s, etc.
+reconnection_backoff_ms = 1000
+max_reconnection_backoff_ms = 60000
+
+# Enable peer reputation tracking
+# Scores peers based on behavior (reliability, latency, etc.)
+enable_peer_scoring = true
+
+# Remove peers below reputation threshold
+# Disconnects unreliable peers
+peer_reputation_threshold = 0.2
+
+# Network bandwidth limiting (optional)
+# Limits maximum bandwidth usage
+# Useful for constrained networks
+enable_bandwidth_limit = false
+# max_download_bandwidth_mbps = 100
+# max_upload_bandwidth_mbps = 50
+
+################################################################################
+# 14. ADVANCED DEBUGGING (Production: Disable for Performance)
+################################################################################
+
+[debug]
+
+# Enable verbose event logging
+# Logs detailed state machine transitions (high overhead!)
+verbose_events = false
+
+# Enable transaction execution tracing
+# Traces every transaction step (VERY high overhead!)
+trace_execution = false
+
+# Enable network message tracing
+# Logs every network message (VERY high overhead!)
+trace_network = false
+
+# Enable consensus tracing
+# Detailed consensus round logging (high overhead!)
+trace_consensus = false
+
+# Enable profiling support
+# May impact performance, for testing only
+enable_profiling = false
+
+################################################################################
+# 15. ENVIRONMENT-SPECIFIC OVERRIDES
+################################################################################
+
+# For different deployment environments, you can override specific settings.
+# Load the appropriate override file with:
+#   source production-overrides.toml
+
+# Production environment typically uses:
+#   - Conservative timeouts (longer than testing)
+#   - Maximum security (TLS, rate limiting enabled)
+#   - Optimized for throughput (batching, caching)
+#   - Comprehensive monitoring (all metrics enabled)
+#   - Minimal debug logging (info or warn level)
+
+################################################################################
+# DEPLOYMENT CHECKLIST
+################################################################################
+#
+# Before deploying to production, verify:
+#
+# ☐ Data directory exists and has sufficient space (100GB+ recommended)
+# ☐ Data directory has proper permissions (755 or 750)
+# ☐ Replace all TODO placeholders with actual values
+# ☐ Private key is securely stored (not in version control)
+# ☐ Firewall rules allow P2P port (4001) and health check port (8080)
+# ☐ Reverse proxy is set up for RPC (port 50051)
+# ☐ Monitoring is configured (Prometheus, etc.)
+# ☐ Backup strategy is implemented
+# ☐ Node has stable network connectivity (ideally gigabit)
+# ☐ Node has sufficient CPU cores (4+ recommended)
+# ☐ Node has sufficient RAM (8GB+ recommended)
+# ☐ Node has SSD storage (not HDD)
+# ☐ System time is synchronized (NTP)
+# ☐ OS security updates are installed
+# ☐ SSH/remote access is secured
+# ☐ File permissions are restrictive (640 for config)
+# ☐ Regular backup and restore testing is performed
+# ☐ Alerting is configured for critical events
+# ☐ Documentation for your deployment is maintained
+#
+# For multi-node deployments, also verify:
+#
+# ☐ Bootstrap peers are configured correctly in all nodes
+# ☐ All nodes have unique node_ids
+# ☐ All nodes use different data directories
+# ☐ All nodes use different RPC ports (if on same machine)
+# ☐ All nodes use different P2P ports (if on same machine)
+# ☐ Network connectivity between nodes is verified (ping test)
+# ☐ Block production is distributed across validators
+#
+################################################################################
+#
+# For support and documentation, see:
+#   - Main README: https://github.com/your-repo/rust-norn/README.md
+#   - Configuration Guide: https://github.com/your-repo/rust-norn/docs/CONFIG.md
+#   - Deployment Guide: https://github.com/your-repo/rust-norn/docs/DEPLOYMENT.md
+#
+################################################################################

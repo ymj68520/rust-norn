@@ -38,6 +38,8 @@ impl<'de> Deserialize<'de> for Hash {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
+        // Strip 0x prefix if present
+        let s = s.strip_prefix("0x").unwrap_or(&s);
         let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
         if bytes.len() != HASH_LENGTH {
             return Err(serde::de::Error::custom("Invalid hash length"));
@@ -81,6 +83,8 @@ impl<'de> Deserialize<'de> for Address {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
+        // Strip 0x prefix if present
+        let s = s.strip_prefix("0x").unwrap_or(&s);
         let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
         if bytes.len() != ADDRESS_LENGTH {
             return Err(serde::de::Error::custom("Invalid address length"));
@@ -88,6 +92,12 @@ impl<'de> Deserialize<'de> for Address {
         let mut arr = [0u8; ADDRESS_LENGTH];
         arr.copy_from_slice(&bytes);
         Ok(Address(arr))
+    }
+}
+
+impl AsRef<[u8]> for Address {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -173,9 +183,18 @@ impl<'de> Deserialize<'de> for PublicKey {
 
 // --- Domain Structs ---
 
+/// Transaction type enum for distinguishing between native and EVM transactions
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Copy, Default)]
+pub enum TransactionType {
+    /// Native norn blockchain transaction
+    #[default]
+    Native,
+    /// Ethereum-compatible EVM transaction
+    EVM,
+}
 
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 
 pub struct TransactionBody {
 
@@ -221,11 +240,48 @@ pub struct TransactionBody {
 
     pub signature: Vec<u8>,
 
+    /// EVM-specific: Transaction type (Native or EVM)
+    #[serde(default)]
+    pub tx_type: TransactionType,
+
+    /// EVM-specific: Chain ID for EIP-155 replay protection
+    #[serde(default)]
+    pub chain_id: Option<u64>,
+
+    /// EVM-specific: Transaction value in wei (for EVM transfers)
+    #[serde(default)]
+    pub value: Option<String>, // Use String for BigUint serialization compatibility
+
+    /// EIP-1559: Maximum fee per gas (base fee + priority fee)
+    #[serde(default)]
+    pub max_fee_per_gas: Option<u64>,
+
+    /// EIP-1559: Maximum priority fee per gas (tip to miner)
+    #[serde(default)]
+    pub max_priority_fee_per_gas: Option<u64>,
+
+    /// EIP-1559: Access list for EIP-2930 (optional)
+    #[serde(default)]
+    pub access_list: Option<Vec<AccessListItem>>,
+
+    /// EIP-1559: Gas price for legacy transactions
+    #[serde(default)]
+    pub gas_price: Option<u64>,
+
+}
+
+/// Access list item for EIP-2930 and EIP-1559
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AccessListItem {
+    /// Address to access
+    pub address: Address,
+    /// Storage keys to access
+    pub storage_keys: Vec<Hash>,
 }
 
 
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 
 pub struct Transaction {
 
@@ -286,20 +342,24 @@ pub struct GeneralParams {
     pub t: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct BlockHeader {
     pub timestamp: i64,
     pub prev_block_hash: Hash,
     pub block_hash: Hash,
     pub merkle_root: Hash,
+    /// State root hash after executing transactions in this block
+    pub state_root: Hash,
     pub height: i64,
     pub public_key: PublicKey,
     #[serde(with = "hex_serde")]
     pub params: Vec<u8>, // This might need to be parsed as GenesisParams or GeneralParams depending on logic
     pub gas_limit: i64,
+    /// EIP-1559: Base fee for this block
+    pub base_fee: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Transaction>,

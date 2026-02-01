@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use num_bigint::BigUint;
 use num_traits::{Zero, One};
+use sha2::Digest;
 
 /// 账户状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -122,27 +123,34 @@ impl Default for AccountStateConfig {
 }
 
 /// 状态变更
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StateChange {
     /// 账户创建
     AccountCreated {
         address: Address,
         account: AccountState,
     },
-    
+
     /// 账户更新
     AccountUpdated {
         address: Address,
         old_account: AccountState,
         new_account: AccountState,
     },
-    
+
     /// 账户删除
     AccountDeleted {
         address: Address,
         old_account: AccountState,
     },
-    
+
+    /// 余额变更
+    BalanceChanged {
+        address: Address,
+        old_balance: String,
+        new_balance: String,
+    },
+
     /// 存储设置
     StorageSet {
         address: Address,
@@ -150,7 +158,7 @@ pub enum StateChange {
         old_value: Option<Vec<u8>>,
         new_value: Vec<u8>,
     },
-    
+
     /// 存储删除
     StorageDeleted {
         address: Address,
@@ -282,10 +290,10 @@ impl AccountStateManager {
     /// 设置存储值
     pub async fn set_storage(&self, address: &Address, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         debug!("Setting storage for address: {:?}, key: {:?}", address, key);
-        
+
         let mut storage = self.storage.write().await;
         let account_storage = storage.entry(*address).or_insert_with(HashMap::new);
-        
+
         // 检查存储项数量限制
         if !account_storage.contains_key(&key) && account_storage.len() >= self.config.max_storage_items {
             return Err(NornError::Internal("Maximum storage limit reached".to_string()));
@@ -321,11 +329,11 @@ impl AccountStateManager {
         };
 
         account_storage.insert(key, storage_item);
-        
+
         // 记录变更
         self.record_change(change).await;
-        
-        debug!("Storage set for address: {:?}, key: {:?}", address, key);
+
+        debug!("Storage set for address: {:?}", address);
         Ok(())
     }
 
@@ -496,12 +504,12 @@ impl AccountStateManager {
             if !account.deleted {
                 // 序列化账户状态
                 let account_data = serde_json::to_vec(account)?;
-                state_data.insert(address.as_bytes().to_vec(), account_data);
-                
+                state_data.insert(address.0.to_vec(), account_data);
+
                 // 添加存储数据
                 if let Some(account_storage) = storage.get(address) {
                     for (key, item) in account_storage.iter() {
-                        let storage_key = [address.as_bytes(), key].concat();
+                        let storage_key = [&address.0[..], key].concat();
                         state_data.insert(storage_key, item.value.clone());
                     }
                 }
@@ -630,16 +638,67 @@ impl AccountStateManager {
         }
         
         for account_storage in storage.values() {
-            stats.total_storage_items += account_storage.len();
+            stats.total_storage_items += account_storage.len() as u64;
         }
         
         stats
     }
 
     /// 记录状态变更
-    async fn record_change(&self, _change: StateChange) {
-        // TODO: 实现变更历史记录
+    async fn record_change(&self, change: StateChange) {
         // 这里可以记录到日志或数据库中
+        // 对于生产环境，应该使用StateHistory管理器
+        debug!("Recording state change: {:?}", change);
+
+        // 发送到tracing系统作为日志
+        match &change {
+            StateChange::AccountCreated { address, .. } => {
+                info!("Account created: {:?}", hex::encode(address));
+            }
+            StateChange::AccountUpdated { address, old_account, new_account } => {
+                info!("Account updated: {:?}, old_nonce={}, new_nonce={}",
+                    hex::encode(address), old_account.nonce, new_account.nonce);
+            }
+            StateChange::AccountDeleted { address, old_account } => {
+                info!("Account deleted: {:?}", hex::encode(address));
+                // old_account is available but not used in logging
+                let _ = old_account;
+            }
+            StateChange::BalanceChanged { address, old_balance, new_balance } => {
+                info!("Balance changed: {:?}, {} -> {}",
+                    hex::encode(address), old_balance, new_balance);
+            }
+            StateChange::StorageSet { address, key, .. } => {
+                info!("Storage set: {:?}, key={}", hex::encode(address), hex::encode(key));
+            }
+            StateChange::StorageDeleted { address, key, .. } => {
+                info!("Storage deleted: {:?}, key={}", hex::encode(address), hex::encode(key));
+            }
+        }
+    }
+
+    // ========== Additional methods for compatibility ==========
+
+    /// Get balance as BigUint (convenience method)
+    pub async fn get_balance(&self, address: &Address) -> Result<BigUint> {
+        let account = self.get_account(address).await?;
+        Ok(account.map(|a| a.balance).unwrap_or_else(|| BigUint::from(0u32)))
+    }
+
+    /// Get accounts lock (for state root calculation and other advanced operations)
+    pub async fn accounts_lock(&self) -> Arc<RwLock<HashMap<Address, AccountState>>> {
+        Arc::clone(&self.accounts)
+    }
+
+    /// Get storage lock (for state root calculation and other advanced operations)
+    pub async fn storage_lock(&self) -> Arc<RwLock<HashMap<Address, HashMap<Vec<u8>, StorageItem>>>> {
+        Arc::clone(&self.storage)
+    }
+}
+
+impl Default for AccountStateManager {
+    fn default() -> Self {
+        Self::new(AccountStateConfig::default())
     }
 }
 
@@ -824,7 +883,7 @@ mod tests {
         };
         
         let contract_account = AccountState {
-            address: Address::from([1u8; 20]),
+            address: Address([1u8; 20]),
             balance: BigUint::from(2000u64),
             nonce: 0,
             code_hash: Some(Hash([2u8; 32])),
@@ -835,8 +894,10 @@ mod tests {
             deleted: false,
         };
         
-        manager.set_account(&normal_account.address, normal_account).await.unwrap();
-        manager.set_account(&contract_account.address, contract_account).await.unwrap();
+        let normal_addr = normal_account.address;
+        manager.set_account(&normal_addr, normal_account).await.unwrap();
+        let contract_addr = contract_account.address;
+        manager.set_account(&contract_addr, contract_account).await.unwrap();
         
         let stats = manager.get_stats().await;
         assert_eq!(stats.total_accounts, 2);

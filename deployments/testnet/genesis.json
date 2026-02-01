@@ -1,0 +1,43 @@
+{
+  "name": "norn-enhanced-testnet",
+  "chain_id": 1337,
+  "genesis_time": "2026-01-30T00:00:00Z",
+  "description": "Norn Enhanced Testnet - Testing txpool_enhanced and fast_sync features",
+  "validators": [
+    {
+      "address": "0x0000000000000000000000000000000000000001",
+      "stake": 1000000,
+      "vrf_public_key": "0x02b2a3ee81e35c0cc8b7c3e3e1d1e1d1e1d1e1d1e1d1e1d1e1d1e1d1e1d1e1"
+    },
+    {
+      "address": "0x0000000000000000000000000000000000000002",
+      "stake": 1000000,
+      "vrf_public_key": "0x03b3a3ee81e35c0cc8b7c3e3e1d1e1d1e1d1e1d1e1d1e1d1e1d1e1d1e1d1e"
+    },
+    {
+      "address": "0x0000000000000000000000000000000000000003",
+      "stake": 1000000,
+      "vrf_public_key": "0x04b4a3ee81e35c0cc8b7c3e3e1d1e1d1e1d1e1d1e1d1e1d1e1d1e1d1e1d1e"
+    }
+  ],
+  "allocations": [
+    {
+      "address": "0x0000000000000000000000000000000000000001",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x0000000000000000000000000000000000000002",
+      "balance": "1000000000000000000000"
+    },
+    {
+      "address": "0x0000000000000000000000000000000000000003",
+      "balance": "1000000000000000000000"
+    }
+  ],
+  "features": {
+    "enhanced_txpool": true,
+    "fast_sync": true,
+    "eip1559": true,
+    "block_time": 5
+  }
+}

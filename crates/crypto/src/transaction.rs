@@ -1,4 +1,4 @@
-use norn_common::types::{Transaction, TransactionBody, Address, Hash, PublicKey};
+use norn_common::types::{Transaction, TransactionBody, Address, Hash, PublicKey, TransactionType};
 use norn_common::types::PUBLIC_KEY_LENGTH;
 use crate::ecdsa::{KeyPair, verify};
 use sha2::{Sha256, Digest};
@@ -82,6 +82,13 @@ impl TransactionSigner {
             timestamp,
             public: PublicKey::default(),
             signature: Vec::new(),
+            tx_type: TransactionType::default(), // Native by default
+            chain_id: None,
+            value: None,
+            max_fee_per_gas: None,
+            max_priority_fee_per_gas: None,
+            access_list: None,
+            gas_price: None,
         };
 
         // Calculate hash of unsigned transaction

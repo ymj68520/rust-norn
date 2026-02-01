@@ -1,0 +1,15 @@
+[package]
+name = "tx-generator"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tx-generator"
+path = "src/main.rs"
+
+[dependencies]
+norn-crypto = { workspace = true }
+norn-common = { workspace = true }
+hex = { workspace = true }
+chrono = "0.4"
+anyhow = { workspace = true }

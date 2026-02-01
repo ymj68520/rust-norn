@@ -1,0 +1,62 @@
+{
+  "dashboard": {
+    "id": null,
+    "title": "Norn Enhanced Testnet",
+    "tags": ["norn", "blockchain", "testnet"],
+    "timezone": "browser",
+    "panels": [
+      {
+        "id": 1,
+        "title": "Transaction Pool Stats",
+        "type": "graph",
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+        "targets": [
+          {
+            "expr": "txpool_size",
+            "legendFormat": "Pool Size"
+          },
+          {
+            "expr": "txpool_avg_gas_price",
+            "legendFormat": "Avg Gas Price"
+          }
+        ]
+      },
+      {
+        "id": 2,
+        "title": "Block Production",
+        "type": "stat",
+        "gridPos": {"h": 4, "w": 6, "x": 0, "y": 8},
+        "targets": [
+          {
+            "expr": "block_height",
+            "legendFormat": "Block Height"
+          }
+        ]
+      },
+      {
+        "id": 3,
+        "title": "TPS (Transactions Per Second)",
+        "type": "gauge",
+        "gridPos": {"h": 4, "w": 6, "x": 6, "y": 8},
+        "targets": [
+          {
+            "expr": "rate(txpackaged_total[1m])",
+            "legendFormat": "TPS"
+          }
+        ]
+      },
+      {
+        "id": 4,
+        "title": "Network Connectivity",
+        "type": "table",
+        "gridPos": {"h": 6, "w": 12, "x": 0, "y": 12},
+        "targets": [
+          {
+            "expr": "peer_count",
+            "legendFormat": "Peer Count"
+          }
+        ]
+      }
+    ]
+  }
+}

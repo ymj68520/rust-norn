@@ -6,15 +6,23 @@ edition = "2021"
 [dependencies]
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 norn-common = { workspace = true }
 norn-core = { workspace = true }
 norn-crypto = { workspace = true }
 norn-network = { workspace = true }
 norn-storage = { workspace = true }
-norn-rpc = { workspace = true }  # Re-enable RPC
+norn-rpc = { workspace = true }
+axum = { workspace = true }
 libp2p = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+prometheus = { workspace = true }
+lazy_static = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

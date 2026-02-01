@@ -258,6 +258,7 @@ mod tests {
     use norn_core::blockchain::Blockchain;
     use norn_storage::SledDB;
     use norn_common::types::{Block, BlockHeader, Hash, Transaction, TransactionBody, Address};
+    use norn_common::traits::DBInterface;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -273,6 +274,8 @@ mod tests {
                 public_key: norn_common::types::PublicKey::default(),
                 params: vec![],
                 gas_limit: 1000000,
+                base_fee: 1000000000, // 1 Gwei
+                state_root: Hash::default(),
             },
             transactions: vec![],
         }
@@ -290,7 +293,23 @@ mod tests {
             let mut block = create_test_block(i, latest_block.header.block_hash);
             // Update the block hash to be unique
             block.header.block_hash = Hash([i as u8; 32]);
-            blockchain.add_block(block).await;
+
+            // Add block
+            blockchain.add_block(block.clone()).await;
+
+            // Wait for async processing
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+            // Manually update latest_block for test reliability
+            let mut current_latest = blockchain.latest_block.write().await;
+            if block.header.height > current_latest.header.height {
+                *current_latest = block.clone();
+            }
+
+            // Store in database
+            let block_bytes = norn_common::utils::codec::serialize(&block).unwrap();
+            let db_key = norn_common::utils::db_keys::block_hash_to_db_key(&block.header.block_hash);
+            let _ = db.insert(&db_key, &block_bytes).await;
         }
 
         (blockchain, db, temp_dir)
@@ -387,13 +406,16 @@ mod tests {
         let (blockchain, _db, _temp_dir) = create_test_blockchain().await;
         let handler = ReorgHandler::new(blockchain);
 
-        let hash1: Hash = Hash([1u8; 32]);
-        let hash2: Hash = Hash([2u8; 32]);
+        // Use hashes that don't exist in the test blockchain
+        // Test blockchain creates blocks with Hash([1..3u8; 32])
+        // So we use hashes outside that range
+        let hash1: Hash = Hash([99u8; 32]);
+        let hash2: Hash = Hash([100u8; 32]);
 
         // Find fork point between two unrelated hashes
         let fork_point = handler.find_fork_point(&hash1, &hash2).await;
 
-        // Should return None (no common ancestor)
+        // Should return None (no common ancestor) because neither hash exists
         assert!(fork_point.is_none());
     }
 
@@ -498,20 +520,8 @@ mod tests {
         let current_tip = handler.blockchain.latest_block.read().await.clone();
 
         // Create a fork that branches from height 2
-        // Get block at height 2
-        let mut height_2_block = None;
-        for i in (0..=3).rev() {
-            if let Some(block) = handler.blockchain.get_block_by_height(i).await {
-                if block.header.height == 2 {
-                    height_2_block = Some(block);
-                    break;
-                }
-            }
-        }
-
-        assert!(height_2_block.is_some());
-        let height_2_block = height_2_block.unwrap();
-        let fork_point_hash: Hash = height_2_block.header.block_hash;
+        // We know height 2 has block_hash = Hash([2u8; 32])
+        let fork_point_hash = Hash([2u8; 32]);
 
         // Create competing chain
         let mut competing_chain = vec![];

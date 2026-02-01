@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  # Norn Blockchain Node
+  norn-node:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: norn-node
+    ports:
+      - "8545:8545"  # Ethereum JSON-RPC
+      - "4001:4001"  # P2P
+    volumes:
+      - norn_data:/app/node_data
+    environment:
+      - RUST_LOG=info
+    command: ./norn --config /app/remix_config.toml
+    networks:
+      - norn-network
+
+  # Faucet Service
+  faucet:
+    build:
+      context: .
+      dockerfile: Dockerfile.faucet
+    container_name: norn-faucet
+    ports:
+      - "3000:3000"
+      - "9091:9091"  # Metrics
+    volumes:
+      - faucet_data:/app/faucet_data
+    environment:
+      - FAUCET_PRIVATE_KEY=${FAUCET_PRIVATE_KEY}
+      -FAUCET_RPC_URL=http://norn-node:8545
+      - FAUCET_DISPENSE_AMOUNT=${FAUCET_DISPENSE_AMOUNT:-1000000000000000000000}
+      - FAUCET_MAX_REQUESTS=${FAUCET_MAX_REQUESTS:-3}
+      - FAUCET_RATE_LIMIT_WINDOW=${FAUCET_RATE_LIMIT_WINDOW:-3600}
+    depends_on:
+      - norn-node
+    restart: unless-stopped
+    networks:
+      - norn-network
+    command:
+      - "--server-addr=0.0.0.0:3000"
+      - "--rpc-url=http://norn-node:8545"
+      - "--private-key=${FAUCET_PRIVATE_KEY}"
+      - "--dispense-amount=${FAUCET_DISPENSE_AMOUNT:-1000000000000000000000}"
+
+  # Nginx Reverse Proxy (optional)
+  nginx:
+    image: nginx:alpine
+    container_name: norn-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - faucet
+    restart: unless-stopped
+    networks:
+      - norn-network
+
+volumes:
+  norn_data:
+  faucet_data:
+
+networks:
+  norn-network:
+    driver: bridge

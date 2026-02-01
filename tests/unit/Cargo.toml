@@ -1,0 +1,17 @@
+[package]
+name = "unit-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "unit-test"
+path = "src/main.rs"
+
+[dependencies]
+norn-storage = { workspace = true }
+norn-common = { workspace = true }
+norn-core = { workspace = true }
+tokio = { workspace = true }
+tempfile = "3.8"
+chrono = "0.4"
+anyhow = { workspace = true }

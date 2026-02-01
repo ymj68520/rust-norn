@@ -9,10 +9,12 @@ pub fn get_genesis_block() -> Block {
         prev_block_hash: Hash::default(), // 创世块的前一个区块哈希为全零
         block_hash: GENESIS_BLOCK_HASH,
         merkle_root: Hash::default(),     // 没有交易，Merkle根为全零
+        state_root: Hash::default(),      // 创世块状态根为全零
         height: 0,                        // 创世块高度为0
         public_key: PublicKey::default(),
         params: serialize_genesis_params(),
         gas_limit: GENESIS_GAS_LIMIT,
+        base_fee: GENESIS_BASE_FEE,       // EIP-1559: 初始基础费用
     };
 
     Block {
@@ -35,6 +37,9 @@ pub const GENESIS_TIMESTAMP: i64 = 1700000000; // 2023-11-14 00:53:20 UTC
 
 /// 创世块的Gas限制
 pub const GENESIS_GAS_LIMIT: i64 = 10_000_000;
+
+/// 创世块的EIP-1559基础费用 (1 Gwei)
+pub const GENESIS_BASE_FEE: u64 = 1_000_000_000;
 
 /// 获取创世块参数
 pub fn get_genesis_params() -> GenesisParams {

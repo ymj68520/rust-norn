@@ -1,0 +1,17 @@
+[package]
+name = "integration-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "integration-test"
+path = "src/main.rs"
+
+[dependencies]
+norn-storage = { workspace = true }
+norn-common = { workspace = true }
+norn-core = { workspace = true }
+norn-crypto = { workspace = true }
+tempfile = "3.8"
+tokio = { workspace = true }
+anyhow = { workspace = true }

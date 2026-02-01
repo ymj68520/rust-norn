@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+  external_labels:
+    cluster: 'norn-testnet'
+    environment: 'testnet'
+
+scrape_configs:
+  - job_name: 'norn-validator1'
+    static_configs:
+      - targets: ['validator1:9090']
+    metrics_path: '/metrics'
+
+  - job_name: 'norn-validator2'
+    static_configs:
+      - targets: ['validator2:9090']
+    metrics_path: '/metrics'
+
+  - job_name: 'norn-observer'
+    static_configs:
+      - targets: ['observer:9092']
+    metrics_path: '/metrics'

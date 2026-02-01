@@ -1,75 +1,132 @@
-# Compiled executables and object files
+# ============================================
+# Rust 构建产物
+# ============================================
 target/
+Cargo.lock
+
+# ============================================
+# 数据目录（运行时生成）
+# ============================================
 data/
+*_data/
+test_node_data/
 
-# IDE-specific files
+# ============================================
+# 密钥文件（绝对不能提交）
+# ============================================
+*.key
+*.pem
+*.der
+*.p8
+*.pk8
+
+# ============================================
+# IDE 和编辑器
+# ============================================
 .idea/
-.claude
-.github
 .vscode/
+.claude/
+*.swp
+*.swo
 *.iml
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
 Thumbs.db
+desktop.ini
 
-# Operating System files
-.directory
+# ============================================
+# 日志文件
+# ============================================
+*.log
+logs/
+*.log.*
 
-# Rust-specific
-**/*.rs.bk
+# ============================================
+# 临时文件和缓存
+# ============================================
+*.tmp
+*.temp
+cache/
+*.cache
+solidity-files-cache.json
+.sisyphus/
+
+# ============================================
+# 测试产物
+# ============================================
+tps_test_results/
+test_results*.log
+*test_report*.md
+*test*.dat
+*test*.out
+
+# ============================================
+# 敏感配置（保留示例文件）
+# ============================================
+.env
+config.toml
+!.env.example
+!*_config.toml
+!production_*.toml
+!node*_config.toml
+
+# ============================================
+# Node.js / 前端相关
+# ============================================
+node_modules/
+package-lock.json
+
+# ============================================
+# 编译和 profiling
+# ============================================
 *.profraw
 *.profdata
 *.gcno
 *.gcda
 *.gcov
 *.d
-
-# Windows specific
+*.o
+*.a
+*.so
+*.dylib
+*.dll
 *.exe
-*.pdb
 
-# Dependencies for bindgen (if they are generated in the project dir)
-# For libclang/zstd-sys error, these might be present
-# target/debug/build/*/out/
+# ============================================
+# Rust 备份文件
+# ============================================
+**/*.rs.bk
+*.bk
 
-# Log files
-*.log
-logs
+# ============================================
+# 操作系统
+# ============================================
+.directory
+.Trash-*
+.nfs*
 
-# Temp files
-*.tmp
-node1_data
+# ============================================
+# Docker
+# ============================================
+.dockerignore
 
-# Configuration files that might contain sensitive data or be user-specific
-config.toml
-
-# Data directory (Database, keys, etc.)
-data/
-
-# Key files (Private keys should NEVER be committed)
-*.key
-*.pem
-*.der
-*.p8
-/CHANGELOG.md
-/nul
-/.claude/settings.local.json
-/TESTING_REPORT.md
-
-# Test files and directories
-test_client/
-tests/
-mock_persistence_test/
-tps_test_results
-
-# Test reports and outputs
-*test_report*.md
-*test*.log
-*test*.dat
-*test*.out
-
-# Documentation
-docs/
-doc/
-*.md
+# ============================================
+# 覆盖规则：需要保留的文档和配置
+# ============================================
 !README.md
-CLAUDE.md
+!CLAUDE.md
+!doc/*.md
+!docs/*.md
+!crates/*/README.md
+!tps_test/README.md
+!tps_test/QUICKSTART.md
+!docker/README.md
+!examples/*/README.md
+!deployments/testnet/*.md
+docs/ALERTING.md
+doc/

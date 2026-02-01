@@ -1,0 +1,60 @@
+# Multi-stage Dockerfile for Norn Faucet Service
+# Production-ready image with minimal size
+
+# Stage 1: Build
+FROM rust:1.75-slim as builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy manifests
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
+
+# Build faucet in release mode
+RUN cargo build --release -p norn-faucet
+
+# Stage 2: Runtime
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -m -u 1000 faucet
+
+WORKDIR /app
+
+# Copy binary from builder
+COPY --from=builder /app/target/release/faucet /usr/local/bin/faucet
+
+# Copy static files
+COPY --from=builder /app/crates/faucet/static /app/static
+
+# Create data directory
+RUN mkdir -p /app/faucet_data && \
+    chown -R faucet:faucet /app
+
+# Switch to non-root user
+USER faucet
+
+# Expose ports
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:3000/health || exit 1
+
+# Set environment variables
+ENV FAUCET_SERVER_ADDR=0.0.0.0:3000 \
+    FAUCET_DB_PATH=/app/faucet_data
+
+# Run the faucet
+ENTRYPOINT ["/usr/local/bin/faucet"]
+CMD ["--help"]

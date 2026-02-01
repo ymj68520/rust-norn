@@ -7,6 +7,7 @@ services:
     ports:
       - "4001:4001"
       - "50051:50051"
+      - "8545:8545"
     volumes:
       - ./node1_config.toml:/etc/norn/config.toml:ro
       - node1_data:/data
@@ -21,6 +22,7 @@ services:
     ports:
       - "4002:4002"
       - "50052:50051"
+      - "8546:8545"
     volumes:
       - ./node2_config.toml:/etc/norn/config.toml:ro
       - node2_data:/data
@@ -35,6 +37,7 @@ services:
     ports:
       - "4003:4003"
       - "50053:50051"
+      - "8547:8545"
     volumes:
       - ./production_config.toml:/etc/norn/config.toml:ro
       - node3_data:/data

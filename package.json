@@ -1,0 +1,25 @@
+{
+  "name": "norn-contracts",
+  "version": "1.0.0",
+  "description": "Smart contracts for norn blockchain",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:unit": "hardhat test contracts/test/*.test.js",
+    "test:e2e": "hardhat test contracts/test/E2E.test.js",
+    "deploy": "hardhat run scripts/deploy.js --network norn",
+    "deploy:local": "hardhat run scripts/deploy.js --network norn_local",
+    "benchmark": "hardhat run scripts/benchmark.js --network norn_local",
+    "node": "hardhat node",
+    "clean": "hardhat clean"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "hardhat": "^2.19.0",
+    "dotenv": "^16.3.1"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.0.0",
+    "ethers": "^6.9.0"
+  }
+}

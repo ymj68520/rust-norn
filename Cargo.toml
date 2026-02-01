@@ -1,14 +1,21 @@
 [workspace]
 resolver = "2"
+
+# 主工作空间成员
 members = [
     "bin/norn",
     "crates/*",
-    "test_integration",
-    "db_test",
-    "scalability_test",
-    "tps_test",
-    "test_tx_gen",
 ]
+
+# 注意：测试模块已整合到 tests/ 目录
+# 如需运行测试，请使用：
+#   cd tests && cargo run --bin <test_name>
+# 或运行统一测试脚本：
+#   cd tests && ./run_all_tests.sh
+
+# 旧测试模块（已弃用，保留用于向后兼容）
+# test_integration, db_test, scalability_test, tps_test, test_tx_gen
+# 这些模块已移动到 tests/ 目录下的对应子目录
 
 [workspace.dependencies]
 # Async Runtime & Utilities
@@ -18,9 +25,10 @@ async-trait = "0.1"
 futures = "0.3"
 
 # Web Framework (Replacing Gin)
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.7", features = ["macros", "ws"] }
 tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["trace", "cors"] }
+tokio-tungstenite = "0.21"  # WebSocket support
 
 # RPC & Serialization (Replacing gRPC/Protobuf/Karmem)
 tonic = "0.11"
@@ -28,6 +36,8 @@ prost = "0.12"
 tonic-build = "0.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+jsonrpsee = { version = "0.20", features = ["server", "macros"] }
+bincode = "1.3"
 
 # P2P Networking (Replacing go-libp2p)
 libp2p = { version = "0.53", features = ["tokio", "gossipsub", "kad", "macros", "noise", "tcp", "yamux", "dns", "identify", "ping"] }
@@ -42,15 +52,18 @@ tracing-appender = "0.2"
 
 # Cryptography (Replacing x/crypto)
 k256 = { version = "0.13", features = ["ecdsa", "serde"] } # ECDSA secp256k1
+blst = { version = "0.3", features = ["portable"] } # alt_bn128 curve support
 p256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
 rand_core = { version = "0.6", features = ["std"] }
-num-bigint = { version = "0.4", features = ["rand"] }
+num-bigint = { version = "0.4", features = ["rand", "serde"] }
 num-traits = "0.2"
 sha2 = "0.10"
 schnorrkel = "0.10" # VRF (Ristretto255), popular in Rust implementations
+curve25519-dalek = "4.0" # Ristretto points and scalars for VRF
 rand = "0.8"
 hex = "0.4"
 bs58 = "0.5" # Base58 for addressing commonly used in libp2p
+spki = "0.7" # Subject Public Key Info (for ECDSA key encoding)
 
 # Metrics (Replacing prometheus/client_golang)
 prometheus = { version = "0.13", features = ["process"] }
@@ -59,6 +72,7 @@ prometheus = { version = "0.13", features = ["process"] }
 cargo-llvm-cov = "0.6"
 tarpaulin = "0.27"
 tempfile = "3.4"
+criterion = "0.5"  # Benchmarking
 
 # Utilities
 config = "0.13" # Replacing gookit/config
@@ -66,8 +80,20 @@ clap = { version = "4.4", features = ["derive", "env"] } # CLI parsing
 anyhow = "1.0" # Error handling
 thiserror = "1.0"
 chrono = { version = "0.4", features = ["serde"] } # Time
-moka = { version = "0.12", features = ["future"] } # High performance cache (replacing golang-lru)
+lazy_static = "1.4" # Static variables
+moka = { version = "0.12", features = ["future", "sync"] } # High performance cache (replacing golang-lru)
 rs_merkle = { version = "1.4" }
+uuid = { version = "1.6", features = ["v4", "serde"] }  # UUID generation
+
+# EVM & Ethereum Support
+revm = { version = "14.0", features = ["std", "serde", "blst"] } # EVM execution engine with blst for alt_bn128
+ethabi = { version = "18.0", features = ["rlp", "serde"] } # ABI encoding/decoding
+hashbrown = "0.14" # Faster HashMap for caching
+once_cell = "1.19" # Lazy static initialization
+keccak-hash = "0.10" # Keccak-256 hash (Ethereum standard)
+rlp = "0.5" # RLP encoding (Ethereum serialization)
+ripemd = { version = "0.1", features = ["std"] } # RIPEMD-160 hash
+blake2 = { version = "0.10", features = ["std"] } # BLAKE2b hash
 
 # Internal crate dependencies
 norn-common = { path = "crates/common" }

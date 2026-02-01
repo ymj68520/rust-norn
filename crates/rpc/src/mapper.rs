@@ -1,5 +1,5 @@
 use crate::proto;
-use norn_common::types::{Block, Transaction, TransactionBody, Hash, Address, PublicKey};
+use norn_common::types::{Block, Transaction, TransactionBody, Hash, Address, PublicKey, TransactionType};
 use hex;
 
 impl From<Block> for proto::Block {
@@ -99,6 +99,13 @@ impl From<proto::Transaction> for Transaction {
                 timestamp: p.timestamp as i64,
                 public,
                 signature: hex::decode(&p.signature).unwrap_or_default(),
+                tx_type: TransactionType::default(),
+                chain_id: None,
+                value: None,
+                gas_price: None,
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+                access_list: None,
             },
         }
     }
@@ -139,6 +146,7 @@ impl From<proto::Block> for Block {
                 }
                 hash
             },
+            state_root: Hash::default(),
             height: proto_header.height as i64,
             public_key: {
                 let mut key = PublicKey::default();
@@ -151,6 +159,7 @@ impl From<proto::Block> for Block {
             },
             params: hex::decode(&proto_header.params).unwrap_or_default(),
             gas_limit: proto_header.gas_limit as i64,
+            base_fee: 1_000_000_000, // Default base fee
         };
 
         let transactions: Vec<Transaction> = proto

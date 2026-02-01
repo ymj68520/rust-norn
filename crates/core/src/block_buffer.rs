@@ -1,10 +1,12 @@
 use moka::future::Cache;
-use norn_common::types::{Block, Hash};
+use norn_common::types::{Block, Hash, GeneralParams};
+use norn_crypto::vdf::{VDFCalculator, VDFOutput, get_calculator};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 use std::time::Duration;
+use serde_json;
 
 // Constants
 const MAX_BLOCK_CHANNEL: usize = 128;
@@ -32,15 +34,25 @@ pub struct BlockBuffer {
     block_tx: mpsc::Sender<Block>,
     second_tx: mpsc::Sender<Block>,
     // pop_chan is passed in constructor to send "popped" blocks back to blockchain/consumer
-    // We don't store the receiver here, but we store the sender to it? 
+    // We don't store the receiver here, but we store the sender to it?
     // Go: `popChan chan *common.Block`. Passed in NewBlockBuffer.
-    // So BlockBuffer holds the Sender side of popChan? 
+    // So BlockBuffer holds the Sender side of popChan?
     // Yes, `b.popChan <- ...`
     pop_tx: mpsc::Sender<Block>,
+    // VDF calculator for verification
+    vdf_calculator: Option<Arc<dyn VDFCalculator>>,
 }
 
 impl BlockBuffer {
     pub async fn new(latest: Block, pop_tx: mpsc::Sender<Block>) -> Self {
+        Self::with_vdf_calculator(latest, pop_tx, None).await
+    }
+
+    pub async fn with_vdf_calculator(
+        latest: Block,
+        pop_tx: mpsc::Sender<Block>,
+        vdf_calculator: Option<Arc<dyn VDFCalculator>>,
+    ) -> Self {
         let (block_tx, block_rx) = mpsc::channel(MAX_BLOCK_CHANNEL);
         let (second_tx, second_rx) = mpsc::channel(MAX_BLOCK_CHANNEL);
 
@@ -48,11 +60,11 @@ impl BlockBuffer {
             known_blocks: Cache::new(MAX_KNOWN_BLOCK),
             processed_blocks: Cache::new(MAX_PROCESSED_BLOCK),
             selected_block: HashMap::new(),
-            
+
             latest_block_hash: latest.header.block_hash,
             latest_block_height: latest.header.height,
             latest_block: latest.clone(),
-            
+
             buffered_height: latest.header.height,
         };
 
@@ -61,6 +73,7 @@ impl BlockBuffer {
             block_tx,
             second_tx,
             pop_tx,
+            vdf_calculator,
         };
 
         // Spawn background tasks
@@ -177,12 +190,12 @@ impl BlockBuffer {
         }
         
         state.processed_blocks.insert(block_hash, ()).await;
-        
-        // VDF Verification - TODO: Implement VDF verification
-        // if !crate::consensus::verify_block_vdf_async(&block).await {
-        //     warn!("Block VDF verification failed: {}", block_hash);
-        //     return;
-        // }
+
+        // VDF Verification
+        if !verify_block_vdf(&block, self.vdf_calculator.as_ref()).await {
+            warn!("Block VDF verification failed: {} at height {}", block_hash, height);
+            return;
+        }
         
         // Selection Logic
         let selected = state.selected_block.get(&height);
@@ -231,6 +244,65 @@ impl BlockBuffer {
         }
         state.latest_block.clone()
     }
+}
+
+/// Verify VDF for a block
+async fn verify_block_vdf(block: &Block, vdf_calculator: Option<&Arc<dyn VDFCalculator>>) -> bool {
+    let Some(calculator) = vdf_calculator else {
+        // No VDF calculator configured, skip verification
+        debug!("No VDF calculator configured, skipping VDF verification");
+        return true;
+    };
+
+    // Parse params to extract VDF data
+    let params: GeneralParams = match serde_json::from_slice(&block.header.params) {
+        Ok(p) => p,
+        Err(_) => {
+            // Try bincode deserialization
+            match bincode::deserialize(&block.header.params) {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to parse block params: {:?}", e);
+                    return false;
+                }
+            }
+        }
+    };
+
+    // Create VDF input from block hash (this should match what was used during computation)
+    let vdf_input = block.header.prev_block_hash; // VDF input is typically previous block hash
+
+    // Reconstruct VDF output from params
+    // The result field in GeneralParams should contain the VDF computation result
+    let result_hash = if params.result.len() >= 32 {
+        let mut hash = Hash::default();
+        hash.0.copy_from_slice(&params.result[..32]);
+        hash
+    } else {
+        // If result is too short, pad with zeros
+        let mut hash = Hash::default();
+        let len = params.result.len().min(32);
+        hash.0[..len].copy_from_slice(&params.result[..len]);
+        hash
+    };
+
+    let vdf_output = VDFOutput {
+        proof: params.proof.clone(),
+        result: result_hash,
+        iterations: 1000, // Default iterations - should be verified from block header
+        computation_time: std::time::Duration::from_secs(0),
+    };
+
+    // Verify VDF
+    let verified = calculator.verify_vdf(&vdf_input, &vdf_output, &params).await;
+
+    if verified {
+        debug!("VDF verification passed for block {}", block.header.height);
+    } else {
+        warn!("VDF verification failed for block {}", block.header.height);
+    }
+
+    verified
 }
 
 // Helper functions

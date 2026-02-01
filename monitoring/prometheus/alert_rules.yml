@@ -1,0 +1,310 @@
+# Prometheus Alert Rules for Norn Blockchain
+#
+# This file defines alerting rules for monitoring the health and performance
+# of the Norn blockchain node.
+#
+# Documentation: docs/ALERTING.md
+
+groups:
+  # ============================================
+  # Node Health Alerts
+  # ============================================
+  - name: node_health
+    interval: 30s
+    rules:
+      # Alert when node is down
+      - alert: NodeDown
+        expr: up{job=~"norn-.*"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "Norn node is down"
+          description: "Node {{ $labels.instance }} has been down for more than 1 minute"
+          runbook_url: "https://docs.norn.io/runbooks/node-down"
+
+      # Alert when node is unhealthy
+      - alert: NodeUnhealthy
+        expr: norn_block_height < 0
+        for: 5m
+        labels:
+          severity: warning
+          category: health
+        annotations:
+          summary: "Node health check failing"
+          description: "Node {{ $labels.instance }} has negative or invalid block height"
+
+  # ============================================
+  # Block Production Alerts
+  # ============================================
+  - name: block_production
+    interval: 30s
+    rules:
+      # Alert when no blocks are produced
+      - alert: NoBlockProduction
+        expr: rate(norn_block_production_total[5m]) == 0
+        for: 10m
+        labels:
+          severity: critical
+          category: consensus
+        annotations:
+          summary: "No blocks being produced"
+          description: "Node {{ $labels.instance }} has not produced any blocks in the last 10 minutes"
+          runbook_url: "https://docs.norn.io/runbooks/no-blocks"
+
+      # Alert when block production rate is too low
+      - alert: LowBlockProductionRate
+        expr: rate(norn_block_production_total[5m]) < 0.1
+        for: 5m
+        labels:
+          severity: warning
+          category: consensus
+        annotations:
+          summary: "Block production rate is low"
+          description: "Block production rate is {{ $value | humanize }} blocks/sec (expected >= 0.1 blocks/sec)"
+
+      # Alert when block production takes too long
+      - alert: SlowBlockProduction
+        expr: histogram_quantile(0.95, rate(norn_block_production_duration_seconds_bucket[5m])) > 5
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Block production is slow"
+          description: "95th percentile block production time is {{ $value | humanizeDuration }} (threshold: 5s)"
+
+  # ============================================
+  # Transaction Pool Alerts
+  # ============================================
+  - name: transaction_pool
+    interval: 30s
+    rules:
+      # Alert when transaction pool is full
+      - alert: TxPoolFull
+        expr: norn_txpool_size > 20000
+        for: 5m
+        labels:
+          severity: warning
+          category: capacity
+        annotations:
+          summary: "Transaction pool is nearly full"
+          description: "Transaction pool has {{ $value }} transactions (capacity: ~20480)"
+
+      # Alert when transaction pool is empty for too long
+      - alert: TxPoolEmpty
+        expr: norn_txpool_size == 0
+        for: 15m
+        labels:
+          severity: info
+          category: activity
+        annotations:
+          summary: "Transaction pool is empty"
+          description: "No transactions in the pool for 15 minutes"
+
+      # High transaction rejection rate
+      - alert: HighTxRejectionRate
+        expr: rate(norn_txpool_add_total{status="rejected"}[5m]) / rate(norn_txpool_add_total[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          category: transactions
+        annotations:
+          summary: "High transaction rejection rate"
+          description: "{{ $value | humanizePercentage }} of transactions are being rejected"
+
+  # ============================================
+  # Network Alerts
+  # ============================================
+  - name: network_health
+    interval: 30s
+    rules:
+      # Alert when peer connections are too low
+      - alert: LowPeerCount
+        expr: norn_peer_connections < 3
+        for: 10m
+        labels:
+          severity: warning
+          category: network
+        annotations:
+          summary: "Low peer connection count"
+          description: "Only {{ $value }} peers connected (minimum recommended: 3)"
+
+      # Alert when no peer connections
+      - alert: NoPeerConnections
+        expr: norn_peer_connections == 0
+        for: 2m
+        labels:
+          severity: critical
+          category: network
+        annotations:
+          summary: "No peer connections"
+          description: "Node is isolated from the network"
+
+  # ============================================
+  # Consensus Alerts
+  # ============================================
+  - name: consensus_health
+    interval: 30s
+    rules:
+      # High consensus failure rate
+      - alert: HighConsensusFailureRate
+        expr: rate(norn_consensus_rounds_total{result="failed"}[5m]) / rate(norn_consensus_rounds_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          category: consensus
+        annotations:
+          summary: "High consensus failure rate"
+          description: "{{ $value | humanizePercentage }} of consensus rounds are failing"
+
+      # Slow VRF execution
+      - alert: SlowVRFExecution
+        expr: histogram_quantile(0.95, rate(norn_vrf_execution_duration_seconds_bucket[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "VRF execution is slow"
+          description: "95th percentile VRF execution time is {{ $value | humanizeDuration }}"
+
+  # ============================================
+  # Sync Alerts
+  # ============================================
+  - name: sync_health
+    interval: 30s
+    rules:
+      # Sync stalled
+      - alert: SyncStalled
+        expr: norn_sync_current_block < (norn_sync_current_block offset 5m)
+        for: 10m
+        labels:
+          severity: warning
+          category: sync
+        annotations:
+          summary: "Blockchain sync is stalled"
+          description: "Sync has not progressed in the last 10 minutes"
+
+      # Slow sync rate
+      - alert: SlowSyncRate
+        expr: rate(norn_sync_blocks_total[5m]) < 1
+        for: 15m
+        labels:
+          severity: info
+          category: sync
+        annotations:
+          summary: "Slow sync rate"
+          description: "Syncing at {{ $value | humanize }} blocks/sec (expected: > 1 block/sec)"
+
+  # ============================================
+  # Storage Alerts
+  # ============================================
+  - name: storage_health
+    interval: 30s
+    rules:
+      # Slow storage reads
+      - alert: SlowStorageReads
+        expr: histogram_quantile(0.95, rate(norn_storage_read_duration_seconds_bucket[5m])) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Slow storage read operations"
+          description: "95th percentile read latency is {{ $value | humanizeDuration }}"
+
+      # Slow storage writes
+      - alert: SlowStorageWrites
+        expr: histogram_quantile(0.95, rate(norn_storage_write_duration_seconds_bucket[5m])) > 0.01
+        for: 10m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Slow storage write operations"
+          description: "95th percentile write latency is {{ $value | humanizeDuration }}"
+
+  # ============================================
+  # RPC Alerts
+  # ============================================
+  - name: rpc_health
+    interval: 30s
+    rules:
+      # High RPC error rate
+      - alert: HighRPCErrorRate
+        expr: rate(norn_rpc_requests_total{status="failure"}[5m]) / rate(norn_rpc_requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          category: rpc
+        annotations:
+          summary: "High RPC error rate"
+          description: "{{ $value | humanizePercentage }} of RPC requests are failing"
+
+      # Slow RPC response time
+      - alert: SlowRPCResponse
+        expr: histogram_quantile(0.95, rate(norn_rpc_request_duration_seconds_bucket[5m])) > 1
+        for: 5m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Slow RPC response times"
+          description: "95th percentile RPC response time is {{ $value | humanizeDuration }}"
+
+  # ============================================
+  # Performance Alerts
+  # ============================================
+  - name: performance_metrics
+    interval: 30s
+    rules:
+      # Low TPS
+      - alert: LowTPS
+        expr: norn_tps < 10
+        for: 10m
+        labels:
+          severity: info
+          category: performance
+        annotations:
+          summary: "Low transactions per second"
+          description: "Current TPS is {{ $value }} (expected: > 10)"
+
+      # Memory usage (if available)
+      - alert: HighMemoryUsage
+        expr: process_resident_memory_bytes / 1024 / 1024 > 2048
+        for: 5m
+        labels:
+          severity: warning
+          category: resources
+        annotations:
+          summary: "High memory usage"
+          description: "Memory usage is {{ $value | humanize }}MB (threshold: 2048MB)"
+
+  # ============================================
+  # State Pruning Alerts
+  # ============================================
+  - name: pruning_health
+    interval: 1m
+    rules:
+      # Pruning operation too slow
+      - alert: SlowPruning
+        expr: norn_state_pruning_duration_seconds > 30
+        labels:
+          severity: warning
+          category: maintenance
+        annotations:
+          summary: "Slow pruning operation"
+          description: "Last pruning operation took {{ $value | humanizeDuration }}"
+
+      # Pruning stalled
+      - alert: PruningStalled
+        expr: time() - norn_state_pruning_last_block > 86400
+        for: 5m
+        labels:
+          severity: info
+          category: maintenance
+        annotations:
+          summary: "State pruning has not run recently"
+          description: "Last pruning was {{ $value | humanizeDuration }} ago"

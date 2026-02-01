@@ -1,0 +1,17 @@
+# Configuration for norn node optimized for Remix development
+# This config sets up a single node with Ethereum JSON-RPC on port 8545 (standard Ethereum port)
+
+data_dir = "./remix_node_data"
+rpc_address = "0.0.0.0:7545"  # Will make Ethereum RPC available on port 8545 (7545 + 1000)
+
+[core]
+    [core.consensus]
+    # Validator keys for consensus
+    pub_key = "020000000000000000000000000000000000000000000000000000000000000001"
+    prv_key = "0000000000000000000000000000000000000000000000000000000000000001"
+
+[network]
+# P2P network configuration
+listen_address = "/ip4/0.0.0.0/tcp/40101"
+bootstrap_peers = []
+mdns = true  # Enable mDNS for local peer discovery

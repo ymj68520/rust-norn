@@ -7,6 +7,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use num_bigint::BigUint;
 use num_traits::{Zero, One};
+use crate::state::AccountStateManager;
 
 /// Gas 价格和限制配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,15 +93,18 @@ pub struct GasOperation {
 pub struct GasCalculator {
     /// 配置
     config: Arc<RwLock<GasConfig>>,
-    
+
     /// Gas 价格表
     gas_schedule: Arc<RwLock<GasSchedule>>,
-    
+
     /// 当前 Gas 价格
     current_gas_price: Arc<RwLock<BigUint>>,
-    
+
     /// Gas 使用历史
     usage_history: Arc<RwLock<Vec<GasUsageRecord>>>,
+
+    /// 状态管理器（用于检查余额）
+    state_manager: Option<Arc<AccountStateManager>>,
 }
 
 /// Gas 调度表
@@ -208,44 +212,197 @@ pub struct GasUsageRecord {
 }
 
 impl GasCalculator {
-    /// 创建新的 Gas 计算器
+    /// 创建新的 Gas 计算器（不带状态管理器）
     pub fn new(config: GasConfig) -> Self {
         let gas_schedule = Self::create_default_gas_schedule();
-        
+
         Self {
             config: Arc::new(RwLock::new(config)),
             gas_schedule: Arc::new(RwLock::new(gas_schedule)),
             current_gas_price: Arc::new(RwLock::new(BigUint::from(1000u64))),
             usage_history: Arc::new(RwLock::new(Vec::new())),
+            state_manager: None,
         }
+    }
+
+    /// 创建新的 Gas 计算器（带状态管理器）
+    pub fn with_state_manager(config: GasConfig, state_manager: Arc<AccountStateManager>) -> Self {
+        let gas_schedule = Self::create_default_gas_schedule();
+
+        Self {
+            config: Arc::new(RwLock::new(config)),
+            gas_schedule: Arc::new(RwLock::new(gas_schedule)),
+            current_gas_price: Arc::new(RwLock::new(BigUint::from(1000u64))),
+            usage_history: Arc::new(RwLock::new(Vec::new())),
+            state_manager: Some(state_manager),
+        }
+    }
+
+    /// 设置状态管理器
+    pub fn set_state_manager(&mut self, state_manager: Arc<AccountStateManager>) {
+        self.state_manager = Some(state_manager);
     }
 
     /// 估算交易 Gas 使用量
     pub async fn estimate_gas(&self, transaction: &Transaction) -> Result<u64> {
         debug!("Estimating gas for transaction: {:?}", transaction);
-        
+
         let gas_schedule = self.gas_schedule.read().await;
-        
-        // 1. 基础交易成本
-        let mut gas_used = gas_schedule.base_costs.get("transaction").copied().unwrap_or(21000);
-        
-        // 2. 数据传输成本
-        let data_cost = self.calculate_data_cost(&transaction.data, &gas_schedule);
-        gas_used += data_cost;
-        
+
+        // 1. 计算内在 Gas（intrinsic gas）
+        let intrinsic_gas = self.calculate_intrinsic_gas(transaction, &gas_schedule).await?;
+
+        // 2. 基础交易成本
+        let mut gas_used = intrinsic_gas;
+
         // 3. 如果是合约创建，添加创建成本
         if transaction.to.is_none() {
             gas_used += gas_schedule.contract_costs.contract_create;
             gas_used += transaction.data.len() as u64 * gas_schedule.contract_costs.contract_code_byte;
         }
-        
+
         // 4. 如果是合约调用，添加调用成本
         if transaction.to.is_some() {
             gas_used += gas_schedule.contract_costs.contract_call;
         }
-        
+
         debug!("Estimated gas: {}", gas_used);
         Ok(gas_used)
+    }
+
+    /// 计算交易的内在 Gas（Intrinsic Gas）
+    ///
+    /// 这是交易必须支付的最小 gas，包括：
+    /// - 基础交易成本（21,000 gas）
+    /// - 数据成本（每字节非零数据 16 gas，零数据 4 gas）
+    /// - 支持 EIP-150 (Tangerine Whistle) - 调用深度限制
+    /// - 支持 EIP-1884 - 净 gas 计量
+    async fn calculate_intrinsic_gas(&self, transaction: &Transaction, gas_schedule: &GasSchedule) -> Result<u64> {
+        // 1. 基础交易成本
+        let mut gas = gas_schedule.base_costs.get("transaction").copied().unwrap_or(21000);
+
+        // 2. 数据成本（EIP-7623: 交易数据成本）
+        // 零字节成本: 4 gas per byte
+        // 非零字节成本: 16 gas per byte
+        let (zero_count, non_zero_count) = transaction.data.iter()
+            .fold((0, 0), |(zeros, non_zeros), &byte| {
+                if byte == 0 {
+                    (zeros + 1, non_zeros)
+                } else {
+                    (zeros, non_zeros + 1)
+                }
+            });
+
+        let zero_cost = zero_count * 4;
+        let non_zero_cost = non_zero_count * 16;
+        let data_cost = zero_cost + non_zero_cost;
+
+        gas += data_cost;
+
+        debug!(
+            "Intrinsic gas: base={}, zero_bytes={}, non_zero_bytes={}, data_cost={}, total={}",
+            gas_schedule.base_costs.get("transaction").copied().unwrap_or(21000),
+            zero_count,
+            non_zero_count,
+            data_cost,
+            gas
+        );
+
+        Ok(gas)
+    }
+
+    /// 计算数据传输成本（辅助方法）
+    fn calculate_data_cost(&self, data: &[u8], gas_schedule: &GasSchedule) -> u64 {
+        // 零字节成本: 4 gas per byte
+        // 非零字节成本: 16 gas per byte
+        data.iter()
+            .fold(0, |acc, &byte| {
+                acc + if byte == 0 { 4 } else { 16 }
+            })
+    }
+
+    /// 计算调用深度 Gas 成本（EIP-150）
+    ///
+    /// EIP-150 引入了调用深度相关的 gas 成本，以防止堆栈溢出攻击
+    pub fn calculate_call_depth_cost(depth: u64, gas_schedule: &GasSchedule) -> u64 {
+        if depth > 0 {
+            depth * gas_schedule.contract_costs.call_depth_cost
+        } else {
+            0
+        }
+    }
+
+    /// 计算 refunds（Gas 退款）
+    ///
+    /// 某些操作可以退还 gas，例如：
+    /// - 清除存储（SSTORE 清除）: 15,000 gas
+    /// - 自毁合约（SELFDESTRUCT）: 24,000 gas
+    pub fn calculate_refund(&self, storage_clears: u64, self_destructs: u64) -> u64 {
+        let storage_refund = storage_clears * 15000;
+        let self_destruct_refund = self_destructs * 24000;
+
+        // 总退款不能超过 gas 使用量的一半（EIP-3529）
+        let total_refund = storage_refund + self_destruct_refund;
+        total_refund // 注意：调用者需要确保不超过上限
+    }
+
+    /// 验证 Gas 价格（EIP-1559: Base fee）
+    ///
+    /// EIP-1559 引入了基础费用（base fee）和优先费用（priority fee）
+    pub async fn validate_gas_price(&self, transaction: &Transaction, base_fee: Option<&BigUint>) -> Result<bool> {
+        let tx_gas_price = BigUint::from_bytes(&transaction.gas_price);
+
+        if let Some(base) = base_fee {
+            // EIP-1559: gas price 必须 >= base fee
+            if tx_gas_price < *base {
+                warn!(
+                    "Gas price below base fee: {} < {}",
+                    tx_gas_price, base
+                );
+                return Ok(false);
+            }
+        }
+
+        // 检查最小 gas price
+        let config = self.config.read().await;
+        if tx_gas_price < config.min_gas_price {
+            warn!(
+                "Gas price below minimum: {} < {}",
+                tx_gas_price, config.min_gas_price
+            );
+            return Ok(false);
+        }
+
+        Ok(true)
+    }
+
+    /// 计算 EIP-1559 费用
+    ///
+    /// 返回 (base_fee, priority_fee, total_fee)
+    pub async fn calculate_eip1559_fees(
+        &self,
+        gas_limit: u64,
+        max_fee_per_gas: &BigUint,
+        max_priority_fee_per_gas: &BigUint,
+        base_fee: &BigUint,
+    ) -> Result<(BigUint, BigUint, BigUint)> {
+        // Priority fee 是 min(max_priority_fee_per_gas, max_fee_per_gas - base_fee)
+        let priority_fee = if max_priority_fee_per_gas < max_fee_per_gas {
+            max_priority_fee_per_gas.clone()
+        } else {
+            let diff = max_fee_per_gas - base_fee;
+            if diff < *max_priority_fee_per_gas {
+                diff
+            } else {
+                max_priority_fee_per_gas.clone()
+            }
+        };
+
+        // Total fee = (base_fee + priority_fee) * gas_limit
+        let effective_gas_price = base_fee + &priority_fee;
+        let total_fee = effective_gas_price * gas_limit;
+
+        Ok((base_fee.clone(), priority_fee, total_fee))
     }
 
     /// 计算实际 Gas 使用量
@@ -323,14 +480,38 @@ impl GasCalculator {
         // 3. 检查账户余额是否足够支付费用
         let max_fee = BigUint::from(transaction.gas_limit) * &gas_price;
         let total_cost = BigUint::from_bytes(&transaction.value) + &max_fee;
-        
-        // TODO: 检查发送者余额
-        // let sender_balance = self.get_balance(&transaction.from).await?;
-        // if sender_balance < total_cost {
-        //     warn!("Insufficient balance for gas fees");
-        //     return Ok(false);
-        // }
-        
+
+        // 检查发送者余额
+        if let Some(state_manager) = &self.state_manager {
+            match state_manager.get_account_state(&transaction.from).await {
+                Ok(Some(account)) => {
+                    let sender_balance = BigUint::from_bytes(&account.balance.0);
+                    if sender_balance < total_cost {
+                        warn!(
+                            "Insufficient balance: required={}, have={}",
+                            total_cost, sender_balance
+                        );
+                        return Ok(false);
+                    }
+                    debug!(
+                        "Balance check passed: required={}, have={}",
+                        total_cost, sender_balance
+                    );
+                }
+                Ok(None) => {
+                    warn!("Sender account does not exist: {:?}", transaction.from);
+                    return Ok(false);
+                }
+                Err(e) => {
+                    error!("Failed to get sender balance: {:?}", e);
+                    // 继续处理，但记录警告
+                    warn!("Unable to verify balance due to error, proceeding with caution");
+                }
+            }
+        } else {
+            debug!("No state manager available, skipping balance check");
+        }
+
         debug!("Transaction gas validation passed");
         Ok(true)
     }
@@ -413,7 +594,7 @@ impl GasCalculator {
             total_gas_used: gas_usage.gas_used,
             gas_limit: gas_usage.gas_limit,
             avg_gas_price: gas_usage.gas_price.clone(),
-            transaction_count: 1, // TODO: 从实际交易数量获取
+            transaction_count: 1, // 单笔交易的 gas 使用记录
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -527,7 +708,7 @@ mod tests {
     async fn test_gas_estimation() {
         let config = GasConfig::default();
         let calculator = GasCalculator::new(config);
-        
+
         let transaction = Transaction {
             from: Address::default(),
             to: Some(Address::default()),
@@ -538,8 +719,168 @@ mod tests {
             data: vec![],
             signature: vec![],
         };
-        
+
         let estimated_gas = calculator.estimate_gas(&transaction).await.unwrap();
+        assert!(estimated_gas >= 21000, "Base gas should be at least 21,000");
+    }
+
+    #[tokio::test]
+    async fn test_intrinsic_gas_calculation() {
+        let config = GasConfig::default();
+        let calculator = GasCalculator::new(config);
+
+        // Test with zero data
+        let tx_zero_data = Transaction {
+            from: Address::default(),
+            to: Some(Address::default()),
+            value: vec![0u8; 32],
+            gas_price: vec![1u8; 32],
+            gas_limit: 100000,
+            nonce: 0,
+            data: vec![0u8; 100], // 100 zero bytes
+            signature: vec![],
+        };
+
+        let gas_schedule = calculator.gas_schedule.read().await;
+        let intrinsic = calculator.calculate_intrinsic_gas(&tx_zero_data, &gas_schedule).await.unwrap();
+
+        // Base: 21000 + Zero bytes: 100 * 4 = 400 = 21400
+        assert_eq!(intrinsic, 21400, "Intrinsic gas calculation incorrect for zero data");
+    }
+
+    #[tokio::test]
+    async fn test_intrinsic_gas_with_non_zero_data() {
+        let config = GasConfig::default();
+        let calculator = GasCalculator::new(config);
+
+        // Test with non-zero data
+        let tx_non_zero = Transaction {
+            from: Address::default(),
+            to: Some(Address::default()),
+            value: vec![0u8; 32],
+            gas_price: vec![1u8; 32],
+            gas_limit: 100000,
+            nonce: 0,
+            data: vec![0xFF; 50], // 50 non-zero bytes
+            signature: vec![],
+        };
+
+        let gas_schedule = calculator.gas_schedule.read().await;
+        let intrinsic = calculator.calculate_intrinsic_gas(&tx_non_zero, &gas_schedule).await.unwrap();
+
+        // Base: 21000 + Non-zero bytes: 50 * 16 = 800 = 21800
+        assert_eq!(intrinsic, 21800, "Intrinsic gas calculation incorrect for non-zero data");
+    }
+
+    #[tokio::test]
+    async fn test_intrinsic_gas_mixed_data() {
+        let config = GasConfig::default();
+        let calculator = GasCalculator::new(config);
+
+        // Test with mixed zero and non-zero data
+        let mut data = vec![0u8; 100];
+        data[0..50].copy_from_slice(&[0xFF; 50]); // First 50 are non-zero
+
+        let tx_mixed = Transaction {
+            from: Address::default(),
+            to: Some(Address::default()),
+            value: vec![0u8; 32],
+            gas_price: vec![1u8; 32],
+            gas_limit: 100000,
+            nonce: 0,
+            data,
+            signature: vec![],
+        };
+
+        let gas_schedule = calculator.gas_schedule.read().await;
+        let intrinsic = calculator.calculate_intrinsic_gas(&tx_mixed, &gas_schedule).await.unwrap();
+
+        // Base: 21000 + Zero: 50 * 4 = 200 + Non-zero: 50 * 16 = 800
+        // Total: 21000 + 200 + 800 = 22000
+        assert_eq!(intrinsic, 22000, "Intrinsic gas calculation incorrect for mixed data");
+    }
+
+    #[tokio::test]
+    async fn test_call_depth_cost() {
+        let config = GasConfig::default();
+        let calculator = GasCalculator::new(config);
+        let gas_schedule = calculator.gas_schedule.read().await;
+
+        // Test different call depths
+        let cost_depth_0 = GasCalculator::calculate_call_depth_cost(0, &gas_schedule);
+        assert_eq!(cost_depth_0, 0, "Zero depth should have zero cost");
+
+        let cost_depth_1 = GasCalculator::calculate_call_depth_cost(1, &gas_schedule);
+        assert_eq!(cost_depth_1, 700, "Depth 1 should cost 700");
+
+        let cost_depth_5 = GasCalculator::calculate_call_depth_cost(5, &gas_schedule);
+        assert_eq!(cost_depth_5, 3500, "Depth 5 should cost 3500");
+    }
+
+    #[tokio::test]
+    async fn test_gas_refund() {
+        let calculator = GasCalculator::new(GasConfig::default());
+
+        // Test refund calculation
+        let refund = GasCalculator::calculate_refund(2, 1);
+        assert_eq!(refund, 54000, "Refund should be 2*15000 + 1*24000 = 54000");
+
+        // Test with zero operations
+        let refund_zero = GasCalculator::calculate_refund(0, 0);
+        assert_eq!(refund_zero, 0, "No operations should have zero refund");
+    }
+
+    #[tokio::test]
+    async fn test_eip1559_fee_calculation() {
+        let calculator = GasCalculator::new(GasConfig::default());
+
+        // Test EIP-1559 fee calculation
+        let base_fee = BigUint::from(100u64);
+        let max_fee = BigUint::from(200u64);
+        let max_priority = BigUint::from(50u64);
+        let gas_limit = 21000u64;
+
+        let (base, priority, total) = calculator
+            .calculate_eip1559_fees(gas_limit, &max_fee, &max_priority, &base_fee)
+            .await
+            .unwrap();
+
+        assert_eq!(base, BigUint::from(100u64));
+        // Priority fee should be min(50, 200-100) = 50
+        assert_eq!(priority, BigUint::from(50u64));
+        // Total = (100 + 50) * 21000 = 3,150,000
+        assert_eq!(total, BigUint::from(3150000u64));
+    }
+
+    #[tokio::test]
+    async fn test_gas_price_validation() {
+        let calculator = GasCalculator::new(GasConfig::default());
+
+        let tx_valid = Transaction {
+            from: Address::default(),
+            to: Some(Address::default()),
+            value: vec![0u8; 32],
+            gas_price: vec![100u8; 32],
+            gas_limit: 21000,
+            nonce: 0,
+            data: vec![],
+            signature: vec![],
+        };
+
+        // Should pass with sufficient gas price
+        let result = calculator.validate_gas_price(&tx_valid, None).await.unwrap();
+        assert!(result, "Valid gas price should pass");
+
+        // Test with base fee
+        let base_fee = BigUint::from(50u64);
+        let result = calculator.validate_gas_price(&tx_valid, Some(&base_fee)).await.unwrap();
+        assert!(result, "Gas price above base fee should pass");
+
+        // Test with gas price below base fee
+        let base_fee_high = BigUint::from(200u64);
+        let result = calculator.validate_gas_price(&tx_valid, Some(&base_fee_high)).await.unwrap();
+        assert!(!result, "Gas price below base fee should fail");
+    }
         assert!(estimated_gas > 0);
     }
 

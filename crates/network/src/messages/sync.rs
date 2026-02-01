@@ -3,6 +3,9 @@ use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// Re-export compression utilities
+use crate::compression::{Compressor, CompressionConfig, CompressionAlgorithm};
+
 /// 网络消息类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum NetworkMessage {
@@ -560,12 +563,29 @@ impl Default for NetworkMessageConfig {
 /// 消息编码器
 pub struct MessageEncoder {
     config: NetworkMessageConfig,
+    compressor: Compressor,
 }
+
+// Compression magic bytes: [0xFF, 0xCF, ALGORITHM]
+// 0xFF 0xCF identifies this as compressed data
+// ALGORITHM: 0x00 = None, 0x01 = Zstd, 0x02 = Snappy
+const COMPRESSED_MAGIC_PREFIX: &[u8] = &[0xFF, 0xCF];
 
 impl MessageEncoder {
     /// 创建新的消息编码器
     pub fn new(config: NetworkMessageConfig) -> Self {
-        Self { config }
+        let compressor = Compressor::with_config(crate::compression::CompressionConfig {
+            algorithm: crate::compression::CompressionAlgorithm::Zstd,
+            level: crate::compression::CompressionLevel::Default,
+            min_size: config.compression_threshold,
+            adaptive: true,
+        });
+        Self { config, compressor }
+    }
+
+    /// 创建带有自定义压缩器的编码器
+    pub fn with_compressor(config: NetworkMessageConfig, compressor: Compressor) -> Self {
+        Self { config, compressor }
     }
 
     /// 编码消息
@@ -597,16 +617,47 @@ impl MessageEncoder {
 
     /// 压缩数据
     fn compress(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        // 简化实现：返回原数据
-        // TODO: 实现实际的压缩算法
-        Ok(data.to_vec())
+        // Skip compression if data is too small (Compressor handles this internally)
+        let compressed = self.compressor.compress(data)?;
+
+        // Add compression magic prefix
+        // Format: [0xFF, 0xCF, ALGORITHM, ...compressed_data...]
+        let algorithm_byte = match self.compressor.config().algorithm {
+            crate::compression::CompressionAlgorithm::None => 0x00u8,
+            crate::compression::CompressionAlgorithm::Zstd => 0x01u8,
+            crate::compression::CompressionAlgorithm::Snappy => 0x02u8,
+        };
+
+        let mut result = Vec::with_capacity(3 + compressed.len());
+        result.extend_from_slice(COMPRESSED_MAGIC_PREFIX);
+        result.push(algorithm_byte);
+        result.extend_from_slice(&compressed);
+
+        Ok(result)
     }
 
     /// 尝试解压缩
     fn try_decompress(&self, data: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        // 简化实现：返回原数据
-        // TODO: 实现实际的解压缩算法
-        Ok(data.to_vec())
+        // Check if data has compression magic prefix
+        if data.len() < 3 || !data.starts_with(COMPRESSED_MAGIC_PREFIX) {
+            // Data is not compressed
+            return Ok(data.to_vec());
+        }
+
+        // Extract algorithm byte
+        let algorithm_byte = data[2];
+        let compressed_data = &data[3..];
+
+        let algorithm = match algorithm_byte {
+            0x00 => crate::compression::CompressionAlgorithm::None,
+            0x01 => crate::compression::CompressionAlgorithm::Zstd,
+            0x02 => crate::compression::CompressionAlgorithm::Snappy,
+            _ => return Err(format!("Unknown compression algorithm: {}", algorithm_byte).into()),
+        };
+
+        // Decompress using the appropriate algorithm
+        self.compressor.decompress(compressed_data, algorithm)
+            .map_err(|e| format!("Decompression failed: {:?}", e).into())
     }
 }
 
@@ -727,7 +778,7 @@ impl MessageValidator {
     fn validate_transaction_message(&self, message: &TransactionMessage) -> Result<(), Box<dyn std::error::Error>> {
         match message {
             TransactionMessage::TransactionBroadcast(broadcast) => {
-                if broadcast.transaction.signature.is_empty() {
+                if broadcast.transaction.body.signature.is_empty() {
                     return Err("Empty transaction signature".into());
                 }
             }
@@ -854,3 +905,35 @@ mod tests {
         assert_eq!(message, message);
     }
 }
+
+/// Compression utilities for network messages
+///
+/// This module provides helper functions to compress and decompress
+/// network messages, reducing bandwidth usage during synchronization.
+impl NetworkMessage {
+    /// Compress the message if beneficial
+    pub fn compress(&self) -> anyhow::Result<CompressedMessage> {
+        // Serialize the message
+        let serialized = bincode::serialize(self)?;
+
+        // Create compression config with adaptive compression
+        let config = CompressionConfig {
+            algorithm: CompressionAlgorithm::Zstd,
+            level: crate::compression::CompressionLevel::Default,
+            min_size: 256,
+            adaptive: true,
+        };
+
+        CompressedMessage::compress(&serialized, &config)
+    }
+
+    /// Decompress a compressed message
+    pub fn decompress(compressed: &CompressedMessage) -> anyhow::Result<Self> {
+        let data = compressed.decompress()?;
+        let message: Self = bincode::deserialize(&data)?;
+        Ok(message)
+    }
+}
+
+// Re-export CompressedMessage
+pub use super::compression::CompressedMessage;

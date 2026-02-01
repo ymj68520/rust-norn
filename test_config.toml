@@ -1,0 +1,11 @@
+data_dir = "test_node_data"
+rpc_address = "127.0.0.1:49999"
+
+[core.consensus]
+pub_key = "loaded_from_file"
+prv_key = "loaded_from_file"
+
+[network]
+listen_address = "/ip4/0.0.0.0/tcp/39999"
+bootstrap_peers = []
+mdns = false

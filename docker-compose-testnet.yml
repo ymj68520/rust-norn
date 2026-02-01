@@ -1,0 +1,130 @@
+version: '3.8'
+
+services:
+  # Validator Node 1
+  norn-validator1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: norn:testnet
+    container_name: norn-validator1
+    command: --config /app/config/testnet.toml
+    ports:
+      - "4001:4001"  # P2P
+      - "50051:50051"  # gRPC RPC
+      - "51337:51337"  # Ethereum JSON-RPC
+      - "9090:9090"  # Prometheus metrics
+      - "8080:8080"  # Health check
+    volumes:
+      - ./test_week3_config.toml:/app/config/testnet.toml:ro
+      - validator1_data:/data/norn
+    networks:
+      - norn_testnet
+    environment:
+      - RUST_LOG=debug,norn=trace
+      - NODE_ID=validator1
+    restart: unless-stopped
+
+  # Validator Node 2
+  norn-validator2:
+    image: norn:testnet
+    container_name: norn-validator2
+    command: --config /app/config/testnet.toml
+    ports:
+      - "4002:4001"
+      - "50052:50051"
+      - "51338:51337"
+      - "9091:9090"
+      - "8081:8080"
+    volumes:
+      - ./test_week3_config.toml:/app/config/testnet.toml:ro
+      - validator2_data:/data/norn
+    networks:
+      - norn_testnet
+    environment:
+      - RUST_LOG=debug,norn=trace
+      - NODE_ID=validator2
+    depends_on:
+      - norn-validator1
+    restart: unless-stopped
+
+  # Validator Node 3
+  norn-validator3:
+    image: norn:testnet
+    container_name: norn-validator3
+    command: --config /app/config/testnet.toml
+    ports:
+      - "4003:4001"
+      - "50053:50051"
+      - "51339:51337"
+      - "9092:9090"
+      - "8082:8080"
+    volumes:
+      - ./test_week3_config.toml:/app/config/testnet.toml:ro
+      - validator3_data:/data/norn
+    networks:
+      - norn_testnet
+    environment:
+      - RUST_LOG=debug,norn=trace
+      - NODE_ID=validator3
+    depends_on:
+      - norn-validator1
+    restart: unless-stopped
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: norn-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./monitoring/prometheus-testnet.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - norn_testnet
+    restart: unless-stopped
+
+  # Grafana Visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: norn-grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+    networks:
+      - norn_testnet
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+networks:
+  norn_testnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+volumes:
+  validator1_data:
+    driver: local
+  validator2_data:
+    driver: local
+  validator3_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local

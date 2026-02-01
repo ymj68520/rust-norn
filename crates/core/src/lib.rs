@@ -12,3 +12,9 @@ pub mod execution;
 pub mod fee;
 pub mod wallet;
 pub mod events;
+pub mod evm;
+
+// Re-export commonly used types
+pub use txpool::{TxPool, TransactionPool, TxPoolStats};
+pub mod txpool_enhanced;  // New: Enhanced transaction pool
+pub use txpool_enhanced::{EnhancedTxPool, PrioritizedTransaction, TxPoolError};

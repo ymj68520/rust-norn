@@ -1,0 +1,94 @@
+# Norn Faucet Configuration
+# Production-grade faucet service for token distribution
+
+[server]
+# Server address to listen on
+address = "0.0.0.0:3000"
+
+# Enable CORS (for web interface)
+cors_enabled = true
+
+# Allowed origins (use "*" for all)
+allowed_origins = ["*"]
+
+[faucet]
+# Blockchain RPC endpoint
+rpc_url = "http://localhost:8545"
+
+# Faucet account private key (NEVER commit this to version control!)
+# Generate with: openssl rand -hex 32
+private_key = "${FAUCET_PRIVATE_KEY}"
+
+# Amount to dispense per request (in wei)
+# 1000 ETH = 1000000000000000000000 wei
+dispense_amount = "1000000000000000000000"
+
+# Minimum balance required for faucet to operate (in wei)
+# 100 ETH = 100000000000000000000 wei
+min_balance = "100000000000000000000"
+
+[rate_limit]
+# Maximum requests per time window
+max_requests_per_window = 3
+
+# Time window in seconds (3600 = 1 hour)
+rate_limit_window_secs = 3600
+
+# Cooldown period between requests for same address (seconds)
+# 86400 = 24 hours
+address_cooldown_secs = 86400
+
+# Maximum amount per address total (in wei)
+# 5000 ETH = 5000000000000000000000 wei
+max_amount_per_address = "5000000000000000000000"
+
+[database]
+# Database path
+path = "./faucet_data"
+
+[maintenance]
+# Enable automatic cleanup of old records
+auto_cleanup = true
+
+# Cleanup records older than X days
+cleanup_after_days = 30
+
+[captcha]
+# Enable captcha verification (for production)
+enabled = false
+
+# Captcha provider ("hcaptcha" or "recaptcha")
+provider = "hcaptcha"
+
+# Captcha site key
+site_key = "${CAPTCHA_SITE_KEY}"
+
+# Captcha secret key
+secret_key = "${CAPTCHA_SECRET_KEY}"
+
+[metrics]
+# Enable Prometheus metrics
+enabled = true
+
+# Metrics port
+port = 9091
+
+[transaction]
+# Gas price to use (in wei)
+# 1 Gwei = 1000000000 wei
+gas_price = "1000000000"
+
+# Gas limit for transactions
+gas_limit = 21000
+
+[auto_refill]
+# Enable automatic refill when balance is low
+enabled = false
+
+# Auto-refill threshold (in wei)
+# 50 ETH = 50000000000000000000 wei
+threshold = "50000000000000000000"
+
+# Auto-refill amount (in wei)
+# 1000 ETH = 1000000000000000000000 wei
+amount = "1000000000000000000000"

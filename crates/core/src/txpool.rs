@@ -10,6 +10,36 @@ pub trait ChainReader: Send + Sync {
     async fn get_transaction_by_hash(&self, hash: &Hash) -> Option<Transaction>;
 }
 
+/// Common trait for transaction pool implementations
+#[async_trait]
+pub trait TransactionPool: Send + Sync {
+    /// Add a transaction to the pool
+    async fn add(&self, tx: Transaction) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Remove a transaction from the pool
+    async fn remove(&self, hash: &Hash);
+
+    /// Get a transaction by hash
+    async fn get(&self, hash: &Hash) -> Option<Transaction>;
+
+    /// Check if a transaction exists in the pool
+    async fn contains(&self, hash: &Hash) -> bool;
+
+    /// Package transactions for a new block
+    async fn package<C: ChainReader>(&self, chain: &C) -> Vec<Transaction>;
+
+    /// Get pool statistics
+    async fn stats(&self) -> TxPoolStats;
+}
+
+/// Transaction pool statistics
+#[derive(Debug, Clone)]
+pub struct TxPoolStats {
+    pub size: usize,
+    pub total_gas_price: u64,
+    pub avg_gas_price: u64,
+}
+
 const MAX_TX_POOL_SIZE: usize = 20480;
 const MAX_TX_PACKAGE_COUNT: usize = 10000;
 
@@ -59,11 +89,11 @@ impl TxPool {
         debug!("Start package transaction...");
         let mut result = Vec::with_capacity(MAX_TX_PACKAGE_COUNT);
         let mut to_remove = Vec::new();
-        
+
         // Iterating DashMap is synchronous.
         // But checking chain is async.
         // We can collect candidates first, then check async.
-        
+
         let candidates: Vec<(Hash, Transaction)> = self.txs
             .iter()
             .take(MAX_TX_PACKAGE_COUNT * 2) // Take more to filter?
@@ -85,12 +115,24 @@ impl TxPool {
                 // "pool.txs.Delete(txHash)"
             }
         }
-        
+
         for hash in to_remove {
             self.remove(&hash);
         }
 
         result
+    }
+
+    pub async fn stats(&self) -> TxPoolStats {
+        let size = self.count.load(Ordering::Relaxed);
+        let total_gas_price = 0u64; // Standard pool doesn't track gas prices
+        let avg_gas_price = if size > 0 { total_gas_price / size as u64 } else { 0 };
+
+        TxPoolStats {
+            size,
+            total_gas_price,
+            avg_gas_price,
+        }
     }
 }
 
@@ -99,16 +141,40 @@ impl Default for TxPool {
     fn default() -> Self {
 
         Self::new()
-
     }
-
 }
 
+#[async_trait]
+impl TransactionPool for TxPool {
+    async fn add(&self, tx: Transaction) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.add(tx);
+        Ok(())
+    }
 
+    async fn remove(&self, hash: &Hash) {
+        self.remove(hash);
+    }
+
+    async fn get(&self, hash: &Hash) -> Option<Transaction> {
+        self.get(hash)
+    }
+
+    async fn contains(&self, hash: &Hash) -> bool {
+        self.contains(hash)
+    }
+
+    async fn package<C: ChainReader>(&self, chain: &C) -> Vec<Transaction> {
+        self.package(chain).await
+    }
+
+    async fn stats(&self) -> TxPoolStats {
+        self.stats().await
+    }
+}
 
 #[cfg(test)]
 
-mod tests {
+pub mod tests {
 
     use super::*;
 
@@ -118,12 +184,9 @@ mod tests {
 
 
 
-    struct MockChain;
-
-
+    pub struct MockChain;
 
     #[async_trait]
-
     impl ChainReader for MockChain {
 
         async fn get_transaction_by_hash(&self, _hash: &Hash) -> Option<Transaction> {

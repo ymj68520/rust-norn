@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+
+# 统一测试工作空间
+members = [
+    "integration",
+    "unit",
+    "performance/tps_test",
+    "performance/scalability_test",
+]
+
+exclude = [
+    "e2e",    # E2E 测试作为独立脚本运行
+    "tools",  # 工具暂时排除，需要修复编译错误
+]
+
+[workspace.dependencies]
+# 继承主工作空间的依赖（从 tests/ 目录回到项目根目录）
+norn-common = { path = "../crates/common" }
+norn-core = { path = "../crates/core" }
+norn-crypto = { path = "../crates/crypto" }
+norn-storage = { path = "../crates/storage" }
+norn-network = { path = "../crates/network" }
+norn-rpc = { path = "../crates/rpc" }
+norn-node = { path = "../crates/node" }
+
+tokio = { version = "1.36", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.11", features = ["json"] }
+tokio-stream = "0.1"
+clap = { version = "4.0", features = ["derive"] }
+chrono = "0.4"
+tempfile = "3.8"
+hex = "0.4"
+rand = "0.8"
+tonic = { version = "0.11" }
+prost = { version = "0.12" }
+tonic-build = { version = "0.11" }
