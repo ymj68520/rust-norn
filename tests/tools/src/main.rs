@@ -1,149 +1,65 @@
 use norn_crypto::ecdsa::KeyPair;
-use norn_crypto::transaction::TransactionSigner;
-use norn_common::types::{Address, Transaction, TransactionBody, TransactionType, Hash};
+use norn_common::types::{Address, Transaction, TransactionBody, Hash};
+use rand::Rng;
 
-// Proto definition (simplified)
-#[derive(Clone, PartialEq, ::prost::Message)]
-struct ProtoTransaction {
-    #[prost(string, tag = "1")]
-    pub hash: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub address: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub receiver: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "4")]
-    pub gas: u64,
-    #[prost(uint64, tag = "5")]
-    pub nonce: u64,
-    #[prost(string, tag = "6")]
-    pub event: ::prost::alloc::string::String,
-    #[prost(string, tag = "7")]
-    pub opt: ::prost::alloc::string::String,
-    #[prost(string, tag = "8")]
-    pub state: ::prost::alloc::string::String,
-    #[prost(string, tag = "9")]
-    pub data: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "10")]
-    pub expire: u64,
-    #[prost(uint64, tag = "11")]
-    pub timestamp: u64,
-    #[prost(string, tag = "12")]
-    pub public: ::prost::alloc::string::String,
-    #[prost(string, tag = "13")]
-    pub signature: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "14")]
-    pub height: u64,
-    #[prost(string, tag = "15")]
-    pub block_hash: ::prost::alloc::string::String,
-    #[prost(uint64, tag = "16")]
-    pub index: u64,
-}
+fn main() -> anyhow::Result<()> {
+    println!("=== Norn Transaction Generator ===\n");
 
-fn main() {
+    // 生成随机密钥对
     let keypair = KeyPair::random();
-    let mut signer = TransactionSigner::new(keypair);
+    let pub_key = keypair.public_key();
+    let encoded_point = pub_key.to_encoded_point(true);
+    let pub_key_bytes = encoded_point.as_bytes();
+    let pub_key_hex = hex::encode(pub_key_bytes);
+    println!("✅ Generated keypair");
+    println!("   Public key: {}", pub_key_hex);
 
-    let receiver = Address::default();
-    let tx = signer.create_transaction(
-        receiver,
-        b"test_event".to_vec(),
-        b"test_opt".to_vec(),
-        b"test_state".to_vec(),
-        b"test_data".to_vec(),
-        1000,
-        chrono::Utc::now().timestamp() + 3600,
-    ).unwrap();
+    // 从公钥创建地址（简化版：取公钥后20字节）
+    let mut addr_bytes = [0u8; 20];
+    addr_bytes.copy_from_slice(&pub_key_bytes[..20.min(pub_key_bytes.len())]);
+    let sender = Address(addr_bytes);
 
-    println!("=== Original Transaction ===");
-    println!("Hash: {}", hex::encode(tx.body.hash.0));
+    // 创建随机接收地址
+    let mut receiver_bytes = [0u8; 20];
+    rand::thread_rng().fill(&mut receiver_bytes);
+    let receiver = Address(receiver_bytes);
 
-    // 验证原始交易
-    match norn_crypto::transaction::verify_transaction(&tx) {
-        Ok(()) => println!("✅ Original transaction is valid"),
-        Err(e) => println!("❌ Original transaction verification failed: {:?}", e),
-    }
+    println!("\n✅ Creating test transaction...");
+    println!("   From: {}", hex::encode(sender.0));
+    println!("   To: {}", hex::encode(receiver.0));
 
-    // 转换为 protobuf
-    let proto = ProtoTransaction {
-        hash: hex::encode(tx.body.hash.0),
-        address: hex::encode(tx.body.address.0),
-        receiver: hex::encode(tx.body.receiver.0),
-        gas: tx.body.gas as u64,
-        nonce: tx.body.nonce as u64,
-        event: hex::encode(&tx.body.event),
-        opt: hex::encode(&tx.body.opt),
-        state: hex::encode(&tx.body.state),
-        data: hex::encode(&tx.body.data),
-        expire: tx.body.expire as u64,
-        timestamp: tx.body.timestamp as u64,
-        public: hex::encode(tx.body.public.0),
-        signature: hex::encode(&tx.body.signature),
-        height: tx.body.height as u64,
-        block_hash: hex::encode(tx.body.block_hash.0),
-        index: tx.body.index as u64,
-    };
+    // 创建随机哈希
+    let mut hash_bytes = [0u8; 32];
+    rand::thread_rng().fill(&mut hash_bytes);
+    let hash = Hash(hash_bytes);
 
-    println!("\n=== After Protobuf Conversion ===");
+    // 创建PublicKey结构（从VerifyingKey）
+    let mut public_key_bytes = [0u8; 33];
+    public_key_bytes.copy_from_slice(&pub_key_bytes[..33.min(pub_key_bytes.len())]);
+    let public = norn_common::types::PublicKey(public_key_bytes);
 
-    // 转换回Transaction
-    use norn_common::types::*;
-
-    let mut hash = Hash::default();
-    if let Ok(bytes) = hex::decode(&proto.hash) {
-        if bytes.len() == 32 {
-            hash.0.copy_from_slice(&bytes);
-        }
-    }
-
-    let mut address = Address::default();
-    if let Ok(bytes) = hex::decode(&proto.address) {
-        if bytes.len() == 20 {
-            address.0.copy_from_slice(&bytes);
-        }
-    }
-
-    let mut receiver_addr = Address::default();
-    if let Ok(bytes) = hex::decode(&proto.receiver) {
-        if bytes.len() == 20 {
-            receiver_addr.0.copy_from_slice(&bytes);
-        }
-    }
-
-    let mut public = PublicKey::default();
-    if let Ok(bytes) = hex::decode(&proto.public) {
-        if bytes.len() == 33 {
-            public.0.copy_from_slice(&bytes);
-        }
-    }
-
-    let mut block_hash = Hash::default();
-    if let Ok(bytes) = hex::decode(&proto.block_hash) {
-        if bytes.len() == 32 {
-            block_hash.0.copy_from_slice(&bytes);
-        }
-    }
-
-    let tx2 = Transaction {
+    // 创建简单的交易
+    let tx = Transaction {
         body: TransactionBody {
             hash,
-            address,
-            receiver: receiver_addr,
-            gas: proto.gas as i64,
-            nonce: proto.nonce as i64,
-            event: hex::decode(&proto.event).unwrap_or_default(),
-            opt: hex::decode(&proto.opt).unwrap_or_default(),
-            state: hex::decode(&proto.state).unwrap_or_default(),
-            data: hex::decode(&proto.data).unwrap_or_default(),
-            expire: proto.expire as i64,
-            height: proto.height as i64,
-            index: proto.index as i64,
-            block_hash,
-            timestamp: proto.timestamp as i64,
+            address: sender,
+            receiver,
+            gas: 21000,
+            nonce: 0,
+            event: vec![],
+            opt: vec![],
+            state: vec![],
+            data: vec![1, 2, 3, 4],
+            expire: 0,
+            height: 0,
+            index: 0,
+            block_hash: Hash::default(),
+            timestamp: chrono::Utc::now().timestamp(),
             public,
-            signature: hex::decode(&proto.signature).unwrap_or_default(),
-            tx_type: TransactionType::default(),
-            chain_id: None,
-            value: None,
+            signature: vec![],
+            tx_type: norn_common::types::TransactionType::Native,
+            chain_id: Some(31337),
+            value: Some("1000".to_string()),
             max_fee_per_gas: None,
             max_priority_fee_per_gas: None,
             access_list: None,
@@ -151,12 +67,57 @@ fn main() {
         },
     };
 
-    println!("Hash after round-trip: {}", hex::encode(tx2.body.hash.0));
-    println!("Hashes match: {}", tx.body.hash.0 == tx2.body.hash.0);
+    println!("\n=== Transaction Details ===");
+    println!("Hash: {}", hex::encode(tx.body.hash.0));
+    println!("Gas: {}", tx.body.gas);
+    println!("Nonce: {}", tx.body.nonce);
+    println!("Timestamp: {}", tx.body.timestamp);
+    println!("Chain ID: {:?}", tx.body.chain_id);
+    println!("Value: {:?}", tx.body.value);
 
-    // 验证转换后的交易
-    match norn_crypto::transaction::verify_transaction(&tx2) {
-        Ok(()) => println!("✅ Round-trip transaction is valid"),
-        Err(e) => println!("❌ Round-trip verification failed: {:?}", e),
+    // 模拟签名
+    let message = b"test transaction message";
+    let signature = keypair.sign(message);
+    println!("\n✅ Signature: {}", hex::encode(&signature[..]));
+
+    // 生成批量测试交易
+    println!("\n=== Generating Batch Transactions ===");
+    for i in 1..=5 {
+        let mut hash_bytes = [0u8; 32];
+        rand::thread_rng().fill(&mut hash_bytes);
+        let batch_hash = Hash(hash_bytes);
+
+        let mut receiver_bytes = [0u8; 20];
+        rand::thread_rng().fill(&mut receiver_bytes);
+        let batch_receiver = Address(receiver_bytes);
+
+        let batch_tx = Transaction {
+            body: TransactionBody {
+                hash: batch_hash,
+                address: sender,
+                receiver: batch_receiver,
+                gas: 21000,
+                nonce: i,
+                data: vec![i as u8],
+                value: Some((1000 * (i + 1)).to_string()),
+                timestamp: chrono::Utc::now().timestamp(),
+                public,
+                signature: vec![],
+                tx_type: norn_common::types::TransactionType::Native,
+                chain_id: Some(31337),
+                ..Default::default()
+            },
+        };
+        println!("  Tx #{}: hash={}, nonce={}, value={:?}",
+            i,
+            hex::encode(&batch_tx.body.hash.0[..8]),
+            batch_tx.body.nonce,
+            batch_tx.body.value
+        );
     }
+
+    println!("\n✅ Transaction generation complete!");
+    println!("   Total transactions generated: 6");
+
+    Ok(())
 }

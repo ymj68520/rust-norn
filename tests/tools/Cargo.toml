@@ -3,13 +3,16 @@ name = "tx-generator"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "tx-generator"
-path = "src/main.rs"
+# 独立工作空间（不继承父workspace）
+[workspace]
 
 [dependencies]
-norn-crypto = { workspace = true }
-norn-common = { workspace = true }
-hex = { workspace = true }
+# 依赖父项目crate
+norn-crypto = { path = "../../crates/crypto" }
+norn-common = { path = "../../crates/common" }
+
+# 外部依赖
+hex = "0.4"
 chrono = "0.4"
-anyhow = { workspace = true }
+anyhow = "1.0"
+rand = "0.8"

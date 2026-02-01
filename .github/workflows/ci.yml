@@ -100,11 +100,17 @@ jobs:
       - name: Run tests for ${{ matrix.component }}
         run: cargo test --package ${{ matrix.component }} --verbose
 
-  # Job 3: Integration tests
+  # Job 3: Integration tests (使用新的测试结构)
   integration:
     name: Integration Tests
     runs-on: ubuntu-latest
     needs: test
+    strategy:
+      matrix:
+        test:
+          - unit-test
+          - integration-test
+          - scalability-test
     steps:
       - uses: actions/checkout@v4
 
@@ -133,36 +139,19 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run integration tests
-        run: cargo test --test integration_enhanced_features --verbose
+      - name: Build ${{ matrix.test }}
+        working-directory: ./tests
+        run: cargo build --bin ${{ matrix.test }} --verbose
 
-      - name: Run E2E tests
-        run: cargo test --test e2e_full_workflow_test --verbose
+      - name: Run ${{ matrix.test }}
+        working-directory: ./tests
+        run: cargo run --bin ${{ matrix.test }} --verbose
 
-  # Job 4: Security audit
-  security:
-    name: Security Audit
+  # Job 4: E2E tests
+  e2e:
+    name: E2E Tests
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-
-      - name: Run cargo audit
-        uses: actions-rs/audit-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  # Job 5: Build documentation
-  docs:
-    name: Build Documentation
-    runs-on: ubuntu-latest
-    needs: test
+    needs: integration
     steps:
       - uses: actions/checkout@v4
 
@@ -189,7 +178,68 @@ jobs:
         uses: actions/cache@v3
         with:
           path: target
-          key: ${{ runner.os }}-cargo-doc-build-target-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run E2E tests
+        working-directory: ./tests/e2e
+        run: cargo test --verbose
+
+      - name: Run modularity tests
+        working-directory: ./tests/unit
+        run: cargo test --test modularity_test --verbose
+
+  # Job 5: Security audit
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    needs: e2e
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Run cargo audit
+        uses: actions-rs/audit-check@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Job 6: Build documentation
+  docs:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    needs: e2e
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v3
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v3
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-target-doc-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build documentation
         run: cargo doc --workspace --no-deps --all-features
