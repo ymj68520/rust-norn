@@ -1,0 +1,25 @@
+{
+  "name": "norn-solidity-sdk",
+  "version": "1.0.0",
+  "description": "JavaScript SDK for deploying and interacting with Solidity smart contracts on the Norn blockchain",
+  "main": "src/index.js",
+  "scripts": {
+    "compile": "node src/compile.js",
+    "deploy": "node src/deploy.js",
+    "interact": "node src/interact.js",
+    "test": "node src/test.js"
+  },
+  "dependencies": {
+    "ethers": "^6.9.0",
+    "dotenv": "^16.3.1"
+  },
+  "keywords": [
+    "blockchain",
+    "solidity",
+    "smart-contracts",
+    "evm",
+    "norn",
+    "ethereum"
+  ],
+  "license": "MIT"
+}

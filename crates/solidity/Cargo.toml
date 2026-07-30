@@ -1,0 +1,39 @@
+[package]
+name = "norn-solidity"
+version = "0.1.0"
+edition = "2021"
+authors = ["Norn Team"]
+description = "Solidity compiler integration for norn blockchain - wraps solc compiler"
+license = "MIT"
+
+[dependencies]
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Process invocation for solc compiler
+which = "6.0"
+tempfile = { workspace = true }
+
+# Version checking
+semver = "1.0"
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Utilities
+hex = { workspace = true }
+regex = "1.10"
+lazy_static = { workspace = true }
+once_cell = { workspace = true }
+tiny-keccak = { version = "2.0", features = ["keccak"] }
+
+# Workspace dependencies
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

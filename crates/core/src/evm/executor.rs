@@ -1110,7 +1110,7 @@ impl EVMExecutor {
             self.log_manager.emit(event_log).await?;
 
             // Create receipt log entry
-            let receipt_log = crate::evm::ReceiptLog {
+            let r_log = crate::evm::ReceiptLog {
                 log_index: index as u64,
                 tx_hash,
                 block_hash,

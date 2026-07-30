@@ -18,6 +18,7 @@ mod blockhash;
 mod abi;
 mod benchmarks;
 mod real_contracts;
+mod solidity; // Solidity compiler integration and contract deployment
 
 pub use error::{EVMError, EVMResult};
 pub use runtime::NornDatabaseAdapter; // Fixed with SyncStateManager bridging layer
@@ -45,6 +46,11 @@ pub use abi::{
     HumanReadableABI,
 };
 pub use benchmarks::{BenchmarkSuite, BenchmarkResult};
+pub use solidity::{
+    SolidityCompiler, SolidityCompilerExt, SolcConfig, OptimizationSettings, EvmVersion,
+    CompiledContract, NornContractArtifact, CompileResult,
+    ContractDeployer, ContractBindings, CallResult,
+};
 #[cfg(feature = "real_contracts_test")]
 pub use real_contracts::ContractTester;
 
