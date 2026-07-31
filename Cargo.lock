@@ -3651,6 +3651,7 @@ dependencies = [
  "moka",
  "norn-common",
  "norn-crypto",
+ "norn-solidity",
  "norn-storage",
  "num-bigint",
  "num-traits",

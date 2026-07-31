@@ -5,7 +5,7 @@
 use crate::evm::{EVMConfig, EVMContext, EVMError, EVMResult, CodeStorage, LogManager, EventLog, Receipt, ReceiptDB, ReceiptLog};
 use crate::evm::runtime::NornDatabaseAdapter; // Fixed with SyncStateManager
 use crate::state::cache::SyncStateManager;
-use crate::state::{AccountStateManager, AccountState as AccountAccountState, AccountType};
+use crate::state::{AccountStateManager, AccountState as AccountAccountState, AccountType, AccountStateConfig};
 use norn_common::types::{Transaction, Address, Hash, TransactionType};
 use std::sync::Arc;
 use tracing::{debug, info, warn, trace, error};
@@ -105,6 +105,22 @@ impl EVMExecutor {
             log_manager,
             receipt_db,
             config,
+        }
+    }
+
+    /// Create a dummy EVM executor (for type binding without full initialization)
+    pub fn dummy() -> Self {
+        let code_storage = Arc::new(CodeStorage::new());
+        let log_manager = Arc::new(LogManager::new());
+        let receipt_db = Arc::new(ReceiptDB::new());
+        let state_manager = Arc::new(AccountStateManager::new(AccountStateConfig::default()));
+
+        Self {
+            state_manager,
+            code_storage,
+            log_manager,
+            receipt_db,
+            config: EVMConfig::default(),
         }
     }
 

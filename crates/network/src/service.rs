@@ -34,7 +34,7 @@ impl NetworkService {
         info!("Local peer id: {:?}", local_peer_id);
 
         let transport = build_transport(&keypair)?;
-        let behaviour = build_behaviour(&keypair, &local_peer_id);
+        let behaviour = build_behaviour(&keypair, &local_peer_id, &config);
 
         let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()

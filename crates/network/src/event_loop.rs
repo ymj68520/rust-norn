@@ -1,10 +1,10 @@
-use libp2p::{Swarm, gossipsub};
+use libp2p::{Swarm, gossipsub, kad, mdns};
 use libp2p::futures::StreamExt;
 use crate::behaviour::NornBehaviour;
 use crate::topics::Topics;
 use super::service::{NetworkCommand, NetworkEvent};
 use tokio::sync::mpsc;
-use tracing::{info, error};
+use tracing::{info, error, debug};
 
 pub struct EventLoop {
     swarm: Swarm<NornBehaviour>,
@@ -76,6 +76,32 @@ impl EventLoop {
                 } else if message.topic == self.topics.transaction.hash() {
                     let _ = self.event_tx.send(NetworkEvent::TransactionReceived(message.data)).await;
                 }
+            },
+            Some(libp2p::swarm::SwarmEvent::Behaviour(crate::behaviour::NornBehaviourEvent::Mdns(
+                mdns::Event::Discovered(list)
+            ))) => {
+                for (peer_id, addr) in list {
+                    debug!("mDNS discovered peer: {:?} at {:?}", peer_id, addr);
+                    // Also add to Kademlia routing table
+                    let _ = self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                }
+            },
+            Some(libp2p::swarm::SwarmEvent::Behaviour(crate::behaviour::NornBehaviourEvent::Mdns(
+                mdns::Event::Expired(list)
+            ))) => {
+                for (peer_id, _) in list {
+                    debug!("mDNS peer expired: {:?}", peer_id);
+                }
+            },
+            Some(libp2p::swarm::SwarmEvent::Behaviour(crate::behaviour::NornBehaviourEvent::Kademlia(
+                kad::Event::RoutingUpdated { peer, is_new_peer: true, .. }
+            ))) => {
+                debug!("Kademlia routing updated (new peer): {:?}", peer);
+            },
+            Some(libp2p::swarm::SwarmEvent::Behaviour(crate::behaviour::NornBehaviourEvent::Kademlia(
+                kad::Event::RoutablePeer { peer, address }
+            ))) => {
+                debug!("Kademlia routable peer: {:?} at {:?}", peer, address);
             },
             Some(libp2p::swarm::SwarmEvent::NewListenAddr { address, .. }) => {
                 info!("Listening on {:?}", address);

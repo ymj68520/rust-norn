@@ -17,7 +17,7 @@ use sha2::{Sha256, Digest};
 use crate::blockchain::Blockchain;
 use crate::txpool::TxPool;
 use crate::merkle::build_merkle_tree;
-use crate::consensus::povf::{PoVFConfig, PoVFEngine, ConsensusMessage, BlockProposal, ConsensusResult};
+use crate::consensus::povf::{PoVFConfig, PoVFEngine, ConsensusMessage, ConsensusResult};
 use crate::state::AccountStateManager;
 use crate::state::merkle::StateRootCalculator;
 use crate::evm::{EIP1559FeeCalculator, EIP1559Config};
@@ -322,14 +322,14 @@ impl BlockProducer {
                         info!("Successfully produced block at height {}", block.header.height);
                         
                         if let Some(engine) = &self.consensus_engine {
-                            // Propose to consensus engine
+                            // Propose to consensus engine (VDF → auto-finalize)
                             let proposal = ConsensusMessage::BlockProposal {
                                 proposer: block.header.public_key,
                                 block: block.clone(),
                                 vrf_output,
-                                round: block.header.height as u64, // Simplified round = height
+                                round: block.header.height as u64,
                             };
-                            
+
                             match engine.handle_message(proposal).await {
                                 Ok(result) => {
                                     if result.is_finalized {
@@ -337,8 +337,6 @@ impl BlockProducer {
                                         if let Err(e) = self.blockchain.commit_block(&result.block).await {
                                             error!("Failed to save finalized block: {}", e);
                                         }
-                                    } else {
-                                        info!("Block proposed but not yet finalized (waiting for votes)");
                                     }
                                 }
                                 Err(e) => {
