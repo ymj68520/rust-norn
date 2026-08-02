@@ -1,11 +1,19 @@
 //! Tendermint BFT Consensus Types & Integer Election Math
 //! 
-//! Pure integer math (no f32/f64/ln) for stake qualification and Tendermint state steps.
+//! Pure integer math (no f32/f64/ln) for stake qualification, proposer selection, and Tendermint state steps.
 
 use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use norn_common::consensus_types::StakeSnapshot;
 use norn_common::types::{ChainId, Hash, ProtocolVersion, ValidatorId};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use anyhow::Result;
+
+pub trait ProposalSigner: Send + Sync {
+    fn validator_id(&self) -> ValidatorId;
+    fn sign_proposal(&self, sign_bytes: &[u8]) -> Result<[u8; 64]>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum ConsensusStep {
@@ -80,7 +88,7 @@ impl ElectionMath {
         left < right
     }
 
-    /// Select deterministic proposer for a given (height, round) via weighted round-robin on StakeSnapshot
+    /// Select deterministic proposer for a given (height, round) via cryptographic seed hashing over StakeSnapshot
     pub fn select_deterministic_proposer(
         snapshot: &StakeSnapshot,
         height: u64,
@@ -90,16 +98,23 @@ impl ElectionMath {
             return None;
         }
 
-        let total_weight = snapshot.total_voting_power();
-        if total_weight == 0 {
-            return None;
-        }
+        let total_weight = match snapshot.total_voting_power() {
+            Ok(w) if w > 0 => w,
+            _ => return None,
+        };
 
-        // Mix height and round to ensure round 0 at different heights rotates proposer
-        let seed = (height as u128).wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(round as u128);
-        let target_weight = seed % total_weight;
+        let mut hasher = Sha256::new();
+        hasher.update(b"NORN_PROPOSER_V2");
+        hasher.update(&snapshot.epoch.to_be_bytes());
+        hasher.update(&height.to_be_bytes());
+        hasher.update(&round.to_be_bytes());
+        hasher.update(&snapshot.snapshot_hash.0);
+        let digest = hasher.finalize();
+
+        let seed = BigUint::from_bytes_be(&digest);
+        let target_weight = (&seed % BigUint::from(total_weight)).to_u128().unwrap_or(0);
+
         let mut accumulated: u128 = 0;
-
         for (validator_id, record) in &snapshot.validators {
             accumulated += record.voting_power as u128;
             if target_weight < accumulated {

@@ -1,12 +1,14 @@
 //! Consensus Safety Store & Anti-Equivocation Persistent Integration
 //! 
 //! Ensures that before broadcasting any Prevote or Precommit vote, the vote
-//! is atomically checked for double-signing conflicts and written to disk
-//! with `sync_all()` to ensure crash-safe anti-equivocation.
+//! is atomically checked for double-signing conflicts, committed to disk
+//! with `sync_all()` and `flush()`, and signed fail-closed.
 
 use anyhow::Result;
 use norn_common::consensus_types::{SignedVote, VoteStep};
-use norn_common::types::{BlockId, ChainId, ProtocolVersion, ValidatorId};
+use norn_common::types::{BlockId, ChainId, ProtocolVersion, StakeSnapshotHash, ValidatorId};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -29,6 +31,9 @@ pub enum SafetyError {
     #[error("Storage I/O failure during safety sync: {0}")]
     StorageIoError(String),
 
+    #[error("Serialization failure during safety WAL write: {0}")]
+    SerializationError(String),
+
     #[error("Signing failure: {0}")]
     SigningError(String),
 }
@@ -42,7 +47,22 @@ pub struct VoteSignRequest {
     pub round: u32,
     pub step: VoteStep,
     pub block_id: Option<BlockId>,
+    pub stake_snapshot_hash: StakeSnapshotHash,
     pub validator_id: ValidatorId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SafetyRecord {
+    pub protocol_version: ProtocolVersion,
+    pub chain_id: ChainId,
+    pub epoch: u64,
+    pub height: u64,
+    pub round: u32,
+    pub step: VoteStep,
+    pub stake_snapshot_hash: StakeSnapshotHash,
+    pub validator_id: ValidatorId,
+    pub block_id: Option<BlockId>,
+    pub sign_bytes_hash: [u8; 32],
 }
 
 pub trait ConsensusSigner: Send + Sync {
@@ -57,9 +77,11 @@ pub trait ConsensusSafetyStore: Send + Sync {
     ) -> Result<SignedVote, SafetyError>;
 }
 
+type SafetyIndexKey = (ChainId, ValidatorId, u64, u64, u32, VoteStep);
+
 /// In-memory ConsensusSafetyStore
 pub struct MemorySafetyStore {
-    state: Mutex<HashMap<(u64, u32, VoteStep), Option<BlockId>>>,
+    state: Mutex<HashMap<SafetyIndexKey, (Option<BlockId>, [u8; 32])>>,
 }
 
 impl MemorySafetyStore {
@@ -87,10 +109,35 @@ impl ConsensusSafetyStore for MemorySafetyStore {
             .lock()
             .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
 
-        let key = (request.height, request.round, request.step);
+        let key: SafetyIndexKey = (
+            request.chain_id.clone(),
+            request.validator_id,
+            request.epoch,
+            request.height,
+            request.round,
+            request.step,
+        );
 
-        if let Some(existing_block_id) = guard.get(&key) {
-            if *existing_block_id != request.block_id {
+        let unsigned_vote = SignedVote {
+            protocol_version: request.protocol_version.clone(),
+            chain_id: request.chain_id.clone(),
+            epoch: request.epoch,
+            height: request.height,
+            round: request.round,
+            step: request.step,
+            block_id: request.block_id.clone(),
+            stake_snapshot_hash: request.stake_snapshot_hash.clone(),
+            validator: request.validator_id,
+            signature: [0u8; 64],
+        };
+
+        let sign_bytes = unsigned_vote.canonical_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(&sign_bytes);
+        let sign_bytes_hash: [u8; 32] = hasher.finalize().into();
+
+        if let Some((existing_block_id, existing_hash)) = guard.get(&key) {
+            if *existing_hash != sign_bytes_hash {
                 warn!(
                     "EQUIVOCATION ATTEMPT REJECTED: height={}, round={}, step={:?}, attempted={:?}, existing={:?}",
                     request.height, request.round, request.step, request.block_id, existing_block_id
@@ -105,23 +152,10 @@ impl ConsensusSafetyStore for MemorySafetyStore {
             }
         }
 
-        guard.insert(key, request.block_id);
+        guard.insert(key, (request.block_id.clone(), sign_bytes_hash));
 
-        let unsigned_vote = SignedVote {
-            protocol_version: request.protocol_version,
-            chain_id: request.chain_id,
-            epoch: request.epoch,
-            height: request.height,
-            round: request.round,
-            step: request.step,
-            block_id: request.block_id,
-            validator: request.validator_id,
-            signature: [0u8; 64],
-        };
-
-        let bytes = unsigned_vote.canonical_bytes();
         let signature = signer
-            .sign_canonical_bytes(&bytes)
+            .sign_canonical_bytes(&sign_bytes)
             .map_err(|e| SafetyError::SigningError(e.to_string()))?;
 
         Ok(SignedVote {
@@ -133,8 +167,9 @@ impl ConsensusSafetyStore for MemorySafetyStore {
 
 /// Disk-backed Persistent ConsensusSafetyStore with mandatory `sync_all()` for crash resilience
 pub struct PersistentSafetyStore {
+    #[allow(dead_code)]
     file_path: PathBuf,
-    state: Mutex<(HashMap<(u64, u32, VoteStep), Option<BlockId>>, BufWriter<File>)>,
+    state: Mutex<(HashMap<SafetyIndexKey, (Option<BlockId>, [u8; 32])>, BufWriter<File>)>,
 }
 
 impl PersistentSafetyStore {
@@ -152,17 +187,23 @@ impl PersistentSafetyStore {
             let mut len_bytes = [0u8; 4];
             while reader.read_exact(&mut len_bytes).is_ok() {
                 let len = u32::from_le_bytes(len_bytes) as usize;
+                if len > 1024 * 1024 {
+                    return Err(anyhow::anyhow!("Safety WAL record exceeds max length threshold"));
+                }
                 let mut buf = vec![0u8; len];
                 reader.read_exact(&mut buf)?;
-                if let Ok((height, round, step_byte, block_id_opt)) =
-                    bincode::deserialize::<(u64, u32, u8, Option<[u8; 32]>) >(&buf)
-                {
-                    let step = match step_byte {
-                        1 => VoteStep::Prevote,
-                        _ => VoteStep::Precommit,
-                    };
-                    let bid = block_id_opt.map(|arr| BlockId(norn_common::types::Hash(arr)));
-                    map.insert((height, round, step), bid);
+                if let Ok(rec) = bincode::deserialize::<SafetyRecord>(&buf) {
+                    let key: SafetyIndexKey = (
+                        rec.chain_id,
+                        rec.validator_id,
+                        rec.epoch,
+                        rec.height,
+                        rec.round,
+                        rec.step,
+                    );
+                    map.insert(key, (rec.block_id, rec.sign_bytes_hash));
+                } else {
+                    return Err(anyhow::anyhow!("Corrupted Safety WAL record encountered"));
                 }
             }
             info!("Recovered {} consensus safety lock records from {:?}", map.len(), file_path);
@@ -193,10 +234,35 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
             .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
 
         let (ref mut map, ref mut writer) = *guard;
-        let key = (request.height, request.round, request.step);
+        let key: SafetyIndexKey = (
+            request.chain_id.clone(),
+            request.validator_id,
+            request.epoch,
+            request.height,
+            request.round,
+            request.step,
+        );
 
-        if let Some(existing_block_id) = map.get(&key) {
-            if *existing_block_id != request.block_id {
+        let unsigned_vote = SignedVote {
+            protocol_version: request.protocol_version.clone(),
+            chain_id: request.chain_id.clone(),
+            epoch: request.epoch,
+            height: request.height,
+            round: request.round,
+            step: request.step,
+            block_id: request.block_id.clone(),
+            stake_snapshot_hash: request.stake_snapshot_hash.clone(),
+            validator: request.validator_id,
+            signature: [0u8; 64],
+        };
+
+        let sign_bytes = unsigned_vote.canonical_bytes();
+        let mut hasher = Sha256::new();
+        hasher.update(&sign_bytes);
+        let sign_bytes_hash: [u8; 32] = hasher.finalize().into();
+
+        if let Some((existing_block_id, existing_hash)) = map.get(&key) {
+            if *existing_hash != sign_bytes_hash {
                 warn!(
                     "PERSISTENT EQUIVOCATION ATTEMPT REJECTED: height={}, round={}, step={:?}, attempted={:?}, existing={:?}",
                     request.height, request.round, request.step, request.block_id, existing_block_id
@@ -211,48 +277,41 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
             }
         }
 
-        // Persist to disk before signing and flush + sync_all
-        let step_byte = match request.step {
-            VoteStep::Prevote => 1u8,
-            VoteStep::Precommit => 2u8,
-        };
-        let block_id_bytes = request.block_id.map(|b| b.0.0);
-        let record = (request.height, request.round, step_byte, block_id_bytes);
-
-        if let Ok(encoded) = bincode::serialize(&record) {
-            let len = encoded.len() as u32;
-            writer
-                .write_all(&len.to_le_bytes())
-                .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
-            writer
-                .write_all(&encoded)
-                .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
-            writer
-                .flush()
-                .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
-            writer
-                .get_ref()
-                .sync_all()
-                .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
-        }
-
-        map.insert(key, request.block_id);
-
-        let unsigned_vote = SignedVote {
-            protocol_version: request.protocol_version,
-            chain_id: request.chain_id,
+        let record = SafetyRecord {
+            protocol_version: request.protocol_version.clone(),
+            chain_id: request.chain_id.clone(),
             epoch: request.epoch,
             height: request.height,
             round: request.round,
             step: request.step,
-            block_id: request.block_id,
-            validator: request.validator_id,
-            signature: [0u8; 64],
+            stake_snapshot_hash: request.stake_snapshot_hash.clone(),
+            validator_id: request.validator_id,
+            block_id: request.block_id.clone(),
+            sign_bytes_hash,
         };
 
-        let bytes = unsigned_vote.canonical_bytes();
+        let encoded = bincode::serialize(&record)
+            .map_err(|e| SafetyError::SerializationError(e.to_string()))?;
+
+        let len = encoded.len() as u32;
+        writer
+            .write_all(&len.to_le_bytes())
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
+        writer
+            .write_all(&encoded)
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
+        writer
+            .flush()
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
+
+        map.insert(key, (request.block_id.clone(), sign_bytes_hash));
+
         let signature = signer
-            .sign_canonical_bytes(&bytes)
+            .sign_canonical_bytes(&sign_bytes)
             .map_err(|e| SafetyError::SigningError(e.to_string()))?;
 
         Ok(SignedVote {
@@ -290,6 +349,7 @@ mod tests {
             round: 0,
             step: VoteStep::Prevote,
             block_id: Some(BlockId(norn_common::types::Hash([1u8; 32]))),
+            stake_snapshot_hash: StakeSnapshotHash([1u8; 32]),
             validator_id: ValidatorId([0u8; 32]),
         };
 
@@ -308,6 +368,7 @@ mod tests {
             round: 0,
             step: VoteStep::Prevote,
             block_id: Some(BlockId(norn_common::types::Hash([2u8; 32]))),
+            stake_snapshot_hash: StakeSnapshotHash([1u8; 32]),
             validator_id: ValidatorId([0u8; 32]),
         };
 

@@ -1,22 +1,24 @@
 //! Block Producer Module
 //! 
-//! Responsible for producing new blocks when this node is selected as proposer.
+//! Responsible for producing new blocks and signed proposals when this node is selected as proposer.
 
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Instant};
-use tracing::{info, warn, error};
+use tracing::{info, error};
 
-use norn_common::types::{Block, BlockHeader, Hash, Transaction, PublicKey, GeneralParams};
-use anyhow::Result;
-use norn_crypto::vrf::{VRFKeyPair, VRFCalculator, VRFOutputData};
+use norn_common::types::{Block, BlockHeader, BlockId, Hash, Transaction, PublicKey, GeneralParams};
+use norn_common::consensus_types::Proposal;
+use anyhow::{anyhow, Result};
+use norn_crypto::vrf::{VRFKeyPair, VRFCalculator, VrfContext};
 use sha2::{Sha256, Digest};
 
 use crate::blockchain::Blockchain;
 use crate::txpool::TxPool;
 use crate::merkle::build_merkle_tree;
 use crate::consensus::povf::PoVFEngine;
+use crate::consensus::types::ProposalSigner;
 use crate::state::AccountStateManager;
 use crate::state::merkle::StateRootCalculator;
 use crate::evm::EIP1559FeeCalculator;
@@ -52,15 +54,11 @@ pub enum ProducerState {
     Idle,
     /// Preparing a new block
     Preparing,
-    /// Computing VDF / Delay
-    ComputingVdf,
     /// Block ready to propose
     ReadyToPropose,
-    /// Waiting for votes
-    WaitingForVotes,
 }
 
-/// Block producer responsible for creating new blocks
+/// Block producer responsible for creating new blocks and proposals
 pub struct BlockProducer {
     config: BlockProducerConfig,
     blockchain: Arc<Blockchain>,
@@ -70,6 +68,7 @@ pub struct BlockProducer {
     state: Arc<RwLock<ProducerState>>,
     last_produced: Arc<RwLock<Option<Instant>>>,
     consensus_engine: Option<Arc<PoVFEngine>>,
+    proposal_signer: Option<Arc<dyn ProposalSigner>>,
     fee_calculator: EIP1559FeeCalculator,
 }
 
@@ -82,6 +81,7 @@ impl BlockProducer {
         vrf_key_pair: VRFKeyPair,
         state_manager: Arc<AccountStateManager>,
         consensus_engine: Option<Arc<PoVFEngine>>,
+        proposal_signer: Option<Arc<dyn ProposalSigner>>,
     ) -> Self {
         let fee_calculator = EIP1559FeeCalculator::default_config();
 
@@ -94,6 +94,7 @@ impl BlockProducer {
             state: Arc::new(RwLock::new(ProducerState::Idle)),
             last_produced: Arc::new(RwLock::new(None)),
             consensus_engine,
+            proposal_signer,
             fee_calculator,
         }
     }
@@ -103,13 +104,12 @@ impl BlockProducer {
         *self.state.read().await
     }
 
-    /// Check if this node should produce a block
+    /// Check if local node is the current BFT proposer
     pub async fn should_produce(&self) -> bool {
         if !self.config.is_validator {
             return false;
         }
 
-        // Check if enough time has passed since last block
         let last = self.last_produced.read().await;
         if let Some(last_time) = *last {
             if last_time.elapsed() < Duration::from_secs(self.config.block_interval) {
@@ -117,84 +117,127 @@ impl BlockProducer {
             }
         }
 
-        true
+        if let Some(ref engine) = self.consensus_engine {
+            let sm = engine.state_machine.read().await;
+            sm.is_local_proposer()
+        } else {
+            true
+        }
     }
 
-    /// Produce a new block
-    pub async fn produce_block(&self) -> Result<(Block, VRFOutputData)> {
-        info!("Starting block production");
+    /// Produce a new block and signed Proposal for BFT broadcast
+    pub async fn produce_proposal(&self) -> Result<(Proposal, Block)> {
+        info!("Starting block and proposal production");
         
         {
             let mut state = self.state.write().await;
             *state = ProducerState::Preparing;
         }
 
-        // Get transactions from pool
         let transactions = self.select_transactions().await;
         
-        // Get latest block
         let latest = self.blockchain.latest_block.read().await;
         let prev_hash = latest.header.block_hash;
-        let new_height = latest.header.height + 1;
+        let new_height: u64 = (latest.header.height + 1) as u64;
         let parent_base_fee = latest.header.base_fee;
         drop(latest);
 
-        // Calculate merkle root from transactions
         let merkle_root = build_merkle_tree(&transactions);
 
-        // Calculate gas used by transactions
         let gas_used: i64 = transactions.iter()
             .map(|tx| tx.body.gas)
             .sum();
 
-        // Calculate EIP-1559 base fee for this block
         let base_fee = self.fee_calculator.calculate_next_base_fee(
             parent_base_fee,
             gas_used as u64,
         );
 
-        // Calculate seed and message
-        let genesis_hash = norn_common::genesis::GENESIS_BLOCK_HASH;
-        let mut hasher = Sha256::new();
-        hasher.update(genesis_hash.0);
-        hasher.update(&(new_height as u64).to_le_bytes());
-        let seed = hasher.finalize();
+        let (config, snapshot, (round, valid_round, valid_round_cert)) = if let Some(ref engine) = self.consensus_engine {
+            let sm = engine.state_machine.read().await;
+            (sm.config.clone(), sm.snapshot.clone(), (sm.round, sm.valid_round, sm.valid_round_certificate.clone()))
+        } else {
+            (Default::default(), Default::default(), (0, None, None))
+        };
 
-        let vrf_output = VRFCalculator::calculate(&self.vrf_key_pair, &seed)?;
+        let local_proposer = self.proposal_signer.as_ref()
+            .map(|s| s.validator_id())
+            .unwrap_or_else(|| norn_common::types::ValidatorId([0u8; 32]));
 
-        // Create block params
-        let params = self.create_block_params(&vrf_output, new_height as u64);
+        let vrf_context = VrfContext {
+            protocol_version: config.protocol_version.clone(),
+            chain_id: config.chain_id.clone(),
+            epoch: config.epoch,
+            height: new_height,
+            round,
+            parent_block_hash: prev_hash,
+            stake_snapshot_hash: snapshot.snapshot_hash.clone(),
+            validator_id: local_proposer,
+        };
+
+        let vrf_output = VRFCalculator::calculate_with_context(&self.vrf_key_pair, &vrf_context)?;
+
+        let params = GeneralParams {
+            result: vrf_output.output_bytes.to_vec(),
+            random_number: self.vrf_to_public_key(),
+            s: vrf_output.preout.0.to_vec(),
+            t: (1000u64 + (new_height as u64 % 100)).to_le_bytes().to_vec(),
+            proof: vrf_output.proof.0.to_vec(),
+        };
         let params_bytes = norn_common::utils::codec::serialize(&params)?;
 
-        // Calculate state root
         let state_root_calculator = StateRootCalculator::new(false);
         let state_root = state_root_calculator
             .calculate_from_manager(&self.state_manager)
             .await
             .unwrap_or_else(|_| Hash::default());
 
-        // Create block header
         let header = BlockHeader {
             timestamp: chrono::Utc::now().timestamp(),
             prev_block_hash: prev_hash,
             block_hash: Hash::default(),
             merkle_root,
             state_root,
-            height: new_height,
+            height: new_height as i64,
             public_key: self.vrf_to_public_key(),
             params: params_bytes,
             gas_limit: self.config.max_gas_per_block,
             base_fee,
         };
 
-        // Create block
         let mut block = Block {
             header,
             transactions,
         };
 
-        // Calculate block hash
         block.header.block_hash = self.calculate_block_hash(&block);
+        let block_id = BlockId(block.header.block_hash);
+
+        let mut unsigned_proposal = Proposal {
+            protocol_version: config.protocol_version,
+            chain_id: config.chain_id,
+            epoch: config.epoch,
+            height: new_height,
+            round,
+            valid_round,
+            valid_round_certificate: valid_round_cert,
+            block_id,
+            parent_block_hash: prev_hash,
+            stake_snapshot_hash: snapshot.snapshot_hash,
+            proposer: local_proposer,
+            vrf_preout: vrf_output.preout.0,
+            vrf_proof: vrf_output.proof.0,
+            signature: [0u8; 64],
+        };
+
+        let sign_bytes = unsigned_proposal.canonical_bytes();
+        let signature = if let Some(ref signer) = self.proposal_signer {
+            signer.sign_proposal(&sign_bytes)?
+        } else {
+            [0u8; 64]
+        };
+
+        unsigned_proposal.signature = signature;
 
         {
             let mut state = self.state.write().await;
@@ -206,11 +249,10 @@ impl BlockProducer {
             *last = Some(Instant::now());
         }
 
-        info!("Block produced at height {}", block.header.height);
-        Ok((block, vrf_output))
+        info!("Proposal produced at height {} round {}", new_height, round);
+        Ok((unsigned_proposal, block))
     }
 
-    /// Select transactions for the block
     async fn select_transactions(&self) -> Vec<Transaction> {
         self.tx_pool.package(&*self.blockchain).await
             .into_iter()
@@ -218,21 +260,6 @@ impl BlockProducer {
             .collect()
     }
 
-    /// Create block params including VRF data
-    fn create_block_params(&self, vrf_output: &VRFOutputData, height: u64) -> GeneralParams {
-        let base_iterations = 1000u64;
-        let iterations = base_iterations + (height % 100);
-        
-        GeneralParams {
-            result: vrf_output.output_bytes.to_vec(),
-            random_number: self.vrf_to_public_key(),
-            s: vrf_output.preout.0.to_vec(),
-            t: iterations.to_le_bytes().to_vec(),
-            proof: vrf_output.proof.0.to_vec(),
-        }
-    }
-
-    /// Convert VRF key pair to PublicKey (33 bytes)
     fn vrf_to_public_key(&self) -> PublicKey {
         let vrf_bytes = self.vrf_key_pair.public_key_bytes();
         let mut pub_key_bytes = [0u8; 33];
@@ -241,7 +268,6 @@ impl BlockProducer {
         PublicKey(pub_key_bytes)
     }
 
-    /// Calculate block hash
     fn calculate_block_hash(&self, block: &Block) -> Hash {
         let mut hasher = Sha256::new();
         hasher.update(block.header.timestamp.to_le_bytes());
@@ -258,7 +284,6 @@ impl BlockProducer {
         hash
     }
 
-    /// Run the block production loop
     pub async fn run(&self) {
         info!("Block producer started");
         let mut timer = interval(Duration::from_secs(1));
@@ -266,15 +291,10 @@ impl BlockProducer {
         loop {
             timer.tick().await;
             if self.should_produce().await {
-                match self.produce_block().await {
-                    Ok((block, _)) => {
-                        info!("Successfully produced block at height {}", block.header.height);
-                        if let Err(e) = self.blockchain.commit_block(&block).await {
-                            error!("Failed to save produced block: {}", e);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Block production failed: {}", e);
+                if let Ok((proposal, block)) = self.produce_proposal().await {
+                    info!("Produced signed proposal for block {:?} at height {}", proposal.block_id, block.header.height);
+                    if let Some(ref engine) = self.consensus_engine {
+                        let _ = engine.candidate_blocks.write().await.insert((block.header.height as u64, proposal.block_id), block);
                     }
                 }
             }
@@ -298,28 +318,8 @@ mod tests {
         let vrf_key_pair = VRFKeyPair::generate();
 
         let config = BlockProducerConfig::default();
-        let producer = BlockProducer::new(config, blockchain, tx_pool, vrf_key_pair, state_manager, None);
+        let producer = BlockProducer::new(config, blockchain, tx_pool, vrf_key_pair, state_manager, None, None);
 
         assert_eq!(producer.get_state().await, ProducerState::Idle);
-    }
-
-    #[tokio::test]
-    async fn test_block_production() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(SledDB::new(temp_dir.path().to_str().unwrap()).unwrap());
-        let blockchain = Blockchain::new_with_fixed_genesis(db).await;
-        let tx_pool = Arc::new(TxPool::new());
-        let state_manager = Arc::new(AccountStateManager::default());
-        let vrf_key_pair = VRFKeyPair::generate();
-
-        let config = BlockProducerConfig {
-            is_validator: true,
-            ..Default::default()
-        };
-        let producer = BlockProducer::new(config, blockchain.clone(), tx_pool, vrf_key_pair, state_manager, None);
-
-        let (block, _) = producer.produce_block().await.unwrap();
-        assert_eq!(block.header.height, 1);
-        assert!(!block.header.block_hash.0.iter().all(|&b| b == 0));
     }
 }

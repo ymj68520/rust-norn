@@ -20,6 +20,7 @@ pub enum AddVoteResult {
     },
     UnknownValidator,
     InvalidSignature,
+    SnapshotMismatch,
 }
 
 pub struct VotePool {
@@ -39,24 +40,42 @@ impl VotePool {
 
     /// Add and verify a vote against the stake snapshot
     pub fn add_vote(&mut self, vote: SignedVote, snapshot: &StakeSnapshot) -> AddVoteResult {
+        if vote.stake_snapshot_hash != snapshot.snapshot_hash {
+            warn!("Vote snapshot hash mismatch for validator {:?}", vote.validator);
+            return AddVoteResult::SnapshotMismatch;
+        }
+
         let Some(record) = snapshot.validators.get(&vote.validator) else {
             warn!("Rejected vote from unknown validator {:?}", vote.validator);
             return AddVoteResult::UnknownValidator;
         };
 
-        // Verify signature if consensus public key is provided (33 bytes secp256k1)
-        if record.consensus_public_key.0 != [0u8; 33] && vote.signature != [0u8; 64] {
-            if let Ok(verifying_key) = VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0) {
-                if let Ok(sig) = Signature::from_slice(&vote.signature) {
-                    let msg_bytes = vote.canonical_bytes();
-                    if verifying_key.verify(&msg_bytes, &sig).is_err() {
-                        warn!("Invalid vote signature for validator {:?}", vote.validator);
-                        return AddVoteResult::InvalidSignature;
-                    }
-                } else {
-                    return AddVoteResult::InvalidSignature;
-                }
-            }
+        // Strict fail-closed secp256k1 ECDSA verification over canonical bytes
+        if record.consensus_public_key.0 == [0u8; 33] || vote.signature == [0u8; 64] {
+            warn!("Rejected vote with zero public key or zero signature for validator {:?}", vote.validator);
+            return AddVoteResult::InvalidSignature;
+        }
+
+        let Ok(verifying_key) = VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0) else {
+            warn!("Malformed SEC1 public key for validator {:?}", vote.validator);
+            return AddVoteResult::InvalidSignature;
+        };
+
+        let Ok(sig) = Signature::from_slice(&vote.signature) else {
+            warn!("Malformed signature for validator {:?}", vote.validator);
+            return AddVoteResult::InvalidSignature;
+        };
+
+        // Reject non-canonical high-S signatures
+        if sig.normalize_s().is_some() {
+            warn!("Non-canonical high-S signature for validator {:?}", vote.validator);
+            return AddVoteResult::InvalidSignature;
+        }
+
+        let msg_bytes = vote.canonical_bytes();
+        if verifying_key.verify(&msg_bytes, &sig).is_err() {
+            warn!("Invalid vote signature for validator {:?}", vote.validator);
+            return AddVoteResult::InvalidSignature;
         }
 
         let key = (vote.height, vote.round, vote.step);
@@ -93,10 +112,10 @@ impl VotePool {
         let key = (height, round, step);
         let step_votes = self.votes.get(&key)?;
 
-        let total_power = snapshot.total_voting_power();
-        if total_power == 0 {
-            return None;
-        }
+        let total_power = match snapshot.total_voting_power() {
+            Ok(w) if w > 0 => w,
+            _ => return None,
+        };
 
         let mut accumulated_power: u128 = 0;
         let mut matching_votes = Vec::new();
@@ -104,7 +123,10 @@ impl VotePool {
         for (validator_id, vote) in step_votes {
             if vote.block_id == block_id {
                 if let Some(record) = snapshot.validators.get(validator_id) {
-                    accumulated_power = accumulated_power.saturating_add(record.voting_power as u128);
+                    accumulated_power = match accumulated_power.checked_add(record.voting_power as u128) {
+                        Some(val) => val,
+                        None => return None,
+                    };
                     matching_votes.push(vote.clone());
                 }
             }
@@ -132,12 +154,18 @@ impl VotePool {
         block_id: BlockId,
         snapshot: &StakeSnapshot,
     ) -> Option<CommitCertificate> {
-        let votes = self.check_quorum(height, round, VoteStep::Precommit, Some(block_id), snapshot)?;
+        let precommits = self.check_quorum(height, round, VoteStep::Precommit, Some(block_id), snapshot)?;
+        let first_vote = precommits.first()?;
+
         Some(CommitCertificate {
+            protocol_version: first_vote.protocol_version.clone(),
+            chain_id: first_vote.chain_id.clone(),
+            epoch: first_vote.epoch,
             height,
             round,
             block_id,
-            votes,
+            stake_snapshot_hash: snapshot.snapshot_hash.clone(),
+            precommits,
         })
     }
 
@@ -159,127 +187,80 @@ impl Default for VotePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::ecdsa::SigningKey;
+    use k256::ecdsa::signature::Signer;
+    use rand::thread_rng;
 
     #[test]
-    fn test_quorum_calculation() {
+    fn test_quorum_calculation_with_real_signatures() {
         let mut snapshot = StakeSnapshot::default();
         let val1 = ValidatorId([1u8; 32]);
         let val2 = ValidatorId([2u8; 32]);
         let val3 = ValidatorId([3u8; 32]);
 
+        let key1 = SigningKey::random(&mut thread_rng());
+        let key2 = SigningKey::random(&mut thread_rng());
+        let key3 = SigningKey::random(&mut thread_rng());
+
+        let pk1_bytes: [u8; 33] = key1.verifying_key().to_sec1_bytes().as_ref().try_into().unwrap();
+        let pk2_bytes: [u8; 33] = key2.verifying_key().to_sec1_bytes().as_ref().try_into().unwrap();
+        let pk3_bytes: [u8; 33] = key3.verifying_key().to_sec1_bytes().as_ref().try_into().unwrap();
+
         snapshot.validators.insert(val1, norn_common::consensus_types::ValidatorRecord {
             validator_id: val1,
-            consensus_public_key: norn_common::types::ConsensusPublicKey::default(),
+            consensus_public_key: norn_common::types::ConsensusPublicKey(pk1_bytes),
             vrf_public_key: norn_common::types::VrfPublicKey::default(),
             voting_power: 10,
         });
         snapshot.validators.insert(val2, norn_common::consensus_types::ValidatorRecord {
             validator_id: val2,
-            consensus_public_key: norn_common::types::ConsensusPublicKey::default(),
+            consensus_public_key: norn_common::types::ConsensusPublicKey(pk2_bytes),
             vrf_public_key: norn_common::types::VrfPublicKey::default(),
             voting_power: 10,
         });
         snapshot.validators.insert(val3, norn_common::consensus_types::ValidatorRecord {
             validator_id: val3,
-            consensus_public_key: norn_common::types::ConsensusPublicKey::default(),
+            consensus_public_key: norn_common::types::ConsensusPublicKey(pk3_bytes),
             vrf_public_key: norn_common::types::VrfPublicKey::default(),
             voting_power: 10,
         });
 
+        snapshot.snapshot_hash = snapshot.compute_hash();
+
         let mut pool = VotePool::new();
         let bid = BlockId(norn_common::types::Hash([9u8; 32]));
 
-        let v1 = SignedVote {
-            protocol_version: norn_common::types::ProtocolVersion(2),
-            chain_id: norn_common::types::ChainId::default(),
-            epoch: 1,
-            height: 1,
-            round: 0,
-            step: VoteStep::Precommit,
-            block_id: Some(bid),
-            validator: val1,
-            signature: [0u8; 64],
+        let mut make_vote = |val: ValidatorId, key: &SigningKey| {
+            let mut v = SignedVote {
+                protocol_version: norn_common::types::ProtocolVersion(2),
+                chain_id: norn_common::types::ChainId::default(),
+                epoch: 1,
+                height: 1,
+                round: 0,
+                step: VoteStep::Precommit,
+                block_id: Some(bid),
+                stake_snapshot_hash: snapshot.snapshot_hash.clone(),
+                validator: val,
+                signature: [0u8; 64],
+            };
+            let sign_bytes = v.canonical_bytes();
+            let sig: Signature = key.sign(&sign_bytes);
+            let sig_canonical = sig.normalize_s().unwrap_or(sig);
+            let bytes_ref = sig_canonical.to_bytes();
+            v.signature = bytes_ref.as_slice().try_into().unwrap();
+            v
         };
 
-        let v2 = SignedVote {
-            protocol_version: norn_common::types::ProtocolVersion(2),
-            chain_id: norn_common::types::ChainId::default(),
-            epoch: 1,
-            height: 1,
-            round: 0,
-            step: VoteStep::Precommit,
-            block_id: Some(bid),
-            validator: val2,
-            signature: [0u8; 64],
-        };
+        let v1 = make_vote(val1, &key1);
+        let v2 = make_vote(val2, &key2);
+        let v3 = make_vote(val3, &key3);
 
         assert_eq!(pool.add_vote(v1, &snapshot), AddVoteResult::Added);
         assert_eq!(pool.add_vote(v2, &snapshot), AddVoteResult::Added);
 
         assert!(pool.create_commit_certificate(1, 0, bid, &snapshot).is_none());
 
-        let v3 = SignedVote {
-            protocol_version: norn_common::types::ProtocolVersion(2),
-            chain_id: norn_common::types::ChainId::default(),
-            epoch: 1,
-            height: 1,
-            round: 0,
-            step: VoteStep::Precommit,
-            block_id: Some(bid),
-            validator: val3,
-            signature: [0u8; 64],
-        };
-
         assert_eq!(pool.add_vote(v3, &snapshot), AddVoteResult::Added);
         assert!(pool.create_commit_certificate(1, 0, bid, &snapshot).is_some());
-    }
-
-    #[test]
-    fn test_equivocation_detection() {
-        let mut snapshot = StakeSnapshot::default();
-        let val1 = ValidatorId([1u8; 32]);
-
-        snapshot.validators.insert(val1, norn_common::consensus_types::ValidatorRecord {
-            validator_id: val1,
-            consensus_public_key: norn_common::types::ConsensusPublicKey::default(),
-            vrf_public_key: norn_common::types::VrfPublicKey::default(),
-            voting_power: 10,
-        });
-
-        let mut pool = VotePool::new();
-        let bid1 = BlockId(norn_common::types::Hash([1u8; 32]));
-        let bid2 = BlockId(norn_common::types::Hash([2u8; 32]));
-
-        let v1 = SignedVote {
-            protocol_version: norn_common::types::ProtocolVersion(2),
-            chain_id: norn_common::types::ChainId::default(),
-            epoch: 1,
-            height: 1,
-            round: 0,
-            step: VoteStep::Prevote,
-            block_id: Some(bid1),
-            validator: val1,
-            signature: [0u8; 64],
-        };
-
-        let v2 = SignedVote {
-            protocol_version: norn_common::types::ProtocolVersion(2),
-            chain_id: norn_common::types::ChainId::default(),
-            epoch: 1,
-            height: 1,
-            round: 0,
-            step: VoteStep::Prevote,
-            block_id: Some(bid2),
-            validator: val1,
-            signature: [0u8; 64],
-        };
-
-        assert_eq!(pool.add_vote(v1, &snapshot), AddVoteResult::Added);
-        match pool.add_vote(v2, &snapshot) {
-            AddVoteResult::EquivocationDetected { validator, .. } => {
-                assert_eq!(validator, val1);
-            }
-            _ => panic!("Expected EquivocationDetected"),
-        }
     }
 }

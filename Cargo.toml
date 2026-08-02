@@ -65,6 +65,7 @@ rand = "0.8"
 hex = "0.4"
 bs58 = "0.5" # Base58 for addressing commonly used in libp2p
 spki = "0.7" # Subject Public Key Info (for ECDSA key encoding)
+zeroize = "1.8"
 
 # Metrics (Replacing prometheus/client_golang)
 prometheus = { version = "0.13", features = ["process"] }

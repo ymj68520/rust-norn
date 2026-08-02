@@ -80,6 +80,23 @@ impl VRFKeyPair {
         Self { keypair }
     }
 
+    /// Generate VRF KeyPair from 32-byte secret key bytes
+    pub fn from_secret_bytes(bytes: &[u8; 32]) -> Result<Self> {
+        let mini_secret = schnorrkel::MiniSecretKey::from_bytes(bytes)
+            .map_err(|e| anyhow!("Invalid MiniSecretKey bytes: {:?}", e))?;
+        let secret = mini_secret.expand(schnorrkel::ExpansionMode::Ed25519);
+        let keypair = secret.to_keypair();
+        Ok(Self { keypair })
+    }
+
+    /// Generate VRF KeyPair from 64-byte secret key bytes
+    pub fn from_secret_key_bytes(bytes: &[u8; 64]) -> Result<Self> {
+        let secret = schnorrkel::SecretKey::from_bytes(bytes)
+            .map_err(|e| anyhow!("Invalid SecretKey bytes: {:?}", e))?;
+        let keypair = secret.to_keypair();
+        Ok(Self { keypair })
+    }
+
     /// Get 32-byte public key
     pub fn public_key_bytes(&self) -> [u8; 32] {
         self.keypair.public.to_bytes()

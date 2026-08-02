@@ -3682,6 +3682,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "once_cell",
+ "rand 0.8.5",
  "revm",
  "revm-precompile",
  "ripemd",
@@ -3783,6 +3784,7 @@ dependencies = [
  "axum 0.7.9",
  "bincode",
  "chrono",
+ "k256",
  "lazy_static",
  "libp2p",
  "norn-common",
@@ -3792,6 +3794,7 @@ dependencies = [
  "norn-rpc",
  "norn-storage",
  "prometheus",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3801,6 +3804,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

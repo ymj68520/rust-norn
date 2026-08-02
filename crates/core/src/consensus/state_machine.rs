@@ -1,19 +1,15 @@
 //! Tendermint-style BFT State Machine (Propose, Prevote, Precommit, Commit)
-//! 
-//! Implements strict BFT locking rules (locked_block, locked_round, valid_block, valid_round),
-//! NIL votes, timeout escalation, proposal signature & VRF verification, and deterministic round-robin scheduling.
 
 use super::safety_store::{ConsensusSafetyStore, ConsensusSigner, VoteSignRequest};
 use super::types::{ConsensusConfig, ConsensusStep, ElectionMath};
 use super::vote_pool::{AddVoteResult, VotePool};
 use anyhow::{anyhow, Result};
 use norn_common::consensus_types::{
-    CommitCertificate, Proposal, SignedVote, StakeSnapshot, VoteStep,
+    CommitCertificate, PrevoteCertificate, Proposal, SignedVote, StakeSnapshot, VoteStep,
 };
 use norn_common::types::{Block, BlockId, ValidatorId};
-use norn_crypto::vrf::{VRFCalculator, VRFOutputData, VRFPreOutBytes, VRFProofBytes};
+use norn_crypto::vrf::{VrfContext, VRFCalculator, VRFOutputData, VRFPreOutBytes, VRFProofBytes};
 use k256::ecdsa::{VerifyingKey, Signature, signature::Verifier};
-use sha2::Digest;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -28,6 +24,7 @@ pub struct TendermintStateMachine {
     pub locked_round: Option<u32>,
     pub valid_block: Option<BlockId>,
     pub valid_round: Option<u32>,
+    pub valid_round_certificate: Option<PrevoteCertificate>,
 
     pub snapshot: StakeSnapshot,
     pub vote_pool: VotePool,
@@ -51,6 +48,7 @@ impl TendermintStateMachine {
             locked_round: None,
             valid_block: None,
             valid_round: None,
+            valid_round_certificate: None,
             snapshot,
             vote_pool: VotePool::new(),
             safety_store,
@@ -67,6 +65,7 @@ impl TendermintStateMachine {
         self.locked_round = None;
         self.valid_block = None;
         self.valid_round = None;
+        self.valid_round_certificate = None;
         self.snapshot = snapshot;
         self.vote_pool.clear_old_heights(height);
         info!("Consensus starting new height {}", height);
@@ -86,7 +85,7 @@ impl TendermintStateMachine {
         ElectionMath::select_deterministic_proposer(&self.snapshot, self.height, self.round)
     }
 
-    /// Check if local node is the current round's proposer
+    /// Check if local node is current round's proposer
     pub fn is_local_proposer(&self) -> bool {
         if let (Some(local_id), Some(proposer)) = (self.local_validator_id, self.get_current_proposer()) {
             local_id == proposer
@@ -95,7 +94,33 @@ impl TendermintStateMachine {
         }
     }
 
-    /// Handle incoming proposal, verify proposer signature and VRF proof, and decide whether to Prevote for it or NIL Prevote
+    /// Verify a PrevoteCertificate POL proof
+    pub fn verify_prevote_certificate(cert: &PrevoteCertificate, snapshot: &StakeSnapshot) -> Result<()> {
+        if cert.stake_snapshot_hash != snapshot.snapshot_hash {
+            return Err(anyhow!("PrevoteCertificate snapshot hash mismatch"));
+        }
+
+        let mut pool = VotePool::new();
+        for vote in &cert.prevotes {
+            if vote.step != VoteStep::Prevote {
+                return Err(anyhow!("PrevoteCertificate contains non-prevote step"));
+            }
+            if vote.block_id != Some(cert.block_id) {
+                return Err(anyhow!("PrevoteCertificate vote block_id mismatch"));
+            }
+            if pool.add_vote(vote.clone(), snapshot) != AddVoteResult::Added {
+                return Err(anyhow!("PrevoteCertificate contains invalid vote"));
+            }
+        }
+
+        if pool.check_quorum(cert.height, cert.round, VoteStep::Prevote, Some(cert.block_id), snapshot).is_none() {
+            return Err(anyhow!("PrevoteCertificate failed > 2/3 quorum check"));
+        }
+
+        Ok(())
+    }
+
+    /// Handle incoming proposal with strict fail-closed signature and VRF verification
     pub fn handle_proposal(
         &mut self,
         proposal: &Proposal,
@@ -113,20 +138,20 @@ impl TendermintStateMachine {
             return Err(anyhow!("Proposal chain_id / protocol_version mismatch"));
         }
 
+        if proposal.stake_snapshot_hash != self.snapshot.snapshot_hash {
+            return Err(anyhow!("Proposal stake_snapshot_hash mismatch"));
+        }
+
         let calculated_block_id = BlockId(block.header.block_hash);
         if proposal.block_id != calculated_block_id {
             return Err(anyhow!("Proposal block_id does not match actual block header hash"));
         }
 
-        // Validate proposer identity
         let expected_proposer = self
             .get_current_proposer()
             .ok_or_else(|| anyhow!("No proposer available"))?;
         if proposal.proposer != expected_proposer {
-            warn!(
-                "Proposal from invalid proposer: expected {:?}, got {:?}",
-                expected_proposer, proposal.proposer
-            );
+            warn!("Proposal from invalid proposer: expected {:?}, got {:?}", expected_proposer, proposal.proposer);
             return self.cast_vote(VoteStep::Prevote, None, signer);
         }
 
@@ -135,28 +160,38 @@ impl TendermintStateMachine {
             return self.cast_vote(VoteStep::Prevote, None, signer);
         };
 
-        // 1. Verify proposer signature over proposal canonical bytes
-        if record.consensus_public_key.0 != [0u8; 33] && proposal.signature != [0u8; 64] {
-            if let Ok(verifying_key) = VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0) {
-                if let Ok(sig) = Signature::from_slice(&proposal.signature) {
-                    let msg_bytes = proposal.canonical_bytes();
-                    if verifying_key.verify(&msg_bytes, &sig).is_err() {
-                        warn!("Proposal signature verification failed");
-                        return self.cast_vote(VoteStep::Prevote, None, signer);
-                    }
-                } else {
-                    return self.cast_vote(VoteStep::Prevote, None, signer);
-                }
-            }
+        // 1. Strict fail-closed ECDSA signature verification
+        if record.consensus_public_key.0 == [0u8; 33] || proposal.signature == [0u8; 64] {
+            warn!("Rejected proposal with zero key or zero signature");
+            return self.cast_vote(VoteStep::Prevote, None, signer);
         }
 
-        // 2. Verify proposer VRF proof
-        let seed = {
-            let genesis_hash = norn_common::genesis::GENESIS_BLOCK_HASH;
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(genesis_hash.0);
-            hasher.update(&(proposal.height as u64).to_le_bytes());
-            hasher.finalize().to_vec()
+        let verifying_key = VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0)
+            .map_err(|_| anyhow!("Malformed SEC1 consensus public key"))?;
+        let sig = Signature::from_slice(&proposal.signature)
+            .map_err(|_| anyhow!("Malformed proposal signature"))?;
+
+        if sig.normalize_s().is_some() {
+            warn!("Rejected non-canonical high-S proposal signature");
+            return self.cast_vote(VoteStep::Prevote, None, signer);
+        }
+
+        let msg_bytes = proposal.canonical_bytes();
+        if verifying_key.verify(&msg_bytes, &sig).is_err() {
+            warn!("Proposal ECDSA signature verification failed");
+            return self.cast_vote(VoteStep::Prevote, None, signer);
+        }
+
+        // 2. Strict VRF verification with VrfContext
+        let context = VrfContext {
+            protocol_version: self.config.protocol_version.clone(),
+            chain_id: self.config.chain_id.clone(),
+            epoch: self.config.epoch,
+            height: self.height,
+            round: self.round,
+            parent_block_hash: proposal.parent_block_hash.clone(),
+            stake_snapshot_hash: self.snapshot.snapshot_hash.clone(),
+            validator_id: proposal.proposer,
         };
 
         let vrf_output_data = VRFOutputData {
@@ -165,19 +200,24 @@ impl TendermintStateMachine {
             output_bytes: proposal.vrf_preout,
         };
 
-        if VRFCalculator::verify(&record.vrf_public_key.0, &seed, &vrf_output_data).is_err() {
-            warn!("Proposal VRF verification failed");
+        let valid_vrf = VRFCalculator::verify_with_context(&record.vrf_public_key.0, &context, &vrf_output_data)?;
+        if !valid_vrf {
+            warn!("Proposal VRF proof verification returned false");
             return self.cast_vote(VoteStep::Prevote, None, signer);
         }
 
-        // Check Tendermint unlocking rule
+        // 3. Evaluate Tendermint unlocking rule
         let can_prevote = match (self.locked_block, self.locked_round) {
             (None, _) => true,
             (Some(locked_bid), Some(locked_r)) => {
                 if locked_bid == calculated_block_id {
                     true
-                } else if let Some(valid_r) = proposal.valid_round {
-                    valid_r >= locked_r
+                } else if let (Some(vr), Some(cert)) = (proposal.valid_round, &proposal.valid_round_certificate) {
+                    if vr >= locked_r && vr == cert.round && cert.block_id == calculated_block_id {
+                        Self::verify_prevote_certificate(cert, &self.snapshot).is_ok()
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -187,7 +227,6 @@ impl TendermintStateMachine {
 
         if can_prevote {
             info!("Casting Prevote for block {:?}", calculated_block_id);
-            self.valid_block = Some(calculated_block_id);
             self.cast_vote(VoteStep::Prevote, Some(calculated_block_id), signer)
         } else {
             warn!("Locked on different block, casting NIL Prevote");
@@ -195,7 +234,7 @@ impl TendermintStateMachine {
         }
     }
 
-    /// Process incoming vote and update BFT state and locking
+    /// Process incoming vote and update BFT state and locking upon Polka
     pub fn handle_vote(
         &mut self,
         vote: SignedVote,
@@ -212,15 +251,15 @@ impl TendermintStateMachine {
                 warn!("Equivocation detected from validator {:?}", validator);
                 return Ok((None, None));
             }
-            AddVoteResult::UnknownValidator | AddVoteResult::InvalidSignature => {
+            AddVoteResult::UnknownValidator | AddVoteResult::InvalidSignature | AddVoteResult::SnapshotMismatch => {
                 return Ok((None, None));
             }
         }
 
-        // Check if 2/3 Prevote quorum is reached for a block
+        // Check if 2/3 Prevote Polka is reached
         if step == VoteStep::Prevote {
             let checked_block = vote.block_id;
-            if let Some(_prevotes) = self.vote_pool.check_quorum(
+            if let Some(prevotes) = self.vote_pool.check_quorum(
                 height,
                 round,
                 VoteStep::Prevote,
@@ -228,13 +267,23 @@ impl TendermintStateMachine {
                 &self.snapshot,
             ) {
                 if let Some(bid) = checked_block {
-                    info!("2/3 Prevotes reached for block {:?}, locking block and casting Precommit", bid);
+                    info!("2/3 Prevotes (Polka) reached for block {:?}, updating locks", bid);
                     self.locked_block = Some(bid);
                     self.locked_round = Some(round);
                     self.valid_block = Some(bid);
                     self.valid_round = Some(round);
+                    self.valid_round_certificate = Some(PrevoteCertificate {
+                        protocol_version: self.config.protocol_version.clone(),
+                        chain_id: self.config.chain_id.clone(),
+                        epoch: self.config.epoch,
+                        height: self.height,
+                        round: self.round,
+                        block_id: bid,
+                        stake_snapshot_hash: self.snapshot.snapshot_hash.clone(),
+                        prevotes,
+                    });
 
-                    // Produce local Precommit vote
+                    // Cast local Precommit vote
                     if self.local_validator_id.is_some() {
                         if let Ok(precommit_vote) = self.cast_vote(VoteStep::Precommit, Some(bid), signer) {
                             return Ok((Some(precommit_vote), None));
@@ -253,7 +302,7 @@ impl TendermintStateMachine {
                     bid,
                     &self.snapshot,
                 ) {
-                    info!("2/3 Precommits reached! Finalizing block {:?}", bid);
+                    info!("2/3 Precommits reached! CommitCertificate formed for block {:?}", bid);
                     self.step = ConsensusStep::Commit;
                     return Ok((None, Some(cert)));
                 }
@@ -275,13 +324,14 @@ impl TendermintStateMachine {
             .ok_or_else(|| anyhow!("Local node is not a validator"))?;
 
         let sign_req = VoteSignRequest {
-            protocol_version: self.config.protocol_version,
-            chain_id: self.config.chain_id,
+            protocol_version: self.config.protocol_version.clone(),
+            chain_id: self.config.chain_id.clone(),
             epoch: self.config.epoch,
             height: self.height,
             round: self.round,
             step,
             block_id,
+            stake_snapshot_hash: self.snapshot.snapshot_hash.clone(),
             validator_id: local_id,
         };
 
