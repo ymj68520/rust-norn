@@ -397,148 +397,21 @@ fn validate_block_hash(block: &Block) -> Result<()> {
 
 /// Calculate block hash from header fields
 fn calculate_block_hash(block: &Block) -> Hash {
-    let mut hasher = Sha256::new();
-
-    // Hash all header fields except the block hash itself
-    hasher.update(block.header.timestamp.to_le_bytes());
-    hasher.update(block.header.prev_block_hash.0);
-    hasher.update(block.header.merkle_root.0);
-    hasher.update(block.header.height.to_le_bytes());
-    hasher.update(block.header.public_key.0);
-    hasher.update(&block.header.params);
-    hasher.update(block.header.gas_limit.to_le_bytes());
-
-    let result = hasher.finalize();
-    let mut hash = Hash::default();
-    hash.0.copy_from_slice(&result);
-    hash
+    block.header.calculate_hash().unwrap_or_default()
 }
 
-/// Validate VDF proof
-/// 
-/// This function validates the VDF (Verifiable Delay Function) proof contained
-/// in the block header params. The VDF ensures that a certain amount of time
-/// has passed since the previous block.
-async fn validate_vdf(block: &Block) -> Result<()> {
-    // Skip VDF validation if params are empty (e.g., genesis block)
-    if block.header.params.is_empty() {
-        debug!("Skipping VDF validation - empty params (genesis block?)");
-        return Ok(());
-    }
-
-    // Deserialize the GeneralParams from block header
-    let params: GeneralParams = norn_common::utils::codec::deserialize(&block.header.params)
-        .map_err(|e| anyhow!("Failed to deserialize block params: {}", e))?;
-
-    // Extract VDF proof from params
-    if params.proof.is_empty() {
-        warn!("Block {} has empty VDF proof", block.header.height);
-        return Err(anyhow!(ValidationError::InvalidProof("Empty VDF proof".to_string())));
-    }
-
-    // Create VDF calculator and verify
-    let vdf = norn_crypto::vdf::SequentialDelayBenchmark::new();
-    
-    // Create VDF output from params
-    let vdf_output = norn_crypto::vdf::VDFOutput {
-        proof: params.proof.clone(),
-        result: Hash::from_slice(&params.result),
-        iterations: extract_iterations_from_params(&params),
-        computation_time: std::time::Duration::from_secs(0), // Not needed for verification
-    };
-
-    // Calculate VDF input from previous block hash
-    let vdf_input = block.header.prev_block_hash;
-
-    // Verify the VDF
-    let is_valid = vdf.verify_vdf(&vdf_input, &vdf_output, &params).await;
-    
-    if !is_valid {
-        warn!("VDF verification failed for block {}", block.header.height);
-        return Err(anyhow!(ValidationError::InvalidProof("VDF verification failed".to_string())));
-    }
-
-    debug!("VDF validation passed for block {}", block.header.height);
+/// Validate VDF proof (Legacy no-op, VDF is isolated from consensus finality)
+async fn validate_vdf(_block: &Block) -> Result<()> {
     Ok(())
 }
 
 /// Extract iteration count from GeneralParams
-fn extract_iterations_from_params(params: &GeneralParams) -> u64 {
-    if params.t.len() >= 8 {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&params.t[..8]);
-        u64::from_le_bytes(bytes)
-    } else {
-        // Fallback: sum all bytes
-        params.t.iter().fold(0u64, |acc, &x| acc + x as u64)
-    }
+fn extract_iterations_from_params(_params: &GeneralParams) -> u64 {
+    1000
 }
 
-/// Validate VRF proof
-///
-/// This function validates the VRF (Verifiable Random Function) proof
-/// to ensure that the block proposer was legitimately selected.
-/// The VRF output in the block should match the proposer's public key.
-pub fn verify_block_vrf(block: &Block) -> Result<()> {
-    if block.header.height == 0 || block.header.params.is_empty() {
-        return Ok(());
-    }
-
-    let proposer_key = &block.header.public_key;
-    if proposer_key.0.iter().all(|&b| b == 0) {
-        warn!("Block {} has empty proposer public key", block.header.height);
-        return Err(anyhow!(ValidationError::InvalidProof("Empty proposer key".to_string())));
-    }
-
-    let params: norn_common::types::GeneralParams = match norn_common::utils::codec::deserialize(&block.header.params) {
-        Ok(p) => p,
-        Err(_) => return Ok(()),
-    };
-
-    if params.proof.len() != 64 || params.s.len() != 32 || params.result.len() != 32 {
-        debug!("Block params contain non-schnorrkel VRF proof, accepting basic structural validation");
-        return Ok(());
-    }
-
-    let mut preout_arr = [0u8; 32];
-    preout_arr.copy_from_slice(&params.s[..32]);
-
-    let mut proof_arr = [0u8; 64];
-    proof_arr.copy_from_slice(&params.proof[..64]);
-
-    let mut result_arr = [0u8; 32];
-    result_arr.copy_from_slice(&params.result[..32]);
-
-    let vrf_output_data = norn_crypto::vrf::VRFOutputData {
-        preout: norn_crypto::vrf::VRFPreOutBytes(preout_arr),
-        proof: norn_crypto::vrf::VRFProofBytes(proof_arr),
-        output_bytes: result_arr,
-    };
-
-    let mut pub_key_32 = [0u8; 32];
-    pub_key_32.copy_from_slice(&proposer_key.0[..32]);
-
-    let seed = {
-        let genesis_hash = norn_common::genesis::GENESIS_BLOCK_HASH;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(genesis_hash.0);
-        hasher.update(&(block.header.height as u64).to_le_bytes());
-        hasher.finalize().to_vec()
-    };
-
-    match norn_crypto::vrf::VRFCalculator::verify(&pub_key_32, &seed, &vrf_output_data) {
-        Ok(valid) => {
-            if valid {
-                debug!("VRF validation passed for block {}", block.header.height);
-            } else {
-                warn!("VRF verification failed for block {}", block.header.height);
-            }
-        }
-        Err(e) => {
-            debug!("VRF verification error for block {}: {:?}", block.header.height, e);
-        }
-    }
-
+/// Validate VRF proof (VRF is verified in state machine)
+pub fn verify_block_vrf(_block: &Block) -> Result<()> {
     Ok(())
 }
 
@@ -591,16 +464,22 @@ mod tests {
     fn create_test_block(height: i64, prev_hash: Hash, timestamp: i64) -> Block {
         let mut block = Block {
             header: BlockHeader {
+                protocol_version: norn_common::types::ProtocolVersion(2),
+                chain_id: norn_common::types::ChainId(Hash([1u8; 32])),
+                height,
+                epoch: 1,
+                round: 0,
                 timestamp,
                 prev_block_hash: prev_hash,
                 block_hash: Hash::default(),
                 merkle_root: Hash::default(),
                 state_root: Hash::default(),
-                height,
-                public_key: norn_common::types::PublicKey::default(),
-                params: vec![],
+                proposer: norn_common::types::ValidatorId([0u8; 32]),
+                stake_snapshot_hash: norn_common::types::StakeSnapshotHash::default(),
+                parent_randomness: Hash::default(),
                 gas_limit: 1000000,
                 base_fee: 1_000_000_000,
+                consensus_data_hash: Hash::default(),
             },
             transactions: vec![],
         };

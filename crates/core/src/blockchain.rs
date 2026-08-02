@@ -292,15 +292,8 @@ async fn get_block_by_height_from_db(_db: &Arc<dyn DBInterface>, height: i64) ->
     Some(norn_common::genesis::get_genesis_block())
 }
 
-fn extract_genesis_params(block: &Block) -> norn_common::types::GenesisParams {
-    if block.header.params.is_empty() {
-        return norn_common::genesis::get_genesis_params();
-    }
-
-    match norn_common::utils::codec::deserialize::<norn_common::types::GenesisParams>(&block.header.params) {
-        Ok(params) => params,
-        Err(_) => norn_common::genesis::get_genesis_params(),
-    }
+fn extract_genesis_params(_block: &Block) -> norn_common::types::GenesisParams {
+    norn_common::genesis::get_genesis_params()
 }
 
 #[cfg(test)]

@@ -5,16 +5,22 @@ use crate::types::{Block, BlockHeader, Hash, GenesisParams, PublicKey};
 /// 确保所有节点使用相同的创世块，这对于网络同步至关重要
 pub fn get_genesis_block() -> Block {
     let header = BlockHeader {
+        protocol_version: crate::types::ProtocolVersion(2),
+        chain_id: crate::types::ChainId(Hash([1u8; 32])),
+        height: 0,
+        epoch: 1,
+        round: 0,
         timestamp: GENESIS_TIMESTAMP,
-        prev_block_hash: Hash::default(), // 创世块的前一个区块哈希为全零
+        prev_block_hash: Hash::default(),
         block_hash: GENESIS_BLOCK_HASH,
-        merkle_root: Hash::default(),     // 没有交易，Merkle根为全零
-        state_root: Hash::default(),      // 创世块状态根为全零
-        height: 0,                        // 创世块高度为0
-        public_key: PublicKey::default(),
-        params: serialize_genesis_params(),
+        merkle_root: Hash::default(),
+        state_root: Hash::default(),
+        proposer: crate::types::ValidatorId([0u8; 32]),
+        stake_snapshot_hash: crate::types::StakeSnapshotHash::default(),
+        parent_randomness: GENESIS_SEED,
         gas_limit: GENESIS_GAS_LIMIT,
-        base_fee: GENESIS_BASE_FEE,       // EIP-1559: 初始基础费用
+        base_fee: GENESIS_BASE_FEE,
+        consensus_data_hash: Hash::default(),
     };
 
     Block {
@@ -151,6 +157,5 @@ mod tests {
         // 两次调用应该返回相同的创世块
         assert_eq!(genesis1.header.block_hash, genesis2.header.block_hash);
         assert_eq!(genesis1.header.timestamp, genesis2.header.timestamp);
-        assert_eq!(genesis1.header.params, genesis2.header.params);
     }
 }

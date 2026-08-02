@@ -4,10 +4,21 @@
 //! detects equivocation (double-voting), and constructs CommitCertificates.
 
 use norn_common::consensus_types::{CommitCertificate, SignedVote, StakeSnapshot, VoteStep};
-use norn_common::types::{BlockId, ValidatorId};
+use norn_common::types::{BlockId, ChainId, ProtocolVersion, StakeSnapshotHash, ValidatorId};
 use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, warn};
 use k256::ecdsa::{VerifyingKey, Signature, signature::Verifier};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VotePoolKey {
+    pub protocol_version: ProtocolVersion,
+    pub chain_id: ChainId,
+    pub epoch: u64,
+    pub height: u64,
+    pub round: u32,
+    pub step: VoteStep,
+    pub stake_snapshot_hash: StakeSnapshotHash,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddVoteResult {
@@ -24,8 +35,8 @@ pub enum AddVoteResult {
 }
 
 pub struct VotePool {
-    /// Maps (height, round, step) -> Map<ValidatorId, SignedVote>
-    votes: HashMap<(u64, u32, VoteStep), BTreeMap<ValidatorId, SignedVote>>,
+    /// Maps VotePoolKey -> Map<ValidatorId, SignedVote>
+    votes: HashMap<VotePoolKey, BTreeMap<ValidatorId, SignedVote>>,
     /// Equivocation records: ValidatorId -> Vec<(SignedVote, SignedVote)>
     equivocation_records: HashMap<ValidatorId, Vec<(SignedVote, SignedVote)>>,
 }
@@ -78,7 +89,15 @@ impl VotePool {
             return AddVoteResult::InvalidSignature;
         }
 
-        let key = (vote.height, vote.round, vote.step);
+        let key = VotePoolKey {
+            protocol_version: vote.protocol_version.clone(),
+            chain_id: vote.chain_id.clone(),
+            epoch: vote.epoch,
+            height: vote.height,
+            round: vote.round,
+            step: vote.step,
+            stake_snapshot_hash: vote.stake_snapshot_hash.clone(),
+        };
         let step_votes = self.votes.entry(key).or_insert_with(BTreeMap::new);
 
         if let Some(existing) = step_votes.get(&vote.validator) {
@@ -103,13 +122,24 @@ impl VotePool {
     /// Check if a specific block_id has achieved > 2/3 total voting power for step (Prevote / Precommit)
     pub fn check_quorum(
         &self,
+        protocol_version: ProtocolVersion,
+        chain_id: ChainId,
+        epoch: u64,
         height: u64,
         round: u32,
         step: VoteStep,
         block_id: Option<BlockId>,
         snapshot: &StakeSnapshot,
     ) -> Option<Vec<SignedVote>> {
-        let key = (height, round, step);
+        let key = VotePoolKey {
+            protocol_version,
+            chain_id,
+            epoch,
+            height,
+            round,
+            step,
+            stake_snapshot_hash: snapshot.snapshot_hash.clone(),
+        };
         let step_votes = self.votes.get(&key)?;
 
         let total_power = match snapshot.total_voting_power() {
@@ -140,6 +170,9 @@ impl VotePool {
             .unwrap_or(false);
 
         if has_quorum {
+            // Sort precommits deterministically by ValidatorId
+            matching_votes.sort_by(|a, b| a.validator.0.cmp(&b.validator.0));
+            matching_votes.dedup_by(|a, b| a.validator == b.validator);
             Some(matching_votes)
         } else {
             None
@@ -149,18 +182,20 @@ impl VotePool {
     /// Construct CommitCertificate if > 2/3 Precommit votes agree on a valid BlockId
     pub fn create_commit_certificate(
         &self,
+        protocol_version: ProtocolVersion,
+        chain_id: ChainId,
+        epoch: u64,
         height: u64,
         round: u32,
         block_id: BlockId,
         snapshot: &StakeSnapshot,
     ) -> Option<CommitCertificate> {
-        let precommits = self.check_quorum(height, round, VoteStep::Precommit, Some(block_id), snapshot)?;
-        let first_vote = precommits.first()?;
+        let precommits = self.check_quorum(protocol_version.clone(), chain_id.clone(), epoch, height, round, VoteStep::Precommit, Some(block_id), snapshot)?;
 
         Some(CommitCertificate {
-            protocol_version: first_vote.protocol_version.clone(),
-            chain_id: first_vote.chain_id.clone(),
-            epoch: first_vote.epoch,
+            protocol_version,
+            chain_id,
+            epoch,
             height,
             round,
             block_id,
@@ -174,7 +209,7 @@ impl VotePool {
     }
 
     pub fn clear_old_heights(&mut self, current_height: u64) {
-        self.votes.retain(|(h, _, _), _| *h >= current_height);
+        self.votes.retain(|key, _| key.height >= current_height);
     }
 }
 
@@ -258,9 +293,25 @@ mod tests {
         assert_eq!(pool.add_vote(v1, &snapshot), AddVoteResult::Added);
         assert_eq!(pool.add_vote(v2, &snapshot), AddVoteResult::Added);
 
-        assert!(pool.create_commit_certificate(1, 0, bid, &snapshot).is_none());
+        assert!(pool.create_commit_certificate(
+            norn_common::types::ProtocolVersion(2),
+            norn_common::types::ChainId::default(),
+            1,
+            1,
+            0,
+            bid,
+            &snapshot,
+        ).is_none());
 
         assert_eq!(pool.add_vote(v3, &snapshot), AddVoteResult::Added);
-        assert!(pool.create_commit_certificate(1, 0, bid, &snapshot).is_some());
+        assert!(pool.create_commit_certificate(
+            norn_common::types::ProtocolVersion(2),
+            norn_common::types::ChainId::default(),
+            1,
+            1,
+            0,
+            bid,
+            &snapshot,
+        ).is_some());
     }
 }

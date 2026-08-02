@@ -28,7 +28,7 @@ impl PoVFEngine {
         safety_store: Arc<dyn ConsensusSafetyStore>,
         local_validator_id: Option<ValidatorId>,
     ) -> Self {
-        let state_machine = TendermintStateMachine::new(config, snapshot, safety_store, local_validator_id);
+        let state_machine = TendermintStateMachine::new(config, snapshot, Hash::default(), safety_store, local_validator_id);
         Self {
             state_machine: Arc::new(RwLock::new(state_machine)),
             candidate_blocks: Arc::new(RwLock::new(HashMap::new())),
@@ -43,16 +43,20 @@ impl PoVFEngine {
         block: Block,
         signer: &dyn ConsensusSigner,
     ) -> Result<Option<SignedVote>> {
-        let calculated_bid = BlockId(block.header.block_hash);
-        {
-            let mut candidates = self.candidate_blocks.write().await;
-            candidates.insert((proposal.height, calculated_bid), block.clone());
-        }
-
         let mut sm = self.state_machine.write().await;
         let vote = sm
             .handle_proposal(&proposal, &block, signer)
             .map_err(|e| NornError::ConsensusError(e.to_string()))?;
+
+        let calculated_bid = BlockId(block.header.block_hash);
+        {
+            let mut candidates = self.candidate_blocks.write().await;
+            if candidates.len() >= 32 {
+                candidates.retain(|(h, _), _| *h >= proposal.height);
+            }
+            candidates.insert((proposal.height, calculated_bid), block.clone());
+        }
+
         Ok(Some(vote))
     }
 

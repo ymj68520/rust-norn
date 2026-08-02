@@ -527,19 +527,46 @@ pub struct GeneralParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct BlockHeader {
+    pub protocol_version: ProtocolVersion,
+    pub chain_id: ChainId,
+    pub height: i64,
+    pub epoch: u64,
+    pub round: u32,
     pub timestamp: i64,
     pub prev_block_hash: Hash,
     pub block_hash: Hash,
     pub merkle_root: Hash,
-    /// State root hash after executing transactions in this block
     pub state_root: Hash,
-    pub height: i64,
-    pub public_key: PublicKey,
-    #[serde(with = "hex_serde")]
-    pub params: Vec<u8>, // This might need to be parsed as GenesisParams or GeneralParams depending on logic
+    pub proposer: ValidatorId,
+    pub stake_snapshot_hash: StakeSnapshotHash,
+    pub parent_randomness: Hash,
     pub gas_limit: i64,
-    /// EIP-1559: Base fee for this block
     pub base_fee: u64,
+    pub consensus_data_hash: Hash,
+}
+
+impl BlockHeader {
+    pub fn calculate_hash(&self) -> Result<Hash, crate::error::NornError> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"NORN_BLOCK_HEADER_V2");
+        hasher.update(&self.protocol_version.0.to_be_bytes());
+        hasher.update(&self.chain_id.0.0);
+        hasher.update(&self.height.to_be_bytes());
+        hasher.update(&self.epoch.to_be_bytes());
+        hasher.update(&self.round.to_be_bytes());
+        hasher.update(&self.timestamp.to_be_bytes());
+        hasher.update(&self.prev_block_hash.0);
+        hasher.update(&self.merkle_root.0);
+        hasher.update(&self.state_root.0);
+        hasher.update(&self.proposer.0);
+        hasher.update(&self.stake_snapshot_hash.0);
+        hasher.update(&self.parent_randomness.0);
+        hasher.update(&self.gas_limit.to_be_bytes());
+        hasher.update(&self.base_fee.to_be_bytes());
+        hasher.update(&self.consensus_data_hash.0);
+        Ok(Hash(hasher.finalize().into()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]

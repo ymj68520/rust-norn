@@ -266,16 +266,22 @@ mod tests {
     fn create_test_block(height: i64, prev_hash: Hash) -> Block {
         Block {
             header: BlockHeader {
+                protocol_version: norn_common::types::ProtocolVersion(2),
+                chain_id: norn_common::types::ChainId(Hash([1u8; 32])),
+                height,
+                epoch: 1,
+                round: 0,
                 timestamp: 1000 + height as i64,
                 prev_block_hash: prev_hash,
                 block_hash: Hash::default(),
                 merkle_root: Hash::default(),
-                height,
-                public_key: norn_common::types::PublicKey::default(),
-                params: vec![],
-                gas_limit: 1000000,
-                base_fee: 1000000000, // 1 Gwei
                 state_root: Hash::default(),
+                proposer: norn_common::types::ValidatorId([0u8; 32]),
+                stake_snapshot_hash: norn_common::types::StakeSnapshotHash::default(),
+                parent_randomness: Hash::default(),
+                gas_limit: 1000000,
+                base_fee: 1000000000,
+                consensus_data_hash: Hash::default(),
             },
             transactions: vec![],
         }

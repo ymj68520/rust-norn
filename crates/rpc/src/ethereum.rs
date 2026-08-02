@@ -411,7 +411,8 @@ impl EthereumRpcImpl {
 
     /// Convert norn block to RPC block format
     fn convert_block(&self, block: &norn_common::types::Block) -> Block {
-        let miner_address = block.header.public_key.to_address();
+        let mut miner_address = Address([0u8; 20]);
+        miner_address.0.copy_from_slice(&block.header.proposer.0[..20]);
         Block {
             hash: format!("0x{}", block.header.block_hash),
             parent_hash: format!("0x{}", block.header.prev_block_hash),
@@ -538,10 +539,12 @@ impl EthereumRpcServer for EthereumRpcImpl {
     async fn estimate_gas(&self, request: CallRequest) -> RpcResult<String> {
         // Create EVM context
         let latest = self.blockchain.latest_block.read().await;
+        let mut coinbase_addr = Address([0u8; 20]);
+        coinbase_addr.0.copy_from_slice(&latest.header.proposer.0[..20]);
         let ctx = EVMContext {
             block_number: latest.header.height as u64,
             block_timestamp: latest.header.timestamp as u64,
-            block_coinbase: latest.header.public_key.to_address(),
+            block_coinbase: coinbase_addr,
             block_gas_limit: latest.header.gas_limit as u64,
             tx_gas_price: 1_000_000_000, // 1 Gwei
         };

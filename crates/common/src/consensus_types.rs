@@ -133,8 +133,19 @@ pub enum ConsensusMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsensusEnvelope {
     pub wire_version: u16,
+    pub protocol_version: ProtocolVersion,
     pub chain_id: ChainId,
+    pub genesis_hash: Hash,
     pub payload: ConsensusMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinalizedConsensusState {
+    pub height: u64,
+    pub finalized_block_id: BlockId,
+    pub commit_certificate_hash: Hash,
+    pub next_randomness: Hash,
+    pub active_stake_snapshot_hash: StakeSnapshotHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +177,32 @@ pub struct StakeSnapshot {
 }
 
 impl StakeSnapshot {
+    pub fn from_genesis(epoch: u64, records: Vec<ValidatorRecord>) -> Result<Self> {
+        if records.is_empty() {
+            return Err(NornError::ConsensusError("Genesis validator set cannot be empty".into()));
+        }
+        let mut validators = BTreeMap::new();
+        let mut total_power = 0u128;
+        for record in records {
+            if record.voting_power == 0 {
+                return Err(NornError::ConsensusError("Validator voting power must be > 0".into()));
+            }
+            total_power = total_power.checked_add(record.voting_power as u128)
+                .ok_or_else(|| NornError::ConsensusError("Voting power overflow".into()))?;
+            if validators.contains_key(&record.validator_id) {
+                return Err(NornError::ConsensusError("Duplicate validator ID in genesis".into()));
+            }
+            validators.insert(record.validator_id, record);
+        }
+        let mut snapshot = Self {
+            epoch,
+            validators,
+            snapshot_hash: StakeSnapshotHash::default(),
+        };
+        snapshot.snapshot_hash = snapshot.compute_hash();
+        Ok(snapshot)
+    }
+
     pub fn total_voting_power(&self) -> Result<u128> {
         self.validators.values().try_fold(0u128, |acc, v| {
             acc.checked_add(v.voting_power as u128)

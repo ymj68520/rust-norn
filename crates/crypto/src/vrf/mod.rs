@@ -226,6 +226,25 @@ pub fn derive_vrf_randomness_bytes(vrf_inout: &VRFInOut) -> [u8; 32] {
     vrf_inout.make_bytes::<[u8; 32]>(b"NORN_VRF_RANDOMNESS_V2")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedVrfOutput {
+    pub score: [u8; 32],
+    pub randomness: [u8; 32],
+}
+
+pub fn verify_and_derive(
+    pub_key_bytes: &[u8; 32],
+    context: &VrfContext,
+    preout_bytes: &VRFPreOutBytes,
+    proof_bytes: &VRFProofBytes,
+) -> Result<VerifiedVrfOutput> {
+    let transcript = context.build_transcript();
+    let vrf_inout = verify_vrf(pub_key_bytes, transcript, preout_bytes, proof_bytes)?;
+    let score = derive_vrf_score_bytes(&vrf_inout);
+    let randomness = derive_vrf_randomness_bytes(&vrf_inout);
+    Ok(VerifiedVrfOutput { score, randomness })
+}
+
 /// High-level VRF Calculator
 pub struct VRFCalculator;
 

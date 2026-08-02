@@ -90,9 +90,12 @@ impl ElectionMath {
 
     /// Select deterministic proposer for a given (height, round) via cryptographic seed hashing over StakeSnapshot
     pub fn select_deterministic_proposer(
-        snapshot: &StakeSnapshot,
+        chain_id: &ChainId,
+        epoch: u64,
         height: u64,
         round: u32,
+        parent_randomness: &Hash,
+        snapshot: &StakeSnapshot,
     ) -> Option<ValidatorId> {
         if snapshot.validators.is_empty() {
             return None;
@@ -105,9 +108,11 @@ impl ElectionMath {
 
         let mut hasher = Sha256::new();
         hasher.update(b"NORN_PROPOSER_V2");
-        hasher.update(&snapshot.epoch.to_be_bytes());
+        hasher.update(&chain_id.0.0);
+        hasher.update(&epoch.to_be_bytes());
         hasher.update(&height.to_be_bytes());
         hasher.update(&round.to_be_bytes());
+        hasher.update(&parent_randomness.0);
         hasher.update(&snapshot.snapshot_hash.0);
         let digest = hasher.finalize();
 
@@ -122,7 +127,7 @@ impl ElectionMath {
             }
         }
 
-        snapshot.validators.keys().next().cloned()
+        snapshot.validators.keys().next().copied()
     }
 }
 

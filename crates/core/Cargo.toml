@@ -51,6 +51,10 @@ criterion = { workspace = true }
 name = "enhanced_features"
 harness = false
 
+[[test]]
+name = "four_node_bft_test"
+path = "../../tests/four_node_bft_test.rs"
+
 [features]
 default = []
 

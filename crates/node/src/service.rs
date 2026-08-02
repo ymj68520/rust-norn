@@ -288,7 +288,9 @@ impl NornNode {
                     if let Ok((proposal, block)) = producer.produce_proposal().await {
                         let envelope = ConsensusEnvelope {
                             wire_version: 1,
+                            protocol_version: proposal.protocol_version.clone(),
                             chain_id: proposal.chain_id.clone(),
+                            genesis_hash: norn_common::types::Hash::default(),
                             payload: ConsensusMessage::Proposal {
                                 proposal: proposal.clone(),
                                 block: block.clone(),
@@ -336,7 +338,9 @@ impl NornNode {
                                                 if let Ok(Some(vote)) = self.consensus.handle_proposal(proposal, block, self.signer.as_ref()).await {
                                                     let resp_env = ConsensusEnvelope {
                                                         wire_version: 1,
+                                                        protocol_version: vote.protocol_version.clone(),
                                                         chain_id: vote.chain_id.clone(),
+                                                        genesis_hash: envelope.genesis_hash.clone(),
                                                         payload: ConsensusMessage::Vote(vote),
                                                     };
                                                     if let Ok(vote_msg) = bincode::serialize(&resp_env) {
@@ -349,7 +353,9 @@ impl NornNode {
                                                     if let Some(precommit_vote) = vote_opt {
                                                         let resp_env = ConsensusEnvelope {
                                                             wire_version: 1,
+                                                            protocol_version: precommit_vote.protocol_version.clone(),
                                                             chain_id: precommit_vote.chain_id.clone(),
+                                                            genesis_hash: envelope.genesis_hash.clone(),
                                                             payload: ConsensusMessage::Vote(precommit_vote),
                                                         };
                                                         if let Ok(vote_msg) = bincode::serialize(&resp_env) {
@@ -357,6 +363,16 @@ impl NornNode {
                                                         }
                                                     }
                                                     if let Some(commit_cert) = cert_opt {
+                                                        let commit_env = ConsensusEnvelope {
+                                                            wire_version: 1,
+                                                            protocol_version: commit_cert.protocol_version.clone(),
+                                                            chain_id: commit_cert.chain_id.clone(),
+                                                            genesis_hash: envelope.genesis_hash.clone(),
+                                                            payload: ConsensusMessage::Commit(commit_cert.clone()),
+                                                        };
+                                                        if let Ok(commit_msg) = bincode::serialize(&commit_env) {
+                                                            let _ = self.network.command_tx.send(NetworkCommand::BroadcastConsensus(commit_msg)).await;
+                                                        }
                                                         if let Ok(finalized) = self.consensus.finalize_block(commit_cert).await {
                                                             info!("Finalized block {:?} at height {}", finalized.block.header.block_hash, finalized.block.header.height);
                                                             if let Err(err) = self.blockchain.commit_block(&finalized.block).await {

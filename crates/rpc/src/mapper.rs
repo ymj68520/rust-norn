@@ -11,8 +11,8 @@ impl From<Block> for proto::Block {
                 block_hash: hex::encode(b.header.block_hash.0),
                 prev_block_hash: hex::encode(b.header.prev_block_hash.0),
                 merkle_root: hex::encode(b.header.merkle_root.0),
-                public: hex::encode(b.header.public_key.0),
-                params: hex::encode(&b.header.params),
+                public: hex::encode(b.header.proposer.0),
+                params: hex::encode(b.header.parent_randomness.0),
                 gas_limit: b.header.gas_limit as u64,
             }),
             transactions: b.transactions.into_iter().map(|t| t.into()).collect(),
@@ -118,6 +118,11 @@ impl From<proto::Block> for Block {
         let proto_header = proto.header.expect("Block header is missing");
 
         let header = BlockHeader {
+            protocol_version: norn_common::types::ProtocolVersion(2),
+            chain_id: norn_common::types::ChainId(Hash([1u8; 32])),
+            height: proto_header.height as i64,
+            epoch: 1,
+            round: 0,
             timestamp: proto_header.timestamp as i64,
             prev_block_hash: {
                 let mut hash = Hash::default();
@@ -147,19 +152,20 @@ impl From<proto::Block> for Block {
                 hash
             },
             state_root: Hash::default(),
-            height: proto_header.height as i64,
-            public_key: {
-                let mut key = PublicKey::default();
+            proposer: {
+                let mut validator_id = norn_common::types::ValidatorId([0u8; 32]);
                 if let Ok(bytes) = hex::decode(&proto_header.public) {
-                    if bytes.len() == 33 {
-                        key.0.copy_from_slice(&bytes);
+                    if bytes.len() == 32 {
+                        validator_id.0.copy_from_slice(&bytes);
                     }
                 }
-                key
+                validator_id
             },
-            params: hex::decode(&proto_header.params).unwrap_or_default(),
+            stake_snapshot_hash: norn_common::types::StakeSnapshotHash::default(),
+            parent_randomness: Hash::default(),
             gas_limit: proto_header.gas_limit as i64,
-            base_fee: 1_000_000_000, // Default base fee
+            base_fee: 1_000_000_000,
+            consensus_data_hash: Hash::default(),
         };
 
         let transactions: Vec<Transaction> = proto

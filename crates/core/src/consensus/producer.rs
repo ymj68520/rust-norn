@@ -153,11 +153,11 @@ impl BlockProducer {
             gas_used as u64,
         );
 
-        let (config, snapshot, (round, valid_round, valid_round_cert)) = if let Some(ref engine) = self.consensus_engine {
+        let (config, snapshot, (round, valid_round, valid_round_cert), parent_rand) = if let Some(ref engine) = self.consensus_engine {
             let sm = engine.state_machine.read().await;
-            (sm.config.clone(), sm.snapshot.clone(), (sm.round, sm.valid_round, sm.valid_round_certificate.clone()))
+            (sm.config.clone(), sm.snapshot.clone(), (sm.round, sm.valid_round, sm.valid_round_certificate.clone()), sm.parent_randomness)
         } else {
-            (Default::default(), Default::default(), (0, None, None))
+            (Default::default(), Default::default(), (0, None, None), Hash::default())
         };
 
         let local_proposer = self.proposal_signer.as_ref()
@@ -177,15 +177,6 @@ impl BlockProducer {
 
         let vrf_output = VRFCalculator::calculate_with_context(&self.vrf_key_pair, &vrf_context)?;
 
-        let params = GeneralParams {
-            result: vrf_output.output_bytes.to_vec(),
-            random_number: self.vrf_to_public_key(),
-            s: vrf_output.preout.0.to_vec(),
-            t: (1000u64 + (new_height as u64 % 100)).to_le_bytes().to_vec(),
-            proof: vrf_output.proof.0.to_vec(),
-        };
-        let params_bytes = norn_common::utils::codec::serialize(&params)?;
-
         let state_root_calculator = StateRootCalculator::new(false);
         let state_root = state_root_calculator
             .calculate_from_manager(&self.state_manager)
@@ -193,16 +184,22 @@ impl BlockProducer {
             .unwrap_or_else(|_| Hash::default());
 
         let header = BlockHeader {
+            protocol_version: config.protocol_version.clone(),
+            chain_id: config.chain_id.clone(),
+            height: new_height as i64,
+            epoch: config.epoch,
+            round,
             timestamp: chrono::Utc::now().timestamp(),
             prev_block_hash: prev_hash,
             block_hash: Hash::default(),
             merkle_root,
             state_root,
-            height: new_height as i64,
-            public_key: self.vrf_to_public_key(),
-            params: params_bytes,
+            proposer: local_proposer,
+            stake_snapshot_hash: snapshot.snapshot_hash.clone(),
+            parent_randomness: parent_rand,
             gas_limit: self.config.max_gas_per_block,
             base_fee,
+            consensus_data_hash: Hash::default(),
         };
 
         let mut block = Block {
@@ -210,7 +207,7 @@ impl BlockProducer {
             transactions,
         };
 
-        block.header.block_hash = self.calculate_block_hash(&block);
+        block.header.block_hash = block.header.calculate_hash()?;
         let block_id = BlockId(block.header.block_hash);
 
         let mut unsigned_proposal = Proposal {
@@ -269,19 +266,7 @@ impl BlockProducer {
     }
 
     fn calculate_block_hash(&self, block: &Block) -> Hash {
-        let mut hasher = Sha256::new();
-        hasher.update(block.header.timestamp.to_le_bytes());
-        hasher.update(block.header.prev_block_hash.0);
-        hasher.update(block.header.merkle_root.0);
-        hasher.update(block.header.height.to_le_bytes());
-        hasher.update(block.header.public_key.0);
-        hasher.update(&block.header.params);
-        hasher.update(block.header.gas_limit.to_le_bytes());
-        
-        let result = hasher.finalize();
-        let mut hash = Hash::default();
-        hash.0.copy_from_slice(&result);
-        hash
+        block.header.calculate_hash().unwrap_or_default()
     }
 
     pub async fn run(&self) {

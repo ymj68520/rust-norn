@@ -79,11 +79,14 @@ impl DBInterface for SledDB {
         let values = values.to_vec();
 
         tokio::task::spawn_blocking(move || {
-            // Simple batch insert without transaction for simplicity
+            let mut batch = sled::Batch::default();
             for (key, value) in keys.iter().zip(values.iter()) {
-                db.insert(key.as_slice(), value.as_slice())
-                    .map_err(|e| anyhow::anyhow!("Failed to insert into SledDB: {}", e))?;
+                batch.insert(key.as_slice(), value.as_slice());
             }
+            db.apply_batch(batch)
+                .map_err(|e| anyhow::anyhow!("Failed to apply batch into SledDB: {}", e))?;
+            db.flush()
+                .map_err(|e| anyhow::anyhow!("Failed to flush SledDB: {}", e))?;
             Ok(())
         }).await?
     }
@@ -93,11 +96,14 @@ impl DBInterface for SledDB {
         let keys = keys.to_vec();
 
         tokio::task::spawn_blocking(move || {
-            // Simple batch delete without transaction for simplicity
+            let mut batch = sled::Batch::default();
             for key in keys.iter() {
-                db.remove(key.as_slice())
-                    .map_err(|e| anyhow::anyhow!("Failed to remove from SledDB: {}", e))?;
+                batch.remove(key.as_slice());
             }
+            db.apply_batch(batch)
+                .map_err(|e| anyhow::anyhow!("Failed to apply batch delete into SledDB: {}", e))?;
+            db.flush()
+                .map_err(|e| anyhow::anyhow!("Failed to flush SledDB: {}", e))?;
             Ok(())
         }).await?
     }

@@ -27,6 +27,7 @@ pub struct TendermintStateMachine {
     pub valid_round_certificate: Option<PrevoteCertificate>,
 
     pub snapshot: StakeSnapshot,
+    pub parent_randomness: norn_common::types::Hash,
     pub vote_pool: VotePool,
     pub safety_store: Arc<dyn ConsensusSafetyStore>,
     pub local_validator_id: Option<ValidatorId>,
@@ -36,6 +37,7 @@ impl TendermintStateMachine {
     pub fn new(
         config: ConsensusConfig,
         snapshot: StakeSnapshot,
+        parent_randomness: norn_common::types::Hash,
         safety_store: Arc<dyn ConsensusSafetyStore>,
         local_validator_id: Option<ValidatorId>,
     ) -> Self {
@@ -50,6 +52,7 @@ impl TendermintStateMachine {
             valid_round: None,
             valid_round_certificate: None,
             snapshot,
+            parent_randomness,
             vote_pool: VotePool::new(),
             safety_store,
             local_validator_id,
@@ -57,7 +60,7 @@ impl TendermintStateMachine {
     }
 
     /// Advance to next height
-    pub fn start_new_height(&mut self, height: u64, snapshot: StakeSnapshot) {
+    pub fn start_new_height(&mut self, height: u64, snapshot: StakeSnapshot, parent_randomness: norn_common::types::Hash) {
         self.height = height;
         self.round = 0;
         self.step = ConsensusStep::NewHeight;
@@ -67,7 +70,7 @@ impl TendermintStateMachine {
         self.valid_round = None;
         self.valid_round_certificate = None;
         self.snapshot = snapshot;
-        self.vote_pool.clear_old_heights(height);
+        self.parent_randomness = parent_randomness;
         info!("Consensus starting new height {}", height);
         self.start_new_round(0);
     }
@@ -82,7 +85,14 @@ impl TendermintStateMachine {
 
     /// Determine the deterministic proposer for current (height, round)
     pub fn get_current_proposer(&self) -> Option<ValidatorId> {
-        ElectionMath::select_deterministic_proposer(&self.snapshot, self.height, self.round)
+        ElectionMath::select_deterministic_proposer(
+            &self.config.chain_id,
+            self.config.epoch,
+            self.height,
+            self.round,
+            &self.parent_randomness,
+            &self.snapshot,
+        )
     }
 
     /// Check if local node is current round's proposer
@@ -113,7 +123,16 @@ impl TendermintStateMachine {
             }
         }
 
-        if pool.check_quorum(cert.height, cert.round, VoteStep::Prevote, Some(cert.block_id), snapshot).is_none() {
+        if pool.check_quorum(
+            cert.protocol_version.clone(),
+            cert.chain_id.clone(),
+            cert.epoch,
+            cert.height,
+            cert.round,
+            VoteStep::Prevote,
+            Some(cert.block_id),
+            snapshot,
+        ).is_none() {
             return Err(anyhow!("PrevoteCertificate failed > 2/3 quorum check"));
         }
 
@@ -194,15 +213,13 @@ impl TendermintStateMachine {
             validator_id: proposal.proposer,
         };
 
-        let vrf_output_data = VRFOutputData {
-            preout: VRFPreOutBytes(proposal.vrf_preout),
-            proof: VRFProofBytes(proposal.vrf_proof),
-            output_bytes: proposal.vrf_preout,
-        };
-
-        let valid_vrf = VRFCalculator::verify_with_context(&record.vrf_public_key.0, &context, &vrf_output_data)?;
-        if !valid_vrf {
-            warn!("Proposal VRF proof verification returned false");
+        if norn_crypto::vrf::verify_and_derive(
+            &record.vrf_public_key.0,
+            &context,
+            &VRFPreOutBytes(proposal.vrf_preout),
+            &VRFProofBytes(proposal.vrf_proof),
+        ).is_err() {
+            warn!("Proposal VRF proof verification failed");
             return self.cast_vote(VoteStep::Prevote, None, signer);
         }
 
@@ -260,6 +277,9 @@ impl TendermintStateMachine {
         if step == VoteStep::Prevote {
             let checked_block = vote.block_id;
             if let Some(prevotes) = self.vote_pool.check_quorum(
+                self.config.protocol_version.clone(),
+                self.config.chain_id.clone(),
+                self.config.epoch,
                 height,
                 round,
                 VoteStep::Prevote,
@@ -297,6 +317,9 @@ impl TendermintStateMachine {
         if step == VoteStep::Precommit {
             if let Some(bid) = vote.block_id {
                 if let Some(cert) = self.vote_pool.create_commit_certificate(
+                    self.config.protocol_version.clone(),
+                    self.config.chain_id.clone(),
+                    self.config.epoch,
                     height,
                     round,
                     bid,
