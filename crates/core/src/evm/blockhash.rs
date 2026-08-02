@@ -89,7 +89,11 @@ impl BlockHistory {
     /// 2. Blocks in range [current - 256, current - 1] are accessible
     /// 3. Current block is NOT accessible (returns zero)
     /// 4. Blocks outside range return zero hash
-    pub async fn get_block_hash(&self, block_number: u64, current_block: u64) -> Result<Hash, EVMError> {
+    pub async fn get_block_hash(
+        &self,
+        block_number: u64,
+        current_block: u64,
+    ) -> Result<Hash, EVMError> {
         // Rule: Current block is not accessible
         if block_number >= current_block {
             warn!(
@@ -143,10 +147,7 @@ impl BlockHistory {
         }
 
         // Not found (shouldn't happen if blocks are added properly)
-        warn!(
-            "BLOCKHASH: Block {} not found in history",
-            block_number
-        );
+        warn!("BLOCKHASH: Block {} not found in history", block_number);
         Ok(Hash::default())
     }
 

@@ -16,10 +16,10 @@
 
 use crate::evm::EVMResult;
 use norn_common::types::{Address, Hash};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
-use std::collections::HashMap;
 
 /// EVM event log
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,13 +148,19 @@ impl LogManager {
         // Index by address
         {
             let mut logs_by_addr = self.logs_by_address.write().await;
-            logs_by_addr.entry(log.address).or_insert_with(Vec::new).push(log_index);
+            logs_by_addr
+                .entry(log.address)
+                .or_insert_with(Vec::new)
+                .push(log_index);
         }
 
         // Index by topics
         for topic in &log.topics {
             let mut logs_by_topic = self.logs_by_topic.write().await;
-            logs_by_topic.entry(*topic).or_insert_with(Vec::new).push(log_index);
+            logs_by_topic
+                .entry(*topic)
+                .or_insert_with(Vec::new)
+                .push(log_index);
         }
 
         info!(
@@ -164,7 +170,10 @@ impl LogManager {
             log.data.len()
         );
 
-        debug!("Event details: topics={:?}, data={:?}", log.topics, log.data);
+        debug!(
+            "Event details: topics={:?}, data={:?}",
+            log.topics, log.data
+        );
 
         Ok(())
     }
@@ -230,9 +239,7 @@ impl LogManager {
         // Filter by topics if specified
         for (i, topic_opt) in topics.iter().enumerate() {
             if let Some(topic) = topic_opt {
-                logs.retain(|log| {
-                    log.topics.get(i).map_or(false, |t| t == topic)
-                });
+                logs.retain(|log| log.topics.get(i).map_or(false, |t| t == topic));
             }
         }
 
@@ -355,9 +362,18 @@ mod tests {
         let data = vec![1, 2, 3];
 
         // Emit logs for different addresses
-        manager.emit(EventLog::log1(addr1, topic0, data.clone())).await.unwrap();
-        manager.emit(EventLog::log1(addr2, topic0, data.clone())).await.unwrap();
-        manager.emit(EventLog::log0(addr1, vec![4, 5])).await.unwrap();
+        manager
+            .emit(EventLog::log1(addr1, topic0, data.clone()))
+            .await
+            .unwrap();
+        manager
+            .emit(EventLog::log1(addr2, topic0, data.clone()))
+            .await
+            .unwrap();
+        manager
+            .emit(EventLog::log0(addr1, vec![4, 5]))
+            .await
+            .unwrap();
 
         // Filter by address
         let addr1_logs = manager.get_logs_by_address(&addr1).await;
@@ -376,9 +392,18 @@ mod tests {
         let data = vec![1, 2, 3];
 
         // Emit logs with different topics
-        manager.emit(EventLog::log1(addr, topic0, data.clone())).await.unwrap();
-        manager.emit(EventLog::log1(addr, topic1, data.clone())).await.unwrap();
-        manager.emit(EventLog::log2(addr, topic0, topic1, data.clone())).await.unwrap();
+        manager
+            .emit(EventLog::log1(addr, topic0, data.clone()))
+            .await
+            .unwrap();
+        manager
+            .emit(EventLog::log1(addr, topic1, data.clone()))
+            .await
+            .unwrap();
+        manager
+            .emit(EventLog::log2(addr, topic0, topic1, data.clone()))
+            .await
+            .unwrap();
 
         // Filter by topic
         let topic0_logs = manager.get_logs_by_topic(&topic0).await;
@@ -398,9 +423,18 @@ mod tests {
         let data = vec![1, 2, 3];
 
         // Emit logs
-        manager.emit(EventLog::log2(addr, topic0, topic1, data.clone())).await.unwrap();
-        manager.emit(EventLog::log3(addr, topic0, topic1, topic2, data.clone())).await.unwrap();
-        manager.emit(EventLog::log1(addr, topic0, data.clone())).await.unwrap();
+        manager
+            .emit(EventLog::log2(addr, topic0, topic1, data.clone()))
+            .await
+            .unwrap();
+        manager
+            .emit(EventLog::log3(addr, topic0, topic1, topic2, data.clone()))
+            .await
+            .unwrap();
+        manager
+            .emit(EventLog::log1(addr, topic0, data.clone()))
+            .await
+            .unwrap();
 
         // Filter by multiple topics (must have both)
         let logs = manager.get_logs_by_topics(&[topic0, topic1]).await;
@@ -415,8 +449,14 @@ mod tests {
         let data = vec![1, 2, 3];
 
         // Emit logs
-        manager.emit(EventLog::log1(addr, topic0, data.clone())).await.unwrap();
-        manager.emit(EventLog::log0(addr, vec![4, 5])).await.unwrap();
+        manager
+            .emit(EventLog::log1(addr, topic0, data.clone()))
+            .await
+            .unwrap();
+        manager
+            .emit(EventLog::log0(addr, vec![4, 5]))
+            .await
+            .unwrap();
 
         assert_eq!(manager.log_count().await, 2);
 

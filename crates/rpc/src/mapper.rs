@@ -1,6 +1,8 @@
 use crate::proto;
-use norn_common::types::{Block, Transaction, TransactionBody, Hash, Address, PublicKey, TransactionType};
 use hex;
+use norn_common::types::{
+    Address, Block, Hash, PublicKey, Transaction, TransactionBody, TransactionType,
+};
 
 impl From<Block> for proto::Block {
     fn from(b: Block) -> Self {
@@ -36,9 +38,11 @@ impl From<Transaction> for proto::Transaction {
             timestamp: t.body.timestamp as u64,
             public: hex::encode(t.body.public.0),
             signature: hex::encode(&t.body.signature),
-            height: t.body.height as u64,
-            block_hash: hex::encode(t.body.block_hash.0),
-            index: t.body.index as u64,
+            // Inclusion metadata is derived from the containing block and
+            // is not present on the consensus transaction object.
+            height: 0,
+            block_hash: hex::encode(Hash::default().0),
+            index: 0,
         }
     }
 }
@@ -74,13 +78,6 @@ impl From<proto::Transaction> for Transaction {
             }
         }
 
-        let mut block_hash = Hash::default();
-        if let Ok(bytes) = hex::decode(&p.block_hash) {
-            if bytes.len() == 32 {
-                block_hash.0.copy_from_slice(&bytes);
-            }
-        }
-
         Transaction {
             body: TransactionBody {
                 hash,
@@ -93,9 +90,6 @@ impl From<proto::Transaction> for Transaction {
                 state: hex::decode(&p.state).unwrap_or_default(),
                 data: hex::decode(&p.data).unwrap_or_default(),
                 expire: p.expire as i64,
-                height: p.height as i64,
-                index: p.index as i64,
-                block_hash,
                 timestamp: p.timestamp as i64,
                 public,
                 signature: hex::decode(&p.signature).unwrap_or_default(),
@@ -168,11 +162,8 @@ impl From<proto::Block> for Block {
             consensus_data_hash: Hash::default(),
         };
 
-        let transactions: Vec<Transaction> = proto
-            .transactions
-            .into_iter()
-            .map(|tx| tx.into())
-            .collect();
+        let transactions: Vec<Transaction> =
+            proto.transactions.into_iter().map(|tx| tx.into()).collect();
 
         Block {
             header,

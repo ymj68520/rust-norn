@@ -6,8 +6,8 @@
 //! - Refund handling
 //! - EIP-1559 dynamic fee calculation
 
-use crate::evm::{EVMError, EVMResult, EIP1559Config};
-use norn_common::types::{Transaction, Address};
+use crate::evm::{EIP1559Config, EVMError, EVMResult};
+use norn_common::types::{Address, Transaction};
 
 /// Gas costs for various operations (in gas units)
 pub mod costs {
@@ -149,12 +149,7 @@ impl GasCalculator {
     /// Calculate gas cost for a contract call
     ///
     /// Includes warm/cold account access costs
-    pub fn call_gas_cost(
-        &self,
-        callee: &Address,
-        is_cold: bool,
-        value_transferred: bool,
-    ) -> u64 {
+    pub fn call_gas_cost(&self, callee: &Address, is_cold: bool, value_transferred: bool) -> u64 {
         let mut gas = costs::CALL_COST;
 
         // Cold account access cost (EIP-2929)
@@ -240,21 +235,12 @@ impl GasCalculator {
     }
 
     /// Check if a transaction's gas limit is sufficient
-    pub fn is_gas_limit_sufficient(
-        &self,
-        gas_limit: u64,
-        intrinsic_cost: u64,
-    ) -> bool {
+    pub fn is_gas_limit_sufficient(&self, gas_limit: u64, intrinsic_cost: u64) -> bool {
         gas_limit >= intrinsic_cost
     }
 
     /// Calculate final gas cost after refunds
-    pub fn final_gas_cost(
-        &self,
-        gas_limit: u64,
-        gas_used: u64,
-        refund: u64,
-    ) -> EVMResult<u64> {
+    pub fn final_gas_cost(&self, gas_limit: u64, gas_used: u64, refund: u64) -> EVMResult<u64> {
         if gas_used > gas_limit {
             return Err(EVMError::Execution(format!(
                 "Gas used {} exceeds gas limit {}",
@@ -291,11 +277,8 @@ impl GasCalculator {
         base_fee: u64,
     ) -> EVMResult<(u64, u64)> {
         // Calculate effective gas price (what user actually pays)
-        let effective_priority_fee = self.effective_gas_tip(
-            max_priority_fee_per_gas,
-            max_fee_per_gas,
-            base_fee,
-        );
+        let effective_priority_fee =
+            self.effective_gas_tip(max_priority_fee_per_gas, max_fee_per_gas, base_fee);
 
         let gas_price = base_fee + effective_priority_fee;
 
@@ -336,11 +319,7 @@ mod tests {
         let calculator = GasCalculator::default();
 
         // Transaction with 10 zero bytes and 10 non-zero bytes
-        let data: Vec<u8> = vec
-![0u8; 10]
-            .into_iter()
-            .chain(vec![1u8; 10])
-            .collect();
+        let data: Vec<u8> = vec![0u8; 10].into_iter().chain(vec![1u8; 10]).collect();
 
         let gas = calculator.intrinsic_gas_cost(false, &data, None);
 
@@ -360,7 +339,10 @@ mod tests {
 
         let gas = calculator.intrinsic_gas_cost(true, &init_code, None);
 
-        assert_eq!(gas, costs::TX_CREATE_COST + (3 * costs::TX_NON_ZERO_DATA_COST));
+        assert_eq!(
+            gas,
+            costs::TX_CREATE_COST + (3 * costs::TX_NON_ZERO_DATA_COST)
+        );
     }
 
     #[test]
@@ -414,7 +396,8 @@ mod tests {
         let parent_gas_target = 10_000_000;
 
         // Block at target: base fee stays the same
-        let base_fee = calculator.calculate_base_fee(parent_base_fee, parent_gas_target, parent_gas_target);
+        let base_fee =
+            calculator.calculate_base_fee(parent_base_fee, parent_gas_target, parent_gas_target);
         assert_eq!(base_fee, parent_base_fee);
 
         // Block under target: base fee decreases
@@ -422,7 +405,8 @@ mod tests {
         assert!(base_fee < parent_base_fee);
 
         // Block over target: base fee increases
-        let base_fee = calculator.calculate_base_fee(parent_base_fee, 15_000_000, parent_gas_target);
+        let base_fee =
+            calculator.calculate_base_fee(parent_base_fee, 15_000_000, parent_gas_target);
         assert!(base_fee > parent_base_fee);
     }
 

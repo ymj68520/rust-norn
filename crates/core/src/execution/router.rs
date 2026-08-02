@@ -2,8 +2,8 @@
 //!
 //! Routes transactions to the appropriate executor based on transaction type.
 
-use crate::evm::{EVMExecutor, EVMContext, EVMExecutionResult};
-use norn_common::types::{Transaction, TransactionType, Address, Hash};
+use crate::evm::{EVMContext, EVMExecutionResult, EVMExecutor};
+use norn_common::types::{Address, Hash, Transaction, TransactionType};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -66,10 +66,7 @@ pub struct TransactionRouter {
 
 impl TransactionRouter {
     /// Create a new transaction router
-    pub fn new(
-        evm_executor: Option<Arc<EVMExecutor>>,
-        block_gas_limit: u64,
-    ) -> Self {
+    pub fn new(evm_executor: Option<Arc<EVMExecutor>>, block_gas_limit: u64) -> Self {
         Self {
             evm_executor,
             block_number: Arc::new(RwLock::new(0)),
@@ -121,10 +118,7 @@ impl TransactionRouter {
     }
 
     /// Execute transaction based on its type
-    pub async fn execute_transaction(
-        &self,
-        tx: &Transaction,
-    ) -> Result<ExecutionResult, String> {
+    pub async fn execute_transaction(&self, tx: &Transaction) -> Result<ExecutionResult, String> {
         let tx_type = tx.body.tx_type;
 
         debug!(
@@ -140,18 +134,15 @@ impl TransactionRouter {
                 Err("Native transactions should use native executor".to_string())
             }
 
-            TransactionType::EVM => {
-                self.execute_evm_transaction(tx).await
-            }
+            TransactionType::EVM => self.execute_evm_transaction(tx).await,
         }
     }
 
     /// Execute EVM transaction
-    async fn execute_evm_transaction(
-        &self,
-        tx: &Transaction,
-    ) -> Result<ExecutionResult, String> {
-        let evm_executor = self.evm_executor.as_ref()
+    async fn execute_evm_transaction(&self, tx: &Transaction) -> Result<ExecutionResult, String> {
+        let evm_executor = self
+            .evm_executor
+            .as_ref()
             .ok_or("EVM executor not configured")?;
 
         // Create EVM context
@@ -166,10 +157,12 @@ impl TransactionRouter {
             block_coinbase,
             block_gas_limit: self.block_gas_limit,
             tx_gas_price,
+            tx_nonce: None,
         };
 
         // Execute transaction
-        let result = evm_executor.execute(tx, &ctx)
+        let result = evm_executor
+            .execute(tx, &ctx)
             .await
             .map_err(|e| format!("EVM execution failed: {:?}", e))?;
 
@@ -180,11 +173,15 @@ impl TransactionRouter {
             error: result.error,
             gas_used: result.gas_used,
             return_data: result.output,
-            logs: result.logs.into_iter().map(|log| LogEntry {
-                address: log.address,
-                topics: log.topics,
-                data: log.data,
-            }).collect(),
+            logs: result
+                .logs
+                .into_iter()
+                .map(|log| LogEntry {
+                    address: log.address,
+                    topics: log.topics,
+                    data: log.data,
+                })
+                .collect(),
         })
     }
 
@@ -198,9 +195,9 @@ impl TransactionRouter {
 mod tests {
     use super::*;
     use crate::evm::EVMConfig;
-    use crate::state::account::{AccountStateManager, AccountStateConfig};
-    use num_bigint::BigUint;
+    use crate::state::account::{AccountStateConfig, AccountStateManager};
     use norn_common::types::TransactionBody;
+    use num_bigint::BigUint;
 
     fn create_test_evm_transaction() -> Transaction {
         Transaction {
@@ -215,9 +212,6 @@ mod tests {
                 state: Vec::new(),
                 data: Vec::new(),
                 expire: 0,
-                height: 0,
-                index: 0,
-                block_hash: Hash::default(),
                 timestamp: 0,
                 public: norn_common::types::PublicKey::default(),
                 signature: Vec::new(),
@@ -253,7 +247,10 @@ mod tests {
 
         // Setup: Give sender account sufficient balance
         let sender = Address([2u8; 20]);
-        state_manager.update_balance(&sender, BigUint::from(2_000_000_000_000_000_000u128)).await.unwrap(); // 2 ETH
+        state_manager
+            .update_balance(&sender, BigUint::from(2_000_000_000_000_000_000u128))
+            .await
+            .unwrap(); // 2 ETH
 
         let router = TransactionRouter::new(Some(evm_executor), 30_000_000);
 

@@ -2,9 +2,9 @@
 //!
 //! Run with: cargo bench --bench enhanced_features
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use norn_common::types::{Address, Transaction};
 use norn_core::txpool_enhanced::EnhancedTxPool;
-use norn_common::types::{Transaction, Address};
 
 fn bench_txpool_add(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -53,7 +53,10 @@ fn bench_txpool_package(c: &mut Criterion) {
                 struct MockChain;
                 #[async_trait::async_trait]
                 impl norn_core::txpool::ChainReader for MockChain {
-                    async fn get_transaction_by_hash(&self, _: &norn_common::types::Hash) -> Option<Transaction> {
+                    async fn get_transaction_by_hash(
+                        &self,
+                        _: &norn_common::types::Hash,
+                    ) -> Option<Transaction> {
                         None
                     }
                 }
@@ -80,12 +83,15 @@ fn bench_txpool_stats(c: &mut Criterion) {
     c.bench_function("txpool_stats_5000", |b| {
         b.iter(|| {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                black_box(pool.stats().await)
-            });
+            rt.block_on(async { black_box(pool.stats().await) });
         });
     });
 }
 
-criterion_group!(benches, bench_txpool_add, bench_txpool_package, bench_txpool_stats);
+criterion_group!(
+    benches,
+    bench_txpool_add,
+    bench_txpool_package,
+    bench_txpool_stats
+);
 criterion_main!(benches);

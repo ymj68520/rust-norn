@@ -7,9 +7,9 @@
 //! - Event emission
 //! - State root calculation
 
-use norn_core::evm::*;
-use norn_core::state::{AccountStateManager, AccountState, AccountStateConfig, AccountType};
 use norn_common::types::{Address, Hash, Transaction, TransactionBody, TransactionType};
+use norn_core::evm::*;
+use norn_core::state::{AccountState, AccountStateConfig, AccountStateManager, AccountType};
 use num_bigint::BigUint;
 use std::sync::Arc;
 
@@ -33,11 +33,9 @@ async fn test_abi_function_encoding() {
 
     let encoded = ABI::encode_function_call(
         "transfer(address,uint256)",
-        &[
-            ABIParam::new(ABIValue::Address(to)),
-            amount,
-        ],
-    ).unwrap();
+        &[ABIParam::new(ABIValue::Address(to)), amount],
+    )
+    .unwrap();
 
     // Should have 4-byte selector + parameters
     assert!(encoded.len() >= 68); // 4 + 32 + 32
@@ -59,7 +57,8 @@ async fn test_abi_event_encoding() {
             ABIParam::new(ABIValue::Address(to)),
         ],
         &[value],
-    ).unwrap();
+    )
+    .unwrap();
 
     // Should have 3 topics (signature + 2 indexed params)
     assert_eq!(topics.len(), 3);
@@ -77,7 +76,11 @@ async fn test_abi_parse_human_readable() {
     let item = HumanReadableABI::parse_item(func).unwrap();
 
     match item {
-        ABIItem::Function { name, inputs, outputs } => {
+        ABIItem::Function {
+            name,
+            inputs,
+            outputs,
+        } => {
             assert_eq!(name, "balanceOf");
             assert_eq!(inputs.len(), 1);
             assert_eq!(outputs.len(), 1);
@@ -122,8 +125,14 @@ async fn test_simple_eth_transfer() {
     let from = test_address(1);
     let to = test_address(2);
 
-    state_manager.update_balance(&from, BigUint::from(2_000_000_000_000_000_000u128)).await.unwrap();
-    state_manager.update_balance(&to, BigUint::from(0u128)).await.unwrap();
+    state_manager
+        .update_balance(&from, BigUint::from(2_000_000_000_000_000_000u128))
+        .await
+        .unwrap();
+    state_manager
+        .update_balance(&to, BigUint::from(0u128))
+        .await
+        .unwrap();
 
     // Create transfer transaction
     let tx = Transaction {
@@ -165,18 +174,25 @@ async fn test_contract_deployment() {
     let init_code = vec![0x60, 0x60, 0x60]; // Simple bytecode
 
     // Deploy contract
-    let (contract_address, result) = executor.create_contract(
-        deployer,
-        0, // nonce
-        init_code.clone(),
-        0, // value
-        100_000, // gas limit
-    ).await.unwrap();
+    let (contract_address, result) = executor
+        .create_contract(
+            deployer,
+            0, // nonce
+            init_code.clone(),
+            0,       // value
+            100_000, // gas limit
+        )
+        .await
+        .unwrap();
 
     assert!(result.success);
     assert!(executor.code_storage().is_contract(&contract_address).await);
 
-    let stored_code = executor.code_storage().get_code_by_address(&contract_address).await.unwrap();
+    let stored_code = executor
+        .code_storage()
+        .get_code_by_address(&contract_address)
+        .await
+        .unwrap();
     assert_eq!(stored_code, Some(init_code));
 }
 
@@ -190,25 +206,17 @@ async fn test_eip170_contract_size_limit() {
 
     // Contract at size limit should succeed
     let valid_code = vec![0x60; 24_576];
-    let result = executor.create_contract(
-        deployer,
-        0,
-        valid_code,
-        0,
-        100_000,
-    ).await;
+    let result = executor
+        .create_contract(deployer, 0, valid_code, 0, 100_000)
+        .await;
 
     assert!(result.is_ok());
 
     // Contract exceeding limit should fail
     let oversized_code = vec![0x60; 24_577];
-    let result = executor.create_contract(
-        deployer,
-        1,
-        oversized_code,
-        0,
-        100_000,
-    ).await;
+    let result = executor
+        .create_contract(deployer, 1, oversized_code, 0, 100_000)
+        .await;
 
     assert!(result.is_err());
 }
@@ -225,7 +233,10 @@ async fn test_event_log_emission() {
     let data = vec![0x01, 0x02, 0x03];
 
     // Emit LOG3
-    executor.emit_log3(contract, topic0, topic1, test_hash(12), data.clone()).await.unwrap();
+    executor
+        .emit_log3(contract, topic0, topic1, test_hash(12), data.clone())
+        .await
+        .unwrap();
 
     let logs = executor.get_logs().await;
 
@@ -248,7 +259,10 @@ async fn test_transaction_receipt() {
     let block_hash = test_hash(2);
 
     // Emit a log
-    executor.emit_log1(from, test_hash(10), vec![0x01]).await.unwrap();
+    executor
+        .emit_log1(from, test_hash(10), vec![0x01])
+        .await
+        .unwrap();
 
     // Create execution result
     let exec_result = EVMExecutionResult {
@@ -260,17 +274,19 @@ async fn test_transaction_receipt() {
     };
 
     // Create receipt
-    let receipt = executor.create_receipt(
-        tx_hash,
-        block_hash,
-        100,
-        0,
-        from,
-        None,
-        &exec_result,
-        None,
-        21_000,
-    ).await;
+    let receipt = executor
+        .create_receipt(
+            tx_hash,
+            block_hash,
+            100,
+            0,
+            from,
+            None,
+            &exec_result,
+            None,
+            21_000,
+        )
+        .await;
 
     assert_eq!(receipt.tx_hash, tx_hash);
     assert_eq!(receipt.block_number, 100);
@@ -279,7 +295,11 @@ async fn test_transaction_receipt() {
     assert_eq!(receipt.logs.len(), 1);
 
     // Store and retrieve receipt
-    executor.receipt_db().put_receipt(receipt.clone()).await.unwrap();
+    executor
+        .receipt_db()
+        .put_receipt(receipt.clone())
+        .await
+        .unwrap();
 
     let retrieved = executor.receipt_db().get_receipt(&tx_hash).await.unwrap();
     assert!(retrieved.is_some());
@@ -320,30 +340,36 @@ async fn test_contract_call() {
     let init_code = vec![0x60, 0x60, 0x60];
 
     // Set up deployer account with sufficient balance for gas
-    state_manager.update_balance(&deployer, BigUint::from(100_000_000_000_000u128)).await.unwrap();
+    state_manager
+        .update_balance(&deployer, BigUint::from(100_000_000_000_000u128))
+        .await
+        .unwrap();
 
-    let (contract_address, _) = executor.create_contract(
-        deployer,
-        0,
-        init_code.clone(),
-        0,
-        100_000,
-    ).await.unwrap();
+    let (contract_address, _) = executor
+        .create_contract(deployer, 0, init_code.clone(), 0, 100_000)
+        .await
+        .unwrap();
 
     // Now call the contract
     let caller = test_address(2);
     let input_data = vec![0x01, 0x02, 0x03];
 
     // Set up caller account with sufficient balance for gas and value transfer
-    state_manager.update_balance(&caller, BigUint::from(100_000_000_000_000u128)).await.unwrap();
+    state_manager
+        .update_balance(&caller, BigUint::from(100_000_000_000_000u128))
+        .await
+        .unwrap();
 
-    let result = executor.call_contract(
-        caller,
-        contract_address,
-        100, // value
-        input_data,
-        50_000, // gas limit
-    ).await.unwrap();
+    let result = executor
+        .call_contract(
+            caller,
+            contract_address,
+            100, // value
+            input_data,
+            50_000, // gas limit
+        )
+        .await
+        .unwrap();
 
     assert!(result.success);
 }
@@ -358,24 +384,19 @@ async fn test_static_call() {
     let deployer = test_address(1);
     let init_code = vec![0x60, 0x60];
 
-    let (contract_address, _) = executor.create_contract(
-        deployer,
-        0,
-        init_code,
-        0,
-        100_000,
-    ).await.unwrap();
+    let (contract_address, _) = executor
+        .create_contract(deployer, 0, init_code, 0, 100_000)
+        .await
+        .unwrap();
 
     // Static call
     let caller = test_address(2);
     let input_data = vec![0x01];
 
-    let result = executor.static_call(
-        caller,
-        contract_address,
-        input_data,
-        50_000,
-    ).await.unwrap();
+    let result = executor
+        .static_call(caller, contract_address, input_data, 50_000)
+        .await
+        .unwrap();
 
     assert!(result.success);
 }
@@ -390,24 +411,19 @@ async fn test_delegate_call() {
     let deployer = test_address(1);
     let init_code = vec![0x60, 0x60, 0x60];
 
-    let (code_address, _) = executor.create_contract(
-        deployer,
-        0,
-        init_code,
-        0,
-        100_000,
-    ).await.unwrap();
+    let (code_address, _) = executor
+        .create_contract(deployer, 0, init_code, 0, 100_000)
+        .await
+        .unwrap();
 
     // Delegate call
     let caller = test_address(2);
     let input_data = vec![0x01, 0x02, 0x03, 0x04];
 
-    let result = executor.delegate_call(
-        caller,
-        code_address,
-        input_data,
-        50_000,
-    ).await.unwrap();
+    let result = executor
+        .delegate_call(caller, code_address, input_data, 50_000)
+        .await
+        .unwrap();
 
     assert!(result.success);
 }
@@ -438,38 +454,44 @@ async fn test_receipt_filtering() {
     let block_hash = test_hash(10);
 
     // Create receipts with logs
-    let receipt1 = Receipt::new(test_hash(1), block_hash, 100, 0)
-        .with_log(ReceiptLog {
-            log_index: 0,
-            tx_hash: test_hash(1),
-            block_hash,
-            block_number: 100,
-            address: address1,
-            topics: vec![test_hash(10)],
-            data: vec![0x01],
-        });
+    let receipt1 = Receipt::new(test_hash(1), block_hash, 100, 0).with_log(ReceiptLog {
+        log_index: 0,
+        tx_hash: test_hash(1),
+        block_hash,
+        block_number: 100,
+        address: address1,
+        topics: vec![test_hash(10)],
+        data: vec![0x01],
+    });
 
-    let receipt2 = Receipt::new(test_hash(2), block_hash, 100, 1)
-        .with_log(ReceiptLog {
-            log_index: 0,
-            tx_hash: test_hash(2),
-            block_hash,
-            block_number: 100,
-            address: address2,
-            topics: vec![test_hash(11)],
-            data: vec![0x02],
-        });
+    let receipt2 = Receipt::new(test_hash(2), block_hash, 100, 1).with_log(ReceiptLog {
+        log_index: 0,
+        tx_hash: test_hash(2),
+        block_hash,
+        block_number: 100,
+        address: address2,
+        topics: vec![test_hash(11)],
+        data: vec![0x02],
+    });
 
     executor.receipt_db().put_receipt(receipt1).await.unwrap();
     executor.receipt_db().put_receipt(receipt2).await.unwrap();
 
     // Filter by address
-    let filtered = executor.receipt_db().get_receipts_by_address(&address1).await.unwrap();
+    let filtered = executor
+        .receipt_db()
+        .get_receipts_by_address(&address1)
+        .await
+        .unwrap();
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].logs[0].address, address1);
 
     // Filter by topic
-    let filtered = executor.receipt_db().get_receipts_by_topic(&test_hash(10)).await.unwrap();
+    let filtered = executor
+        .receipt_db()
+        .get_receipts_by_topic(&test_hash(10))
+        .await
+        .unwrap();
     assert_eq!(filtered.len(), 1);
 }
 
@@ -498,16 +520,25 @@ async fn test_state_root_calculation() {
         state_manager.set_account(&address, account).await.unwrap();
     }
 
-    let root = calculator.calculate_from_manager(&state_manager).await.unwrap();
+    let root = calculator
+        .calculate_from_manager(&state_manager)
+        .await
+        .unwrap();
 
     // State root should be non-zero
     assert_ne!(root, Hash::default());
 
     // Modify an account
     let address = Address([1u8; 20]);
-    state_manager.update_balance(&address, BigUint::from(9999u128)).await.unwrap();
+    state_manager
+        .update_balance(&address, BigUint::from(9999u128))
+        .await
+        .unwrap();
 
-    let root2 = calculator.calculate_from_manager(&state_manager).await.unwrap();
+    let root2 = calculator
+        .calculate_from_manager(&state_manager)
+        .await
+        .unwrap();
 
     // State root should change
     assert_ne!(root, root2);
@@ -527,9 +558,6 @@ fn create_test_transaction() -> Transaction {
             state: Vec::new(),
             data: Vec::new(),
             expire: 0,
-            height: 0,
-            index: 0,
-            block_hash: Hash::default(),
             timestamp: 0,
             public: Default::default(),
             signature: Vec::new(),

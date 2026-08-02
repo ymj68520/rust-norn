@@ -3,9 +3,9 @@
 //! Implements EIP-2930 access list support, which allows transactions to specify
 //! addresses and storage slots they will access, reducing gas costs for warm access.
 
+use norn_common::types::{AccessListItem, Address, Hash};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use norn_common::types::{Address, Hash, AccessListItem};
 
 /// Gas cost for accessing an address not in the access list (cold access)
 pub const COLD_ACCOUNT_ACCESS_COST: u64 = 2_600;
@@ -76,13 +76,15 @@ impl AccessListTracker {
         let address_access = self.access_address(address);
 
         // Check if storage key was pre-declared
-        let is_predeclared = self.predeclared_access
+        let is_predeclared = self
+            .predeclared_access
             .get(address)
             .map(|keys| keys.contains(storage_key))
             .unwrap_or(false);
 
         // Check if storage key was already accessed
-        let is_warm = self.accessed_storage
+        let is_warm = self
+            .accessed_storage
             .get(address)
             .map(|keys| keys.contains(storage_key))
             .unwrap_or(false);
@@ -166,7 +168,10 @@ impl AccessListTracker {
 
     /// Get the total number of storage keys in the access list
     pub fn storage_key_count(&self) -> usize {
-        self.predeclared_access.values().map(|keys| keys.len()).sum()
+        self.predeclared_access
+            .values()
+            .map(|keys| keys.len())
+            .sum()
     }
 
     /// Check if an address is in the access list
@@ -206,12 +211,10 @@ impl EIP2930Utils {
     }
 
     /// Estimate gas savings from using an access list
-    pub fn estimate_gas_savings(
-        cold_addresses: usize,
-        cold_storage_slots: usize,
-    ) -> u64 {
+    pub fn estimate_gas_savings(cold_addresses: usize, cold_storage_slots: usize) -> u64 {
         // Savings = (cold cost - warm cost) * number of accesses
-        let address_savings = (COLD_ACCOUNT_ACCESS_COST - WARM_ACCOUNT_ACCESS_COST) as usize * cold_addresses;
+        let address_savings =
+            (COLD_ACCOUNT_ACCESS_COST - WARM_ACCOUNT_ACCESS_COST) as usize * cold_addresses;
         let storage_savings = (COLD_SLOAD_COST - WARM_SLOAD_COST) as usize * cold_storage_slots;
 
         (address_savings + storage_savings) as u64
@@ -425,10 +428,8 @@ mod tests {
         }];
 
         let intrinsic_gas = 21_000;
-        let total_cost = EIP2930Utils::calculate_transaction_gas_cost(
-            intrinsic_gas,
-            Some(access_list),
-        );
+        let total_cost =
+            EIP2930Utils::calculate_transaction_gas_cost(intrinsic_gas, Some(access_list));
 
         let access_cost = ACCESS_LIST_ADDRESS_COST + ACCESS_LIST_STORAGE_KEY_COST;
         assert_eq!(total_cost, intrinsic_gas + access_cost);

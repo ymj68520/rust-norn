@@ -1,5 +1,5 @@
-use p256::ecdsa::{SigningKey, VerifyingKey, Signature, signature::Signer};
 use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{signature::Signer, Signature, SigningKey, VerifyingKey};
 use rand_core::OsRng;
 use thiserror::Error;
 
@@ -32,7 +32,7 @@ impl KeyPair {
     pub fn public_key(&self) -> VerifyingKey {
         *self.signing_key.verifying_key()
     }
-    
+
     pub fn public_key_hex(&self) -> String {
         hex::encode(self.public_key().to_encoded_point(true).as_bytes())
     }
@@ -43,10 +43,17 @@ impl KeyPair {
     }
 }
 
-pub fn verify(public_key_bytes: &[u8], msg: &[u8], signature_bytes: &[u8]) -> Result<bool, EcdsaError> {
-    let public_key = VerifyingKey::from_sec1_bytes(public_key_bytes).map_err(|_| EcdsaError::KeyError)?;
-    let signature = Signature::from_der(signature_bytes).or_else(|_| Signature::from_slice(signature_bytes)).map_err(|_| EcdsaError::KeyError)?;
-    
+pub fn verify(
+    public_key_bytes: &[u8],
+    msg: &[u8],
+    signature_bytes: &[u8],
+) -> Result<bool, EcdsaError> {
+    let public_key =
+        VerifyingKey::from_sec1_bytes(public_key_bytes).map_err(|_| EcdsaError::KeyError)?;
+    let signature = Signature::from_der(signature_bytes)
+        .or_else(|_| Signature::from_slice(signature_bytes))
+        .map_err(|_| EcdsaError::KeyError)?;
+
     Ok(public_key.verify(msg, &signature).is_ok())
 }
 
@@ -59,7 +66,7 @@ mod tests {
         let pair = KeyPair::random();
         let msg = b"hello world";
         let sig = pair.sign(msg);
-        
+
         let pk_bytes = pair.public_key().to_encoded_point(true).as_bytes().to_vec();
         assert!(verify(&pk_bytes, msg, &sig).unwrap());
     }

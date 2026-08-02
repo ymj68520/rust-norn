@@ -170,7 +170,9 @@ where
             let norn_err = e.into();
             match norn_err {
                 NornError::Internal(msg) => NornError::Internal(format!("{}: {}", context, msg)),
-                NornError::Database(db_err) => NornError::Database(DatabaseError::TransactionFailed(format!("{}: {}", context, db_err))),
+                NornError::Database(db_err) => NornError::Database(
+                    DatabaseError::TransactionFailed(format!("{}: {}", context, db_err)),
+                ),
                 _ => NornError::Internal(format!("{}: {}", context, norn_err)),
             }
         })

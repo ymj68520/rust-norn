@@ -1,5 +1,5 @@
 //! Consensus Safety Store & Anti-Equivocation Persistent Integration
-//! 
+//!
 //! Ensures that before broadcasting any Prevote or Precommit vote, the vote
 //! is atomically checked for double-signing conflicts, committed to disk
 //! with `sync_all()` and `flush()`, and signed fail-closed.
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use thiserror::Error;
@@ -38,7 +38,7 @@ pub enum SafetyError {
     SigningError(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoteSignRequest {
     pub protocol_version: ProtocolVersion,
     pub chain_id: ChainId,
@@ -63,6 +63,21 @@ pub struct SafetyRecord {
     pub validator_id: ValidatorId,
     pub block_id: Option<BlockId>,
     pub sign_bytes_hash: [u8; 32],
+    /// `None` is a durable signing intent. `Some` is the completion/ack and
+    /// contains the exact signature that may be replayed after restart.
+    #[serde(default)]
+    pub signature: Option<Vec<u8>>,
+}
+
+fn decode_signature(signature: &Option<Vec<u8>>) -> Result<Option<[u8; 64]>, SafetyError> {
+    let Some(bytes) = signature else {
+        return Ok(None);
+    };
+    let array = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| SafetyError::SerializationError("invalid WAL signature length".into()))?;
+    Ok(Some(array))
 }
 
 pub trait ConsensusSigner: Send + Sync {
@@ -75,13 +90,17 @@ pub trait ConsensusSafetyStore: Send + Sync {
         request: VoteSignRequest,
         signer: &dyn ConsensusSigner,
     ) -> Result<SignedVote, SafetyError>;
+
+    /// Return completed votes whose broadcast may have been interrupted by a
+    /// process crash or a transient network failure.
+    fn recover_signed_votes(&self) -> Vec<SignedVote>;
 }
 
 type SafetyIndexKey = (ChainId, ValidatorId, u64, u64, u32, VoteStep);
 
 /// In-memory ConsensusSafetyStore
 pub struct MemorySafetyStore {
-    state: Mutex<HashMap<SafetyIndexKey, (Option<BlockId>, [u8; 32])>>,
+    state: Mutex<HashMap<SafetyIndexKey, SafetyRecord>>,
 }
 
 impl MemorySafetyStore {
@@ -136,32 +155,96 @@ impl ConsensusSafetyStore for MemorySafetyStore {
         hasher.update(&sign_bytes);
         let sign_bytes_hash: [u8; 32] = hasher.finalize().into();
 
-        if let Some((existing_block_id, existing_hash)) = guard.get(&key) {
-            if *existing_hash != sign_bytes_hash {
+        if let Some(existing) = guard.get(&key) {
+            if existing.sign_bytes_hash != sign_bytes_hash {
                 warn!(
                     "EQUIVOCATION ATTEMPT REJECTED: height={}, round={}, step={:?}, attempted={:?}, existing={:?}",
-                    request.height, request.round, request.step, request.block_id, existing_block_id
+                    request.height, request.round, request.step, request.block_id, existing.block_id
                 );
                 return Err(SafetyError::EquivocationDetected {
                     height: request.height,
                     round: request.round,
                     step: request.step,
                     attempted: request.block_id,
-                    existing: *existing_block_id,
+                    existing: existing.block_id,
                 });
             }
         }
 
-        guard.insert(key, (request.block_id.clone(), sign_bytes_hash));
+        if let Some(existing) = guard.get(&key) {
+            if existing.sign_bytes_hash == sign_bytes_hash {
+                if let Some(signature) = decode_signature(&existing.signature)? {
+                    return Ok(SignedVote {
+                        protocol_version: request.protocol_version,
+                        chain_id: request.chain_id,
+                        epoch: request.epoch,
+                        height: request.height,
+                        round: request.round,
+                        step: request.step,
+                        block_id: request.block_id,
+                        stake_snapshot_hash: request.stake_snapshot_hash,
+                        validator: request.validator_id,
+                        signature,
+                    });
+                }
+            }
+        }
+
+        guard.insert(
+            key,
+            SafetyRecord {
+                protocol_version: request.protocol_version.clone(),
+                chain_id: request.chain_id.clone(),
+                epoch: request.epoch,
+                height: request.height,
+                round: request.round,
+                step: request.step,
+                stake_snapshot_hash: request.stake_snapshot_hash.clone(),
+                validator_id: request.validator_id,
+                block_id: request.block_id.clone(),
+                sign_bytes_hash,
+                signature: None,
+            },
+        );
 
         let signature = signer
             .sign_canonical_bytes(&sign_bytes)
             .map_err(|e| SafetyError::SigningError(e.to_string()))?;
 
-        Ok(SignedVote {
+        let signed_vote = SignedVote {
             signature,
             ..unsigned_vote
-        })
+        };
+        if let Some(record) = guard.get_mut(&key) {
+            record.signature = Some(signed_vote.signature.to_vec());
+        }
+        Ok(signed_vote)
+    }
+
+    fn recover_signed_votes(&self) -> Vec<SignedVote> {
+        let Ok(guard) = self.state.lock() else {
+            return Vec::new();
+        };
+        guard
+            .values()
+            .filter_map(|record| {
+                decode_signature(&record.signature)
+                    .ok()
+                    .flatten()
+                    .map(|signature| SignedVote {
+                        protocol_version: record.protocol_version,
+                        chain_id: record.chain_id,
+                        epoch: record.epoch,
+                        height: record.height,
+                        round: record.round,
+                        step: record.step,
+                        block_id: record.block_id,
+                        stake_snapshot_hash: record.stake_snapshot_hash,
+                        validator: record.validator_id,
+                        signature,
+                    })
+            })
+            .collect()
     }
 }
 
@@ -169,7 +252,7 @@ impl ConsensusSafetyStore for MemorySafetyStore {
 pub struct PersistentSafetyStore {
     #[allow(dead_code)]
     file_path: PathBuf,
-    state: Mutex<(HashMap<SafetyIndexKey, (Option<BlockId>, [u8; 32])>, BufWriter<File>)>,
+    state: Mutex<(HashMap<SafetyIndexKey, SafetyRecord>, BufWriter<File>)>,
 }
 
 impl PersistentSafetyStore {
@@ -180,19 +263,43 @@ impl PersistentSafetyStore {
         }
 
         let mut map = HashMap::new();
+        let mut valid_wal_len = 0u64;
 
         if file_path.exists() {
             let f = File::open(&file_path)?;
             let mut reader = BufReader::new(f);
             let mut len_bytes = [0u8; 4];
-            while reader.read_exact(&mut len_bytes).is_ok() {
+            loop {
+                let frame_start = reader.stream_position()?;
+                match reader.read_exact(&mut len_bytes) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => return Err(err.into()),
+                }
                 let len = u32::from_le_bytes(len_bytes) as usize;
                 if len > 1024 * 1024 {
-                    return Err(anyhow::anyhow!("Safety WAL record exceeds max length threshold"));
+                    return Err(anyhow::anyhow!(
+                        "Safety WAL record exceeds max length threshold"
+                    ));
                 }
                 let mut buf = vec![0u8; len];
-                reader.read_exact(&mut buf)?;
+                match reader.read_exact(&mut buf) {
+                    Ok(()) => {}
+                    // A crash may leave a torn final frame. Earlier synced
+                    // frames remain authoritative and can be replayed.
+                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => return Err(err.into()),
+                }
                 if let Ok(rec) = bincode::deserialize::<SafetyRecord>(&buf) {
+                    if rec
+                        .signature
+                        .as_ref()
+                        .is_some_and(|signature| signature.len() != 64)
+                    {
+                        return Err(anyhow::anyhow!(
+                            "Safety WAL completion has invalid signature length"
+                        ));
+                    }
                     let key: SafetyIndexKey = (
                         rec.chain_id,
                         rec.validator_id,
@@ -201,18 +308,29 @@ impl PersistentSafetyStore {
                         rec.round,
                         rec.step,
                     );
-                    map.insert(key, (rec.block_id, rec.sign_bytes_hash));
+                    map.insert(key, rec);
                 } else {
                     return Err(anyhow::anyhow!("Corrupted Safety WAL record encountered"));
                 }
+                valid_wal_len = reader.stream_position()?.max(frame_start);
             }
-            info!("Recovered {} consensus safety lock records from {:?}", map.len(), file_path);
+            info!(
+                "Recovered {} consensus safety lock records from {:?}",
+                map.len(),
+                file_path
+            );
         }
 
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .read(true)
+            .write(true)
             .open(&file_path)?;
+        if file.metadata()?.len() > valid_wal_len {
+            file.set_len(valid_wal_len)?;
+            file.sync_all()?;
+        }
+        file.seek(SeekFrom::End(0))?;
         let writer = BufWriter::new(file);
 
         Ok(Self {
@@ -261,18 +379,32 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
         hasher.update(&sign_bytes);
         let sign_bytes_hash: [u8; 32] = hasher.finalize().into();
 
-        if let Some((existing_block_id, existing_hash)) = map.get(&key) {
-            if *existing_hash != sign_bytes_hash {
+        if let Some(existing) = map.get(&key) {
+            if existing.sign_bytes_hash != sign_bytes_hash {
                 warn!(
                     "PERSISTENT EQUIVOCATION ATTEMPT REJECTED: height={}, round={}, step={:?}, attempted={:?}, existing={:?}",
-                    request.height, request.round, request.step, request.block_id, existing_block_id
+                    request.height, request.round, request.step, request.block_id, existing.block_id
                 );
                 return Err(SafetyError::EquivocationDetected {
                     height: request.height,
                     round: request.round,
                     step: request.step,
                     attempted: request.block_id,
-                    existing: *existing_block_id,
+                    existing: existing.block_id,
+                });
+            }
+            if let Some(signature) = decode_signature(&existing.signature)? {
+                return Ok(SignedVote {
+                    protocol_version: request.protocol_version,
+                    chain_id: request.chain_id,
+                    epoch: request.epoch,
+                    height: request.height,
+                    round: request.round,
+                    step: request.step,
+                    block_id: request.block_id,
+                    stake_snapshot_hash: request.stake_snapshot_hash,
+                    validator: request.validator_id,
+                    signature,
                 });
             }
         }
@@ -288,6 +420,7 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
             validator_id: request.validator_id,
             block_id: request.block_id.clone(),
             sign_bytes_hash,
+            signature: None,
         };
 
         let encoded = bincode::serialize(&record)
@@ -308,16 +441,69 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
             .sync_all()
             .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
 
-        map.insert(key, (request.block_id.clone(), sign_bytes_hash));
+        map.insert(key, record);
 
         let signature = signer
             .sign_canonical_bytes(&sign_bytes)
             .map_err(|e| SafetyError::SigningError(e.to_string()))?;
 
-        Ok(SignedVote {
+        let signed_vote = SignedVote {
             signature,
             ..unsigned_vote
-        })
+        };
+
+        let completion = SafetyRecord {
+            protocol_version: request.protocol_version,
+            chain_id: request.chain_id,
+            epoch: request.epoch,
+            height: request.height,
+            round: request.round,
+            step: request.step,
+            stake_snapshot_hash: request.stake_snapshot_hash,
+            validator_id: request.validator_id,
+            block_id: request.block_id,
+            sign_bytes_hash,
+            signature: Some(signed_vote.signature.to_vec()),
+        };
+        let completion_encoded = bincode::serialize(&completion)
+            .map_err(|e| SafetyError::SerializationError(e.to_string()))?;
+        let completion_len = completion_encoded.len() as u32;
+        writer
+            .write_all(&completion_len.to_le_bytes())
+            .and_then(|_| writer.write_all(&completion_encoded))
+            .and_then(|_| writer.flush())
+            .and_then(|_| writer.get_ref().sync_all())
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
+        map.insert(key, completion);
+
+        Ok(signed_vote)
+    }
+
+    fn recover_signed_votes(&self) -> Vec<SignedVote> {
+        let Ok(guard) = self.state.lock() else {
+            return Vec::new();
+        };
+        guard
+            .0
+            .values()
+            .filter_map(|record| {
+                decode_signature(&record.signature)
+                    .ok()
+                    .flatten()
+                    .map(|signature| SignedVote {
+                        protocol_version: record.protocol_version,
+                        chain_id: record.chain_id,
+                        epoch: record.epoch,
+                        height: record.height,
+                        round: record.round,
+                        step: record.step,
+                        block_id: record.block_id,
+                        stake_snapshot_hash: record.stake_snapshot_hash,
+                        validator: record.validator_id,
+                        signature,
+                    })
+            })
+            .collect()
     }
 }
 
@@ -330,6 +516,13 @@ mod tests {
     impl ConsensusSigner for DummySigner {
         fn sign_canonical_bytes(&self, _bytes: &[u8]) -> Result<[u8; 64]> {
             Ok([7u8; 64])
+        }
+    }
+
+    struct FailingSigner;
+    impl ConsensusSigner for FailingSigner {
+        fn sign_canonical_bytes(&self, _bytes: &[u8]) -> Result<[u8; 64]> {
+            Err(anyhow::anyhow!("injected signer failure"))
         }
     }
 
@@ -355,10 +548,30 @@ mod tests {
 
         let v1 = store.sign_vote_once(req1.clone(), &signer);
         assert!(v1.is_ok());
+        let persisted = store.recover_signed_votes();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0], v1.as_ref().unwrap().clone());
 
         // Reopen store from disk to verify crash recovery
         drop(store);
+        // Simulate a crash while writing the next frame length.
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&[1u8, 2u8])
+            .unwrap();
         let recovered_store = PersistentSafetyStore::open(&path).unwrap();
+        assert_eq!(recovered_store.recover_signed_votes(), persisted);
+
+        // Replaying the same request returns the exact durable signature and
+        // does not invoke the signer again.
+        assert_eq!(
+            recovered_store
+                .sign_vote_once(req1.clone(), &FailingSigner)
+                .unwrap(),
+            persisted[0]
+        );
 
         let req_conflicting = VoteSignRequest {
             protocol_version: ProtocolVersion(2),
@@ -372,7 +585,42 @@ mod tests {
             validator_id: ValidatorId([0u8; 32]),
         };
 
-        let err = recovered_store.sign_vote_once(req_conflicting, &signer).unwrap_err();
+        let err = recovered_store
+            .sign_vote_once(req_conflicting, &signer)
+            .unwrap_err();
         assert!(matches!(err, SafetyError::EquivocationDetected { .. }));
+    }
+
+    #[test]
+    fn signer_failure_leaves_intent_without_a_recoverable_vote() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("safety-intent.log");
+        let store = PersistentSafetyStore::open(&path).unwrap();
+        let request = VoteSignRequest {
+            protocol_version: ProtocolVersion(2),
+            chain_id: ChainId(norn_common::types::Hash([4u8; 32])),
+            epoch: 1,
+            height: 11,
+            round: 0,
+            step: VoteStep::Precommit,
+            block_id: Some(BlockId(norn_common::types::Hash([4u8; 32]))),
+            stake_snapshot_hash: StakeSnapshotHash([4u8; 32]),
+            validator_id: ValidatorId([4u8; 32]),
+        };
+
+        assert!(matches!(
+            store.sign_vote_once(request.clone(), &FailingSigner),
+            Err(SafetyError::SigningError(_))
+        ));
+        assert!(store.recover_signed_votes().is_empty());
+
+        let conflicting = VoteSignRequest {
+            block_id: Some(BlockId(norn_common::types::Hash([5u8; 32]))),
+            ..request
+        };
+        assert!(matches!(
+            store.sign_vote_once(conflicting, &DummySigner),
+            Err(SafetyError::EquivocationDetected { .. })
+        ));
     }
 }

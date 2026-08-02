@@ -3,21 +3,33 @@
 use super::safety_store::{ConsensusSafetyStore, ConsensusSigner};
 use super::state_machine::TendermintStateMachine;
 use super::types::ConsensusConfig;
+use crate::evm::CodeStorage;
+use crate::execution::{
+    calculate_v2_execution_data_hash, execute_v2_block, V2BlockExecution, V2ExecutionContext,
+};
+use crate::state::AccountStateManager;
+use k256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+use norn_common::chain_context::ChainContext;
 use norn_common::consensus_types::{
-    CommitCertificate, FinalizedBlock, Proposal, SignedVote, StakeSnapshot, VoteStep,
+    CommitCertificate, FinalizedBlock, FinalizedBlockV2, FinalizedConsensusState, Proposal,
+    SignedVote, StakeSnapshot, VoteStep,
 };
 use norn_common::error::{NornError, Result};
-use norn_common::types::{Block, BlockId, Hash, ValidatorId};
-use k256::ecdsa::{VerifyingKey, Signature, signature::Verifier};
+use norn_common::genesis::ProtocolResourceLimits;
+use norn_common::types::{Block, BlockHeader, BlockId, BlockV2, Hash, ValidatorId};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 pub struct PoVFEngine {
     pub state_machine: Arc<RwLock<TendermintStateMachine>>,
     pub candidate_blocks: Arc<RwLock<HashMap<(u64, BlockId), Block>>>,
+    pub candidate_blocks_v2: Arc<RwLock<HashMap<(u64, BlockId), BlockV2>>>,
+    pub candidate_proposals_v2: Arc<RwLock<HashMap<(u64, BlockId), Proposal>>>,
+    pub candidate_randomness_v2: Arc<RwLock<HashMap<(u64, BlockId), Hash>>>,
     pub finalized_blocks: Arc<RwLock<HashMap<Hash, FinalizedBlock>>>,
+    pub finalized_blocks_v2: Arc<RwLock<HashMap<Hash, FinalizedBlockV2>>>,
     pub current_height: Arc<RwLock<u64>>,
 }
 
@@ -54,7 +66,11 @@ impl PoVFEngine {
         Self {
             state_machine: Arc::new(RwLock::new(state_machine)),
             candidate_blocks: Arc::new(RwLock::new(HashMap::new())),
+            candidate_blocks_v2: Arc::new(RwLock::new(HashMap::new())),
+            candidate_proposals_v2: Arc::new(RwLock::new(HashMap::new())),
+            candidate_randomness_v2: Arc::new(RwLock::new(HashMap::new())),
             finalized_blocks: Arc::new(RwLock::new(HashMap::new())),
+            finalized_blocks_v2: Arc::new(RwLock::new(HashMap::new())),
             current_height: Arc::new(RwLock::new(1)),
         }
     }
@@ -82,6 +98,163 @@ impl PoVFEngine {
         Ok(Some(vote))
     }
 
+    pub async fn handle_proposal_v2(
+        &self,
+        proposal: Proposal,
+        block: BlockV2,
+        signer: &dyn ConsensusSigner,
+        state_manager: &AccountStateManager,
+        limits: &ProtocolResourceLimits,
+        context: &ChainContext,
+        code_storage: &Arc<CodeStorage>,
+    ) -> Result<Option<SignedVote>> {
+        if block.header.block_hash != block.header.calculate_hash()? {
+            return Err(NornError::ConsensusError(
+                "V2 proposal header hash mismatch".into(),
+            ));
+        }
+        if block.header.merkle_root != BlockV2::calculate_merkle_root(&block.transactions)? {
+            return Err(NornError::ConsensusError(
+                "V2 proposal Merkle root mismatch".into(),
+            ));
+        }
+        block.validate_structure(context, limits)?;
+        let evm_context = V2ExecutionContext {
+            block_number: block.header.height.max(0) as u64,
+            block_timestamp: block.header.timestamp.max(0) as u64,
+            block_coinbase: norn_common::types::Address(
+                block.header.proposer.0[..20]
+                    .try_into()
+                    .map_err(|_| NornError::ConsensusError("invalid proposer ID".into()))?,
+            ),
+            block_gas_limit: limits.max_block_gas,
+            code_storage: code_storage.clone(),
+        };
+        let execution = execute_v2_block(
+            state_manager,
+            &block.transactions,
+            limits,
+            Some(&evm_context),
+        )
+        .await
+        .map_err(|e| NornError::ConsensusError(format!("V2 execution rejected: {e}")))?;
+        let projected_state_root = execution
+            .overlay
+            .projected_state_root(state_manager)
+            .await
+            .map_err(|e| NornError::ConsensusError(format!("V2 state projection failed: {e}")))?;
+        if projected_state_root != block.header.state_root {
+            return Err(NornError::ConsensusError(
+                "V2 proposal state_root does not match deterministic execution".into(),
+            ));
+        }
+        if calculate_v2_execution_data_hash(&execution.results) != block.header.consensus_data_hash
+        {
+            return Err(NornError::ConsensusError(
+                "V2 proposal execution commitment does not match deterministic execution".into(),
+            ));
+        }
+        let mut sm = self.state_machine.write().await;
+        let (vote, verified_vrf) = sm
+            .handle_proposal_v2_with_vrf(&proposal, &block, signer)
+            .map_err(|e| NornError::ConsensusError(e.to_string()))?;
+
+        let calculated_bid = BlockId(block.header.block_hash);
+        if let Some(randomness) = verified_vrf.map(|output| Hash(output.randomness)) {
+            let key = (proposal.height, calculated_bid);
+            let mut proposals = self.candidate_proposals_v2.write().await;
+            if let Some(existing) = proposals.get(&key) {
+                if existing != &proposal {
+                    return Err(NornError::ConsensusError(
+                        "conflicting V2 proposals for the same block ID".into(),
+                    ));
+                }
+            } else {
+                proposals.insert(key, proposal.clone());
+            }
+            self.candidate_randomness_v2
+                .write()
+                .await
+                .insert(key, randomness);
+        }
+        {
+            let mut candidates = self.candidate_blocks_v2.write().await;
+            if candidates.len() >= 32 {
+                candidates.retain(|(h, _), _| *h >= proposal.height);
+                self.candidate_proposals_v2
+                    .write()
+                    .await
+                    .retain(|(h, _), _| *h >= proposal.height);
+                self.candidate_randomness_v2
+                    .write()
+                    .await
+                    .retain(|(h, _), _| *h >= proposal.height);
+            }
+            candidates.insert((proposal.height, calculated_bid), block);
+        }
+        Ok(Some(vote))
+    }
+
+    /// Re-execute a finalized candidate against the current finalized parent
+    /// without mutating live state. The returned overlay is the exact write
+    /// set that the finality driver persists and applies after the DB batch is
+    /// durable.
+    pub async fn execute_v2_block_for_finality(
+        &self,
+        block: &BlockV2,
+        state_manager: &AccountStateManager,
+        limits: &ProtocolResourceLimits,
+        context: &ChainContext,
+        code_storage: &Arc<CodeStorage>,
+    ) -> Result<V2BlockExecution> {
+        if block.header.block_hash != block.header.calculate_hash()? {
+            return Err(NornError::ConsensusError(
+                "V2 finality header hash mismatch".into(),
+            ));
+        }
+        if block.header.merkle_root != BlockV2::calculate_merkle_root(&block.transactions)? {
+            return Err(NornError::ConsensusError(
+                "V2 finality Merkle root mismatch".into(),
+            ));
+        }
+        block.validate_structure(context, limits)?;
+        let evm_context = V2ExecutionContext {
+            block_number: block.header.height.max(0) as u64,
+            block_timestamp: block.header.timestamp.max(0) as u64,
+            block_coinbase: norn_common::types::Address(
+                block.header.proposer.0[..20]
+                    .try_into()
+                    .map_err(|_| NornError::ConsensusError("invalid proposer ID".into()))?,
+            ),
+            block_gas_limit: limits.max_block_gas,
+            code_storage: code_storage.clone(),
+        };
+        let execution = execute_v2_block(
+            state_manager,
+            &block.transactions,
+            limits,
+            Some(&evm_context),
+        )
+        .await
+        .map_err(|e| NornError::ConsensusError(format!("V2 finality execution rejected: {e}")))?;
+        let projected_state_root = execution
+            .overlay
+            .projected_state_root(state_manager)
+            .await
+            .map_err(|e| {
+                NornError::ConsensusError(format!("V2 finality state projection failed: {e}"))
+            })?;
+        if projected_state_root != block.header.state_root
+            || calculate_v2_execution_data_hash(&execution.results)
+                != block.header.consensus_data_hash
+        {
+            return Err(NornError::ConsensusError(
+                "V2 finality execution commitment mismatch".into(),
+            ));
+        }
+        Ok(execution)
+    }
+
     pub async fn handle_vote(
         &self,
         vote: SignedVote,
@@ -103,21 +276,57 @@ impl PoVFEngine {
     }
 
     /// Verify a CommitCertificate before applying block
-    pub fn verify_commit_certificate(&self, block: &Block, cert: &CommitCertificate, snapshot: &StakeSnapshot) -> Result<()> {
-        let calculated_bid = BlockId(block.header.block_hash);
+    pub fn verify_commit_certificate(
+        &self,
+        block: &Block,
+        cert: &CommitCertificate,
+        snapshot: &StakeSnapshot,
+    ) -> Result<()> {
+        self.verify_commit_certificate_header(&block.header, cert, snapshot)
+    }
+
+    pub fn verify_commit_certificate_v2(
+        &self,
+        block: &BlockV2,
+        cert: &CommitCertificate,
+        snapshot: &StakeSnapshot,
+    ) -> Result<()> {
+        self.verify_commit_certificate_header(&block.header, cert, snapshot)
+    }
+
+    fn verify_commit_certificate_header(
+        &self,
+        header: &BlockHeader,
+        cert: &CommitCertificate,
+        snapshot: &StakeSnapshot,
+    ) -> Result<()> {
+        let calculated_bid = BlockId(header.block_hash);
         if cert.block_id != calculated_bid {
-            return Err(NornError::ConsensusError("CommitCertificate block_id mismatch".into()));
+            return Err(NornError::ConsensusError(
+                "CommitCertificate block_id mismatch".into(),
+            ));
         }
-        if cert.height != block.header.height as u64 {
-            return Err(NornError::ConsensusError("CommitCertificate height mismatch".into()));
+        if cert.height != header.height as u64 {
+            return Err(NornError::ConsensusError(
+                "CommitCertificate height mismatch".into(),
+            ));
         }
         if cert.stake_snapshot_hash != snapshot.snapshot_hash {
-            return Err(NornError::ConsensusError("CommitCertificate snapshot hash mismatch".into()));
+            return Err(NornError::ConsensusError(
+                "CommitCertificate snapshot hash mismatch".into(),
+            ));
         }
 
         let total_power = snapshot.total_voting_power()?;
         if total_power == 0 {
-            return Err(NornError::ConsensusError("Empty voting power in snapshot".into()));
+            return Err(NornError::ConsensusError(
+                "Empty voting power in snapshot".into(),
+            ));
+        }
+        if cert.precommits.len() > snapshot.validators.len() {
+            return Err(NornError::ConsensusError(
+                "CommitCertificate has more votes than the stake snapshot".into(),
+            ));
         }
 
         let mut accumulated_power: u128 = 0;
@@ -125,41 +334,70 @@ impl PoVFEngine {
 
         for precommit in &cert.precommits {
             if precommit.step != VoteStep::Precommit {
-                return Err(NornError::ConsensusError("Non-precommit vote in CommitCertificate".into()));
+                return Err(NornError::ConsensusError(
+                    "Non-precommit vote in CommitCertificate".into(),
+                ));
             }
             if precommit.block_id != Some(cert.block_id) {
-                return Err(NornError::ConsensusError("Precommit block_id mismatch in CommitCertificate".into()));
+                return Err(NornError::ConsensusError(
+                    "Precommit block_id mismatch in CommitCertificate".into(),
+                ));
             }
             if precommit.height != cert.height || precommit.round != cert.round {
-                return Err(NornError::ConsensusError("Precommit height/round mismatch in CommitCertificate".into()));
+                return Err(NornError::ConsensusError(
+                    "Precommit height/round mismatch in CommitCertificate".into(),
+                ));
             }
 
             if !seen_validators.insert(precommit.validator) {
-                return Err(NornError::ConsensusError("Duplicate validator precommit in CommitCertificate".into()));
+                return Err(NornError::ConsensusError(
+                    "Duplicate validator precommit in CommitCertificate".into(),
+                ));
             }
 
-            let record = snapshot.validators.get(&precommit.validator)
-                .ok_or_else(|| NornError::ConsensusError("Unknown validator precommit in CommitCertificate".into()))?;
+            let record = snapshot
+                .validators
+                .get(&precommit.validator)
+                .ok_or_else(|| {
+                    NornError::ConsensusError(
+                        "Unknown validator precommit in CommitCertificate".into(),
+                    )
+                })?;
 
             if record.consensus_public_key.0 == [0u8; 33] || precommit.signature == [0u8; 64] {
-                return Err(NornError::ConsensusError("Zero key or zero signature in CommitCertificate".into()));
+                return Err(NornError::ConsensusError(
+                    "Zero key or zero signature in CommitCertificate".into(),
+                ));
             }
 
             let verifying_key = VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0)
-                .map_err(|_| NornError::ConsensusError("Malformed SEC1 public key in CommitCertificate".into()))?;
-            let sig = Signature::from_slice(&precommit.signature)
-                .map_err(|_| NornError::ConsensusError("Malformed precommit signature in CommitCertificate".into()))?;
+                .map_err(|_| {
+                    NornError::ConsensusError(
+                        "Malformed SEC1 public key in CommitCertificate".into(),
+                    )
+                })?;
+            let sig = Signature::from_slice(&precommit.signature).map_err(|_| {
+                NornError::ConsensusError(
+                    "Malformed precommit signature in CommitCertificate".into(),
+                )
+            })?;
 
             if sig.normalize_s().is_some() {
-                return Err(NornError::ConsensusError("Non-canonical high-S signature in CommitCertificate".into()));
+                return Err(NornError::ConsensusError(
+                    "Non-canonical high-S signature in CommitCertificate".into(),
+                ));
             }
 
             let msg_bytes = precommit.canonical_bytes();
-            verifying_key.verify(&msg_bytes, &sig)
-                .map_err(|_| NornError::ConsensusError("Invalid precommit signature in CommitCertificate".into()))?;
+            verifying_key.verify(&msg_bytes, &sig).map_err(|_| {
+                NornError::ConsensusError("Invalid precommit signature in CommitCertificate".into())
+            })?;
 
-            accumulated_power = accumulated_power.checked_add(record.voting_power as u128)
-                .ok_or_else(|| NornError::ConsensusError("Voting power overflow in CommitCertificate".into()))?;
+            accumulated_power = accumulated_power
+                .checked_add(record.voting_power as u128)
+                .ok_or_else(|| {
+                    NornError::ConsensusError("Voting power overflow in CommitCertificate".into())
+                })?;
         }
 
         let has_quorum = accumulated_power
@@ -169,7 +407,9 @@ impl PoVFEngine {
             .unwrap_or(false);
 
         if !has_quorum {
-            return Err(NornError::ConsensusError("CommitCertificate fails > 2/3 voting power quorum".into()));
+            return Err(NornError::ConsensusError(
+                "CommitCertificate fails > 2/3 voting power quorum".into(),
+            ));
         }
 
         Ok(())
@@ -178,9 +418,15 @@ impl PoVFEngine {
     pub async fn finalize_block(&self, commit: CommitCertificate) -> Result<FinalizedBlock> {
         let block = {
             let candidates = self.candidate_blocks.read().await;
-            candidates.get(&(commit.height, commit.block_id))
+            candidates
+                .get(&(commit.height, commit.block_id))
                 .cloned()
-                .ok_or_else(|| NornError::ConsensusError(format!("Candidate block missing for height {} block {:?}", commit.height, commit.block_id)))?
+                .ok_or_else(|| {
+                    NornError::ConsensusError(format!(
+                        "Candidate block missing for height {} block {:?}",
+                        commit.height, commit.block_id
+                    ))
+                })?
         };
 
         let snapshot = {
@@ -191,7 +437,10 @@ impl PoVFEngine {
         self.verify_commit_certificate(&block, &commit, &snapshot)?;
 
         let hash = block.header.block_hash;
-        info!("Finalizing block {:?} at height {}", hash, block.header.height);
+        info!(
+            "Finalizing block {:?} at height {}",
+            hash, block.header.height
+        );
 
         let finalized = FinalizedBlock {
             block: block.clone(),
@@ -214,6 +463,136 @@ impl PoVFEngine {
         }
 
         Ok(finalized)
+    }
+
+    /// Finalize a V2 candidate after the commit certificate is verified. This
+    /// only records the finalized payload; applying its overlay to durable
+    /// state belongs to the atomic finality/storage stage.
+    pub async fn finalize_block_v2(&self, commit: CommitCertificate) -> Result<FinalizedBlockV2> {
+        let finalized_hash = commit.block_id.0;
+        if let Some(existing) = self.finalized_blocks_v2.read().await.get(&finalized_hash) {
+            if existing.commit == commit {
+                return Ok(existing.clone());
+            }
+            return Err(NornError::ConsensusError(
+                "V2 block was already finalized with a different certificate".into(),
+            ));
+        }
+
+        let block = {
+            let candidates = self.candidate_blocks_v2.read().await;
+            candidates
+                .get(&(commit.height, commit.block_id))
+                .cloned()
+                .ok_or_else(|| {
+                    NornError::ConsensusError(format!(
+                        "V2 candidate block missing for height {} block {:?}",
+                        commit.height, commit.block_id
+                    ))
+                })?
+        };
+
+        let _proposal = self
+            .candidate_proposals_v2
+            .read()
+            .await
+            .get(&(commit.height, commit.block_id))
+            .cloned()
+            .ok_or_else(|| {
+                NornError::ConsensusError(
+                    "V2 finalized block is missing its verified proposal VRF".into(),
+                )
+            })?;
+
+        let snapshot = {
+            let sm = self.state_machine.read().await;
+            sm.snapshot.clone()
+        };
+        let max_certificate_members = self
+            .state_machine
+            .read()
+            .await
+            .config
+            .max_certificate_members as usize;
+        if commit.precommits.len() > max_certificate_members {
+            return Err(NornError::ConsensusError(
+                "CommitCertificate exceeds Genesis certificate member limit".into(),
+            ));
+        }
+        self.verify_commit_certificate_v2(&block, &commit, &snapshot)?;
+
+        let next_randomness = self
+            .candidate_randomness_v2
+            .read()
+            .await
+            .get(&(commit.height, commit.block_id))
+            .copied()
+            .ok_or_else(|| {
+                NornError::ConsensusError(
+                    "V2 finalized block is missing its derived proposal randomness".into(),
+                )
+            })?;
+        let consensus_state = FinalizedConsensusState::from_v2(&block, &commit, next_randomness)?;
+
+        let hash = block.header.block_hash;
+        let finalized = FinalizedBlockV2 {
+            block,
+            commit,
+            consensus_state,
+        };
+        {
+            let mut finalized_blocks = self.finalized_blocks_v2.write().await;
+            if let Some(existing) = finalized_blocks.get(&hash) {
+                if existing.commit == finalized.commit {
+                    return Ok(existing.clone());
+                }
+                return Err(NornError::ConsensusError(
+                    "V2 block was already finalized concurrently with a different certificate"
+                        .into(),
+                ));
+            }
+            finalized_blocks.insert(hash, finalized.clone());
+        }
+        self.candidate_blocks_v2
+            .write()
+            .await
+            .retain(|(height, _), _| *height >= finalized.block.header.height as u64);
+        self.candidate_proposals_v2
+            .write()
+            .await
+            .retain(|(height, _), _| *height >= finalized.block.header.height as u64);
+        self.candidate_randomness_v2
+            .write()
+            .await
+            .retain(|(height, _), _| *height >= finalized.block.header.height as u64);
+        Ok(finalized)
+    }
+
+    /// Apply the finalized consensus transition after the finality/storage
+    /// driver has durably committed the block.  This is intentionally
+    /// separate from certificate verification so a failed durable commit
+    /// cannot advance the in-memory height or randomness.
+    pub async fn advance_after_finalized_v2(
+        &self,
+        finalized: &FinalizedBlockV2,
+        next_snapshot: StakeSnapshot,
+    ) -> Result<()> {
+        let mut sm = self.state_machine.write().await;
+        if sm.height == finalized.consensus_state.height.saturating_add(1) {
+            if sm.parent_randomness != finalized.consensus_state.next_randomness
+                || sm.snapshot.snapshot_hash != next_snapshot.snapshot_hash
+            {
+                return Err(NornError::ConsensusError(
+                    "in-memory consensus state conflicts with durable finalized state".into(),
+                ));
+            }
+            *self.current_height.write().await = sm.height;
+            return Ok(());
+        }
+        sm.start_new_height_from_finalized(&finalized.consensus_state, next_snapshot)
+            .map_err(|e| NornError::ConsensusError(e.to_string()))?;
+        *self.current_height.write().await = sm.height;
+        Ok(())
     }
 
     pub async fn get_current_height(&self) -> u64 {

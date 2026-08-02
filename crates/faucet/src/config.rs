@@ -75,10 +75,11 @@ impl Default for FaucetConfig {
         Self {
             server_addr: "0.0.0.0:3000".to_string(),
             rpc_url: "http://localhost:8545".to_string(),
-            private_key: std::env::var("FAUCET_PRIVATE_KEY")
-                .unwrap_or_else(|_| "0x0000000000000000000000000000000000000000000000000000000000000001".to_string()),
+            private_key: std::env::var("FAUCET_PRIVATE_KEY").unwrap_or_else(|_| {
+                "0x0000000000000000000000000000000000000000000000000000000000000001".to_string()
+            }),
             dispense_amount: "1000000000000000000000".to_string(), // 1000 ETH
-            min_balance: "100000000000000000000".to_string(), // 100 ETH
+            min_balance: "100000000000000000000".to_string(),      // 100 ETH
             max_requests_per_window: 3,
             rate_limit_window_secs: 3600, // 1 hour
             address_cooldown_secs: 86400, // 24 hours
@@ -92,8 +93,8 @@ impl Default for FaucetConfig {
             allowed_origins: vec!["*".to_string()],
             auto_refill_enabled: false,
             auto_refill_threshold: "50000000000000000000".to_string(), // 50 ETH
-            auto_refill_amount: "1000000000000000000000".to_string(), // 1000 ETH
-            gas_price: "1000000000".to_string(), // 1 Gwei
+            auto_refill_amount: "1000000000000000000000".to_string(),  // 1000 ETH
+            gas_price: "1000000000".to_string(),                       // 1 Gwei
             gas_limit: 21000,
         }
     }
@@ -125,7 +126,8 @@ impl FaucetConfig {
         }
 
         if let Ok(max_req) = std::env::var("FAUCET_MAX_REQUESTS") {
-            config.max_requests_per_window = max_req.parse().unwrap_or(config.max_requests_per_window);
+            config.max_requests_per_window =
+                max_req.parse().unwrap_or(config.max_requests_per_window);
         }
 
         if let Ok(window) = std::env::var("FAUCET_RATE_LIMIT_WINDOW") {

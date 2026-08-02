@@ -3,9 +3,9 @@
 //! These types represent the output of solc compilation, mirroring the
 //! standard JSON artifact format used by Hardhat, Foundry, and ethers.js.
 
-use tiny_keccak::{Hasher, Keccak};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tiny_keccak::{Hasher, Keccak};
 
 // ============ Top-level solc output ============
 
@@ -92,24 +92,30 @@ impl CompiledContract {
 
     /// Get all function ABI items
     pub fn functions(&self) -> Vec<&AbiItem> {
-        self.abi.iter().filter_map(|item| {
-            if let AbiItem::Function { .. } = item {
-                Some(item)
-            } else {
-                None
-            }
-        }).collect()
+        self.abi
+            .iter()
+            .filter_map(|item| {
+                if let AbiItem::Function { .. } = item {
+                    Some(item)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Get all event ABI items
     pub fn events(&self) -> Vec<&AbiItem> {
-        self.abi.iter().filter_map(|item| {
-            if let AbiItem::Event { .. } = item {
-                Some(item)
-            } else {
-                None
-            }
-        }).collect()
+        self.abi
+            .iter()
+            .filter_map(|item| {
+                if let AbiItem::Event { .. } = item {
+                    Some(item)
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Get a function by name
@@ -162,7 +168,11 @@ pub struct EvmBytecode {
 impl EvmBytecode {
     /// Convert to bytes
     pub fn as_bytes(&self) -> Vec<u8> {
-        let hex_str = self.object.code.strip_prefix("0x").unwrap_or(&self.object.code);
+        let hex_str = self
+            .object
+            .code
+            .strip_prefix("0x")
+            .unwrap_or(&self.object.code);
         hex::decode(hex_str).unwrap_or_default()
     }
 
@@ -307,11 +317,8 @@ impl AbiParam {
         if self.components.is_empty() {
             self.param_type.clone()
         } else {
-            let components: Vec<String> = self
-                .components
-                .iter()
-                .map(|c| c.type_signature())
-                .collect();
+            let components: Vec<String> =
+                self.components.iter().map(|c| c.type_signature()).collect();
             format!("({})", components.join(","))
         }
     }
@@ -388,8 +395,9 @@ impl CompileResult {
 
     /// Get contracts by source file path
     pub fn get_contracts_by_source(&self, source_path: &str) -> Vec<&CompiledContract> {
-        self.contracts.iter().filter(|c| {
-            c.metadata.contains(source_path)
-        }).collect()
+        self.contracts
+            .iter()
+            .filter(|c| c.metadata.contains(source_path))
+            .collect()
     }
 }

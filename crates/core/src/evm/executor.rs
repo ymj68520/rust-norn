@@ -2,26 +2,29 @@
 //!
 //! This module provides EVM transaction execution capabilities using revm.
 
-use crate::evm::{EVMConfig, EVMContext, EVMError, EVMResult, CodeStorage, LogManager, EventLog, Receipt, ReceiptDB, ReceiptLog};
 use crate::evm::runtime::NornDatabaseAdapter; // Fixed with SyncStateManager
+use crate::evm::{
+    CodeStorage, EVMCodeChange, EVMConfig, EVMContext, EVMError, EVMResult, EventLog, LogManager,
+    Receipt, ReceiptDB, ReceiptLog,
+};
 use crate::state::cache::SyncStateManager;
-use crate::state::{AccountStateManager, AccountState as AccountAccountState, AccountType, AccountStateConfig};
-use norn_common::types::{Transaction, Address, Hash, TransactionType};
-use std::sync::Arc;
-use tracing::{debug, info, warn, trace, error};
-use sha2::{Sha256, Digest};
+use crate::state::{
+    AccountState as AccountAccountState, AccountStateConfig, AccountStateManager, AccountType,
+};
+use norn_common::types::{Address, Hash, Transaction, TransactionType};
 use num_bigint::BigUint;
-use num_traits::{Zero, One};
+use num_traits::{One, Zero};
+use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use tracing::{debug, error, info, trace, warn};
 
 // Import revm types
 use revm::{
-    Evm,
     primitives::{
-        TxKind, AccountInfo, Bytes, Address as RevmAddr, U256,
-        Env, ExecutionResult, ResultAndState,
-        HashMap as RevmHashMap, SpecId, SpecId::CANCUN,
-        TransactTo,
+        AccountInfo, Address as RevmAddr, Bytes, Env, ExecutionResult, HashMap as RevmHashMap,
+        ResultAndState, SpecId, SpecId::CANCUN, TransactTo, TxKind, U256,
     },
+    Evm,
 };
 
 // Type aliases for clarity
@@ -70,7 +73,6 @@ pub struct EVMExecutor {
 
     // /// Database adapter
     // db_adapter: Arc<NornDatabaseAdapter>, // TODO: Fix async/sync interface mismatch
-
     /// Code storage
     code_storage: Arc<CodeStorage>,
 
@@ -82,14 +84,15 @@ pub struct EVMExecutor {
 
     /// EVM configuration
     config: EVMConfig,
+
+    /// Capture code lifecycle changes when building a canonical V2 execution
+    /// overlay with a code-address write set.
+    capture_code_changes: bool,
 }
 
 impl EVMExecutor {
     /// Create a new EVM executor
-    pub fn new(
-        state_manager: Arc<AccountStateManager>,
-        config: EVMConfig,
-    ) -> Self {
+    pub fn new(state_manager: Arc<AccountStateManager>, config: EVMConfig) -> Self {
         // let db_adapter = Arc::new(NornDatabaseAdapter::new(
         //     Arc::clone(&state_manager)
         // ));
@@ -105,6 +108,41 @@ impl EVMExecutor {
             log_manager,
             receipt_db,
             config,
+            capture_code_changes: false,
+        }
+    }
+
+    /// Construct an executor over a caller-owned state projection while
+    /// retaining the code store. V2 consensus passes a cloned state here.
+    pub fn with_code_storage(
+        state_manager: Arc<AccountStateManager>,
+        config: EVMConfig,
+        code_storage: Arc<CodeStorage>,
+    ) -> Self {
+        Self {
+            state_manager,
+            code_storage,
+            log_manager: Arc::new(LogManager::new()),
+            receipt_db: Arc::new(ReceiptDB::new()),
+            config,
+            capture_code_changes: false,
+        }
+    }
+
+    /// Construct an executor for V2 overlay execution and capture code
+    /// lifecycle mutations separately from account/storage writes.
+    pub fn with_code_storage_collecting_code_changes(
+        state_manager: Arc<AccountStateManager>,
+        config: EVMConfig,
+        code_storage: Arc<CodeStorage>,
+    ) -> Self {
+        Self {
+            state_manager,
+            code_storage,
+            log_manager: Arc::new(LogManager::new()),
+            receipt_db: Arc::new(ReceiptDB::new()),
+            config,
+            capture_code_changes: true,
         }
     }
 
@@ -121,6 +159,7 @@ impl EVMExecutor {
             log_manager,
             receipt_db,
             config: EVMConfig::default(),
+            capture_code_changes: false,
         }
     }
 
@@ -248,19 +287,22 @@ impl EVMExecutor {
     ) -> EVMResult<EVMExecutionResult> {
         info!(
             "Executing EVM transaction: hash={:?}, from={:?}, to={:?}, data_len={}",
-            tx.body.hash, tx.body.address, tx.body.receiver, tx.body.data.len()
+            tx.body.hash,
+            tx.body.address,
+            tx.body.receiver,
+            tx.body.data.len()
         );
 
         // Validate transaction type
         if tx.body.tx_type != TransactionType::EVM {
             return Err(EVMError::InvalidTransaction(
-                "Not an EVM transaction".to_string()
+                "Not an EVM transaction".to_string(),
             ));
         }
 
         // Check if this is a contract creation (to address is zero or default)
-        let is_contract_creation = tx.body.receiver == Address::default()
-            || tx.body.receiver.0.iter().all(|&b| b == 0);
+        let is_contract_creation =
+            tx.body.receiver == Address::default() || tx.body.receiver.0.iter().all(|&b| b == 0);
 
         if is_contract_creation && !tx.body.data.is_empty() {
             // Contract creation
@@ -280,18 +322,25 @@ impl EVMExecutor {
         let sender = tx.body.address;
         let nonce = tx.body.nonce as u64;
         let init_code = tx.body.data.clone();
-        let value = tx.body.value.clone()
+        let value = tx
+            .body
+            .value
+            .clone()
             .unwrap_or_else(|| "0".to_string())
             .parse::<u128>()
             .unwrap_or(0);
 
         info!(
             "Contract creation: sender={:?}, nonce={}, init_code_len={}, value={}",
-            sender, nonce, init_code.len(), value
+            sender,
+            nonce,
+            init_code.len(),
+            value
         );
 
         // Use revm v14 for contract creation
-        self.execute_with_revm(sender, None, value, init_code, tx.body.gas as u64, ctx).await
+        self.execute_with_revm(sender, None, value, init_code, tx.body.gas as u64, ctx)
+            .await
     }
 
     /// Execute a regular ETH transfer or contract call
@@ -304,30 +353,40 @@ impl EVMExecutor {
         let to = tx.body.receiver;
 
         // Get value from transaction
-        let value = tx.body.value.clone()
-            .unwrap_or_else(|| "0".to_string());
-        let value_u256: u128 = value.parse()
+        let value = tx.body.value.clone().unwrap_or_else(|| "0".to_string());
+        let value_u256: u128 = value
+            .parse()
             .map_err(|_| EVMError::InvalidTransaction("Invalid value format".to_string()))?;
 
-        debug!("Transferring {} wei from {:?} to {:?}", value_u256, from, to);
+        debug!(
+            "Transferring {} wei from {:?} to {:?}",
+            value_u256, from, to
+        );
 
         // Check if this is a contract call (has data)
         if !tx.body.data.is_empty() {
             // This is a contract call
-            return self.call_contract(
-                from,
-                to,
-                value_u256,
-                tx.body.data.clone(),
-                tx.body.gas as u64,
-            ).await;
+            return self
+                .call_contract(
+                    from,
+                    to,
+                    value_u256,
+                    tx.body.data.clone(),
+                    tx.body.gas as u64,
+                )
+                .await;
         }
 
         // Simple ETH transfer
         // Check from balance
-        let from_account = self.state_manager.get_account(&from).await
+        let from_account = self
+            .state_manager
+            .get_account(&from)
+            .await
             .map_err(|e| EVMError::StateAccess(format!("Failed to get account: {}", e)))?;
-        let from_balance = from_account.map(|a| a.balance).unwrap_or_else(|| BigUint::zero());
+        let from_balance = from_account
+            .map(|a| a.balance)
+            .unwrap_or_else(|| BigUint::zero());
 
         if from_balance < BigUint::from(value_u256) {
             return Err(EVMError::Execution(format!(
@@ -338,11 +397,17 @@ impl EVMExecutor {
 
         // Deduct from sender
         let amount = BigUint::from(value_u256);
-        self.state_manager.subtract_balance(&from, &amount).await
-            .map_err(|e| EVMError::StateAccess(format!("Failed to subtract from balance: {}", e)))?;
+        self.state_manager
+            .subtract_balance(&from, &amount)
+            .await
+            .map_err(|e| {
+                EVMError::StateAccess(format!("Failed to subtract from balance: {}", e))
+            })?;
 
         // Add to receiver
-        self.state_manager.add_balance(&to, &amount).await
+        self.state_manager
+            .add_balance(&to, &amount)
+            .await
             .map_err(|e| EVMError::StateAccess(format!("Failed to add to balance: {}", e)))?;
 
         Ok(EVMExecutionResult {
@@ -355,26 +420,31 @@ impl EVMExecutor {
     }
 
     /// Execute a simple ETH transfer
-    async fn execute_simple_transfer(
-        &self,
-        tx: &Transaction,
-    ) -> EVMResult<EVMExecutionResult> {
+    async fn execute_simple_transfer(&self, tx: &Transaction) -> EVMResult<EVMExecutionResult> {
         let from = tx.body.address;
         let to = tx.body.receiver;
 
         // Get value from transaction
-        let value = tx.body.value.clone()
-            .unwrap_or_else(|| "0".to_string());
-        let value_u128: u128 = value.parse()
+        let value = tx.body.value.clone().unwrap_or_else(|| "0".to_string());
+        let value_u128: u128 = value
+            .parse()
             .map_err(|_| EVMError::InvalidTransaction("Invalid value format".to_string()))?;
         let value_biguint = BigUint::from(value_u128);
 
-        debug!("Transferring {} wei from {:?} to {:?}", value_u128, from, to);
+        debug!(
+            "Transferring {} wei from {:?} to {:?}",
+            value_u128, from, to
+        );
 
         // Get sender balance
-        let sender_account = self.state_manager.get_account(&from).await
+        let sender_account = self
+            .state_manager
+            .get_account(&from)
+            .await
             .map_err(|e| EVMError::Execution(format!("Failed to get sender account: {}", e)))?;
-        let sender_balance = sender_account.map(|a| a.balance).unwrap_or_else(|| BigUint::zero());
+        let sender_balance = sender_account
+            .map(|a| a.balance)
+            .unwrap_or_else(|| BigUint::zero());
 
         // Check sufficient balance
         if sender_balance < value_biguint {
@@ -385,15 +455,25 @@ impl EVMExecutor {
         }
 
         // Deduct from sender
-        self.state_manager.subtract_balance(&from, &value_biguint).await
-            .map_err(|e| EVMError::Execution(format!("Failed to deduct from sender balance: {}", e)))?;
+        self.state_manager
+            .subtract_balance(&from, &value_biguint)
+            .await
+            .map_err(|e| {
+                EVMError::Execution(format!("Failed to deduct from sender balance: {}", e))
+            })?;
 
         // Add to receiver
-        self.state_manager.add_balance(&to, &value_biguint).await
-            .map_err(|e| EVMError::Execution(format!("Failed to add to receiver balance: {}", e)))?;
+        self.state_manager
+            .add_balance(&to, &value_biguint)
+            .await
+            .map_err(|e| {
+                EVMError::Execution(format!("Failed to add to receiver balance: {}", e))
+            })?;
 
         // Increment nonce for sender
-        self.state_manager.increment_nonce(&from).await
+        self.state_manager
+            .increment_nonce(&from)
+            .await
             .map_err(|e| EVMError::Execution(format!("Failed to increment nonce: {}", e)))?;
 
         info!(
@@ -423,7 +503,11 @@ impl EVMExecutor {
     ) -> EVMResult<Vec<u8>> {
         debug!(
             "EVM call: from={:?}, to={:?}, value={}, data_len={}, gas_limit={}",
-            from, to, value, data.len(), gas_limit
+            from,
+            to,
+            value,
+            data.len(),
+            gas_limit
         );
 
         // Check if this is a contract call or simple transfer
@@ -433,20 +517,26 @@ impl EVMExecutor {
             // This is a contract call - use call_contract
             let result = self.call_contract(from, to, value, data, gas_limit).await?;
             if !result.success {
-                return Err(EVMError::Execution(result.error.unwrap_or_else(||
-                    "Contract call failed".to_string()
-                )));
+                return Err(EVMError::Execution(
+                    result
+                        .error
+                        .unwrap_or_else(|| "Contract call failed".to_string()),
+                ));
             }
             Ok(result.output)
         } else if value > 0 {
             // This is a simple ETH transfer
             // Deduct from sender
             let value_biguint = num_bigint::BigUint::from(value);
-            self.state_manager.subtract_balance(&from, &value_biguint).await
+            self.state_manager
+                .subtract_balance(&from, &value_biguint)
+                .await
                 .map_err(|e| EVMError::Execution(format!("Failed to deduct from sender: {}", e)))?;
 
             // Add to recipient
-            self.state_manager.add_balance(&to, &value_biguint).await
+            self.state_manager
+                .add_balance(&to, &value_biguint)
+                .await
                 .map_err(|e| EVMError::Execution(format!("Failed to add to recipient: {}", e)))?;
 
             debug!("Transferred {} wei from {:?} to {:?}", value, from, to);
@@ -485,7 +575,11 @@ impl EVMExecutor {
     ) -> EVMResult<EVMExecutionResult> {
         info!(
             "CALL: caller={:?}, callee={:?}, value={}, data_len={}, gas_limit={}",
-            caller, callee, value, input_data.len(), gas_limit
+            caller,
+            callee,
+            value,
+            input_data.len(),
+            gas_limit
         );
 
         // Check if callee is a contract
@@ -498,9 +592,14 @@ impl EVMExecutor {
 
         // Use revm for actual contract execution
         let ctx = EVMContext::default();
-        let result = self.execute_with_revm(caller, Some(callee), value, input_data, gas_limit, &ctx).await?;
+        let result = self
+            .execute_with_revm(caller, Some(callee), value, input_data, gas_limit, &ctx)
+            .await?;
 
-        info!("CALL completed: success={}, gas_used={}", result.success, result.gas_used);
+        info!(
+            "CALL completed: success={}, gas_used={}",
+            result.success, result.gas_used
+        );
         Ok(result)
     }
 
@@ -529,7 +628,10 @@ impl EVMExecutor {
     ) -> EVMResult<EVMExecutionResult> {
         info!(
             "DELEGATECALL: caller={:?}, code_address={:?}, data_len={}, gas_limit={}",
-            caller, code_address, input_data.len(), gas_limit
+            caller,
+            code_address,
+            input_data.len(),
+            gas_limit
         );
 
         // Check if code_address has code
@@ -541,11 +643,19 @@ impl EVMExecutor {
         }
 
         // Get code from code_address
-        let contract_code = self.code_storage.get_code_by_address(&code_address).await?
-            .ok_or_else(|| EVMError::Execution(format!("No code found at address: {:?}", code_address)))?;
+        let contract_code = self
+            .code_storage
+            .get_code_by_address(&code_address)
+            .await?
+            .ok_or_else(|| {
+                EVMError::Execution(format!("No code found at address: {:?}", code_address))
+            })?;
 
         if contract_code.is_empty() {
-            return Err(EVMError::Execution(format!("Contract has no code: {:?}", code_address)));
+            return Err(EVMError::Execution(format!(
+                "Contract has no code: {:?}",
+                code_address
+            )));
         }
 
         // DELEGATECALL executes code from code_address but in caller's context
@@ -556,7 +666,10 @@ impl EVMExecutor {
 
         // For now, we simulate the execution without actual bytecode interpretation
         // In a full implementation, this would use revm with appropriate context setup
-        debug!("Executing DELEGATECALL - code from {:?} in context of {:?}", code_address, caller);
+        debug!(
+            "Executing DELEGATECALL - code from {:?} in context of {:?}",
+            code_address, caller
+        );
 
         // Base gas costs for DELEGATECALL (cheaper than CALL)
         let gas_cost = 2_200 + // Base DELEGATECALL cost
@@ -604,7 +717,10 @@ impl EVMExecutor {
     ) -> EVMResult<EVMExecutionResult> {
         info!(
             "STATICCALL: caller={:?}, callee={:?}, data_len={}, gas_limit={}",
-            caller, callee, input_data.len(), gas_limit
+            caller,
+            callee,
+            input_data.len(),
+            gas_limit
         );
 
         // Check if callee is a contract
@@ -616,11 +732,19 @@ impl EVMExecutor {
         }
 
         // Get contract code
-        let contract_code = self.code_storage.get_code_by_address(&callee).await?
-            .ok_or_else(|| EVMError::Execution(format!("No code found at address: {:?}", callee)))?;
+        let contract_code = self
+            .code_storage
+            .get_code_by_address(&callee)
+            .await?
+            .ok_or_else(|| {
+                EVMError::Execution(format!("No code found at address: {:?}", callee))
+            })?;
 
         if contract_code.is_empty() {
-            return Err(EVMError::Execution(format!("Contract has no code: {:?}", callee)));
+            return Err(EVMError::Execution(format!(
+                "Contract has no code: {:?}",
+                callee
+            )));
         }
 
         // STATICCALL is a read-only call:
@@ -654,10 +778,7 @@ impl EVMExecutor {
     }
 
     /// Estimate gas for a transaction (eth_estimateGas)
-    pub async fn estimate_gas(
-        &self,
-        tx: &Transaction,
-    ) -> EVMResult<u64> {
+    pub async fn estimate_gas(&self, tx: &Transaction) -> EVMResult<u64> {
         debug!("Estimating gas for transaction: {:?}", tx.body.hash);
 
         // Simple gas estimation based on transaction type
@@ -714,37 +835,76 @@ impl EVMExecutor {
         gas_limit: u64,
         ctx: &EVMContext,
     ) -> EVMResult<EVMExecutionResult> {
-        use revm::primitives::{CfgEnv, Env, HandlerCfg, TxEnv, TransactTo, SpecId, BlockEnv};
-        use revm::Evm;
-        use crate::state::cache::SyncStateManager;
+        self.execute_with_revm_inner(caller, to, value, data, gas_limit, ctx)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// Execute with revm and return code-address mutations for a V2 overlay.
+    pub async fn execute_with_revm_and_code_changes(
+        &self,
+        caller: Address,
+        to: Option<Address>,
+        value: u128,
+        data: Vec<u8>,
+        gas_limit: u64,
+        ctx: &EVMContext,
+    ) -> EVMResult<(EVMExecutionResult, Vec<EVMCodeChange>)> {
+        self.execute_with_revm_inner(caller, to, value, data, gas_limit, ctx)
+            .await
+    }
+
+    async fn execute_with_revm_inner(
+        &self,
+        caller: Address,
+        to: Option<Address>,
+        value: u128,
+        data: Vec<u8>,
+        gas_limit: u64,
+        ctx: &EVMContext,
+    ) -> EVMResult<(EVMExecutionResult, Vec<EVMCodeChange>)> {
         use crate::evm::runtime::NornDatabaseAdapter;
+        use crate::state::cache::SyncStateManager;
+        use revm::primitives::{BlockEnv, CfgEnv, Env, HandlerCfg, SpecId, TransactTo, TxEnv};
         use revm::DatabaseCommit;
+        use revm::Evm;
 
         info!(
             "Executing with revm: caller={:?}, to={:?}, value={}, data_len={}, gas_limit={}",
-            caller, to, value, data.len(), gas_limit
+            caller,
+            to,
+            value,
+            data.len(),
+            gas_limit
         );
 
         // Create sync state manager wrapper
         let sync_config = crate::state::cache::SyncCacheConfig::default();
-        let sync_state_manager = SyncStateManager::new(
-            Arc::clone(&self.state_manager),
-            sync_config,
-        );
+        let sync_state_manager =
+            SyncStateManager::new(Arc::clone(&self.state_manager), sync_config);
 
         // Create database adapter with code storage
-        let mut db_adapter = NornDatabaseAdapter::with_code_storage(
-            sync_state_manager,
-            Arc::clone(&self.code_storage),
-            ctx.block_number,
-        );
+        let mut db_adapter = if self.capture_code_changes {
+            NornDatabaseAdapter::with_code_storage_collecting_code_changes(
+                sync_state_manager,
+                Arc::clone(&self.code_storage),
+                ctx.block_number,
+            )
+        } else {
+            NornDatabaseAdapter::with_code_storage(
+                sync_state_manager,
+                Arc::clone(&self.code_storage),
+                ctx.block_number,
+            )
+        };
 
         // Insert block hashes for BLOCKHASH opcode
         for i in 0..256u64 {
             if ctx.block_number > i {
                 let mut hash = [0u8; 32];
                 hash[0..8].copy_from_slice(&(ctx.block_number - i).to_be_bytes());
-                db_adapter.insert_block_hash(ctx.block_number - i, revm::primitives::B256::from(hash));
+                db_adapter
+                    .insert_block_hash(ctx.block_number - i, revm::primitives::B256::from(hash));
             }
         }
 
@@ -761,9 +921,10 @@ impl EVMExecutor {
             },
             value: revm::primitives::U256::from(value),
             data: revm::primitives::Bytes::from(data),
-            gas_limit: gas_limit,  // Already u64
+            gas_limit: gas_limit, // Already u64
             gas_price: revm::primitives::U256::from(ctx.tx_gas_price),
             gas_priority_fee: None,
+            nonce: ctx.tx_nonce,
             ..Default::default()
         };
 
@@ -803,7 +964,10 @@ impl EVMExecutor {
             }
             Err(e) => {
                 error!("revm execution failed: {:?}", e);
-                return Err(EVMError::Execution(format!("revm execution failed: {:?}", e)));
+                return Err(EVMError::Execution(format!(
+                    "revm execution failed: {:?}",
+                    e
+                )));
             }
         };
 
@@ -813,16 +977,17 @@ impl EVMExecutor {
         // Extract logs from execution result
         // In revm v14, only Success has logs field
         let logs = match &execution_result {
-            revm::primitives::ExecutionResult::Success { logs, .. } => {
-                logs.clone()
-            }
+            revm::primitives::ExecutionResult::Success { logs, .. } => logs.clone(),
             _ => Vec::new(), // Revert and Halt don't have logs in revm v14
         };
 
-        let logs: Vec<ExecutionLog> = logs.into_iter()
+        let logs: Vec<ExecutionLog> = logs
+            .into_iter()
             .map(|log| ExecutionLog {
                 address: Address(log.address.as_slice().try_into().unwrap_or([0u8; 20])),
-                topics: log.topics().into_iter() // Use getter method
+                topics: log
+                    .topics()
+                    .into_iter() // Use getter method
                     .map(|t| Hash(t.as_slice().try_into().unwrap_or([0u8; 32])))
                     .collect(),
                 data: log.data.data.to_vec(), // Access the inner Bytes field
@@ -832,18 +997,22 @@ impl EVMExecutor {
         // Commit state changes back to database adapter
         // In revm v14, we need to use the evm's db_mut() to get mutable access
         evm.db_mut().commit(state_changes);
+        if let Some(error) = evm.db_mut().take_commit_error() {
+            return Err(EVMError::Execution(format!(
+                "revm state commit failed: {error}"
+            )));
+        }
+        let code_changes = evm.db_mut().take_code_changes();
 
         // Get gas used and refunded based on result variant
         let (gas_used, gas_refunded, is_success) = match &execution_result {
-            revm::primitives::ExecutionResult::Success { gas_used, gas_refunded, .. } => {
-                (*gas_used, *gas_refunded, true)
-            }
-            revm::primitives::ExecutionResult::Revert { gas_used, .. } => {
-                (*gas_used, 0u64, false)
-            }
-            revm::primitives::ExecutionResult::Halt { gas_used, .. } => {
-                (*gas_used, 0u64, false)
-            }
+            revm::primitives::ExecutionResult::Success {
+                gas_used,
+                gas_refunded,
+                ..
+            } => (*gas_used, *gas_refunded, true),
+            revm::primitives::ExecutionResult::Revert { gas_used, .. } => (*gas_used, 0u64, false),
+            revm::primitives::ExecutionResult::Halt { gas_used, .. } => (*gas_used, 0u64, false),
         };
 
         info!(
@@ -857,36 +1026,31 @@ impl EVMExecutor {
         // Get output based on result variant
         // Note: revm v14 Output is an enum with Call, Create variants
         let output = match &execution_result {
-            revm::primitives::ExecutionResult::Success { output, .. } => {
-                match output {
-                    revm::primitives::Output::Call(data) => {
-                        data.to_vec()
-                    }
-                    revm::primitives::Output::Create(data, _) => {
-                        data.to_vec()
-                    }
-                }
-            }
+            revm::primitives::ExecutionResult::Success { output, .. } => match output {
+                revm::primitives::Output::Call(data) => data.to_vec(),
+                revm::primitives::Output::Create(data, _) => data.to_vec(),
+            },
             revm::primitives::ExecutionResult::Revert { output, .. } => {
                 // In revm v14, Revert output is Bytes (not Option)
                 output.to_vec()
             }
-            revm::primitives::ExecutionResult::Halt { .. } => {
-                Vec::new()
-            }
+            revm::primitives::ExecutionResult::Halt { .. } => Vec::new(),
         };
 
-        Ok(EVMExecutionResult {
-            success: is_success,
-            gas_used: gas_used, // Already u64
-            output,
-            error: if is_success {
-                None
-            } else {
-                Some(format!("Execution reverted"))
+        Ok((
+            EVMExecutionResult {
+                success: is_success,
+                gas_used: gas_used, // Already u64
+                output,
+                error: if is_success {
+                    None
+                } else {
+                    Some(format!("Execution reverted"))
+                },
+                logs,
             },
-            logs,
-        })
+            code_changes,
+        ))
     }
 
     /// Execute transaction using revm v14
@@ -937,15 +1101,19 @@ impl EVMExecutor {
     ) -> EVMResult<(Address, EVMExecutionResult)> {
         info!(
             "Creating contract: sender={:?}, nonce={}, init_code_len={}, value={}",
-            sender, nonce, init_code.len(), value
+            sender,
+            nonce,
+            init_code.len(),
+            value
         );
 
         // Validate contract size (EIP-170: max 24KB)
         if init_code.len() > self.config.max_contract_size {
-            return Err(EVMError::ContractCreationFailed(
-                format!("Contract code too large: {} bytes (max {})",
-                    init_code.len(), self.config.max_contract_size)
-            ));
+            return Err(EVMError::ContractCreationFailed(format!(
+                "Contract code too large: {} bytes (max {})",
+                init_code.len(),
+                self.config.max_contract_size
+            )));
         }
 
         // Calculate contract address
@@ -957,8 +1125,12 @@ impl EVMExecutor {
         let code_hash = Hash(Sha256::digest(&init_code).into());
 
         // Store contract code
-        self.code_storage.store_code(code_hash, init_code.clone()).await?;
-        self.code_storage.bind_code_to_address(contract_address, code_hash).await?;
+        self.code_storage
+            .store_code(code_hash, init_code.clone())
+            .await?;
+        self.code_storage
+            .bind_code_to_address(contract_address, code_hash)
+            .await?;
 
         // Update sender's account (increment nonce)
         // TODO: This should be done as part of the transaction execution
@@ -981,11 +1153,15 @@ impl EVMExecutor {
             deleted: false,
         };
 
-        self.state_manager.set_account(&contract_address, contract_account)
+        self.state_manager
+            .set_account(&contract_address, contract_account)
             .await
             .map_err(|e| EVMError::StateAccess(format!("Failed to set contract account: {}", e)))?;
 
-        info!("Contract created successfully: address={:?}, code_hash={:?}", contract_address, code_hash);
+        info!(
+            "Contract created successfully: address={:?}, code_hash={:?}",
+            contract_address, code_hash
+        );
 
         let result = EVMExecutionResult {
             success: true,
@@ -1009,24 +1185,25 @@ impl EVMExecutor {
     ) -> EVMResult<(Address, EVMExecutionResult)> {
         info!(
             "Creating contract (CREATE2): sender={:?}, init_code_len={}, value={}",
-            sender, init_code.len(), value
+            sender,
+            init_code.len(),
+            value
         );
 
         // Validate contract size
         if init_code.len() > self.config.max_contract_size {
-            return Err(EVMError::ContractCreationFailed(
-                format!("Contract code too large: {} bytes (max {})",
-                    init_code.len(), self.config.max_contract_size)
-            ));
+            return Err(EVMError::ContractCreationFailed(format!(
+                "Contract code too large: {} bytes (max {})",
+                init_code.len(),
+                self.config.max_contract_size
+            )));
         }
 
         // Calculate init code hash
         let init_code_hash = Hash(Sha256::digest(&init_code).into());
 
         // Calculate contract address
-        let contract_address = CodeStorage::calculate_create2_address(
-            sender, salt, init_code_hash
-        );
+        let contract_address = CodeStorage::calculate_create2_address(sender, salt, init_code_hash);
 
         debug!("Calculated CREATE2 address: {:?}", contract_address);
 
@@ -1034,8 +1211,12 @@ impl EVMExecutor {
         let code_hash = Hash(Sha256::digest(&init_code).into());
 
         // Store contract code
-        self.code_storage.store_code(code_hash, init_code.clone()).await?;
-        self.code_storage.bind_code_to_address(contract_address, code_hash).await?;
+        self.code_storage
+            .store_code(code_hash, init_code.clone())
+            .await?;
+        self.code_storage
+            .bind_code_to_address(contract_address, code_hash)
+            .await?;
 
         // Create contract account
         let now = std::time::SystemTime::now()
@@ -1054,11 +1235,15 @@ impl EVMExecutor {
             deleted: false,
         };
 
-        self.state_manager.set_account(&contract_address, contract_account)
+        self.state_manager
+            .set_account(&contract_address, contract_account)
             .await
             .map_err(|e| EVMError::StateAccess(format!("Failed to set contract account: {}", e)))?;
 
-        info!("CREATE2 contract created successfully: address={:?}", contract_address);
+        info!(
+            "CREATE2 contract created successfully: address={:?}",
+            contract_address
+        );
 
         // Extract any logs emitted during contract creation
         let logs = self.extract_logs_from_manager(&contract_address).await?;
@@ -1092,7 +1277,11 @@ impl EVMExecutor {
             })
             .collect();
 
-        debug!("Extracted {} logs for address {:?}", execution_logs.len(), address);
+        debug!(
+            "Extracted {} logs for address {:?}",
+            execution_logs.len(),
+            address
+        );
         Ok(execution_logs)
     }
 
@@ -1112,7 +1301,11 @@ impl EVMExecutor {
             return Ok(());
         }
 
-        info!("Processing {} logs for transaction {:?}", logs.len(), tx_hash);
+        info!(
+            "Processing {} logs for transaction {:?}",
+            logs.len(),
+            tx_hash
+        );
 
         // Convert ExecutionLog to EventLog and store
         for (index, log) in logs.iter().enumerate() {
@@ -1145,7 +1338,6 @@ impl EVMExecutor {
         Ok(())
     }
 
-
     /// Calculate bloom filter from logs
     ///
     /// Creates a bloom filter for efficient log querying, as specified in EIP-42
@@ -1171,7 +1363,9 @@ impl EVMExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::account::{AccountStateManager, AccountStateConfig, AccountState, AccountType};
+    use crate::state::account::{
+        AccountState, AccountStateConfig, AccountStateManager, AccountType,
+    };
     use norn_common::types::TransactionBody;
     use num_bigint::BigUint;
 
@@ -1191,9 +1385,6 @@ mod tests {
                 state: Vec::new(),
                 data: Vec::new(),
                 expire: 0,
-                height: 0,
-                index: 0,
-                block_hash: Hash::default(),
                 timestamp: 0,
                 public: norn_common::types::PublicKey::default(),
                 signature: Vec::new(),
@@ -1225,7 +1416,10 @@ mod tests {
 
         // Setup: Give sender account sufficient balance
         let sender = Address([1u8; 20]);
-        state_manager.update_balance(&sender, BigUint::from(2_000_000_000_000_000_000u128)).await.unwrap(); // 2 ETH
+        state_manager
+            .update_balance(&sender, BigUint::from(2_000_000_000_000_000_000u128))
+            .await
+            .unwrap(); // 2 ETH
 
         let tx = create_test_transaction();
         let ctx = EVMContext::default();
@@ -1238,13 +1432,20 @@ mod tests {
 
         // Verify balances updated
         let sender_account = state_manager.get_account(&sender).await.unwrap();
-        let sender_balance = sender_account.map(|a| a.balance).unwrap_or_else(|| BigUint::zero());
+        let sender_balance = sender_account
+            .map(|a| a.balance)
+            .unwrap_or_else(|| BigUint::zero());
         assert_eq!(sender_balance, BigUint::from(1_000_000_000_000_000_000u128)); // 1 ETH remaining
 
         let receiver = Address([2u8; 20]);
         let receiver_account = state_manager.get_account(&receiver).await.unwrap();
-        let receiver_balance = receiver_account.map(|a| a.balance).unwrap_or_else(|| BigUint::zero());
-        assert_eq!(receiver_balance, BigUint::from(1_000_000_000_000_000_000u128)); // Received 1 ETH
+        let receiver_balance = receiver_account
+            .map(|a| a.balance)
+            .unwrap_or_else(|| BigUint::zero());
+        assert_eq!(
+            receiver_balance,
+            BigUint::from(1_000_000_000_000_000_000u128)
+        ); // Received 1 ETH
     }
 
     #[tokio::test]
@@ -1281,7 +1482,10 @@ mod tests {
         let data = vec![0x01, 0x02, 0x03];
 
         // Set up sender with sufficient balance
-        state_manager.add_balance(&from, &num_bigint::BigUint::from(10000u64)).await.unwrap();
+        state_manager
+            .add_balance(&from, &num_bigint::BigUint::from(10000u64))
+            .await
+            .unwrap();
 
         let result = executor.call(from, to, 1000, data, 100_000).await.unwrap();
         assert_eq!(result, Vec::<u8>::new()); // Placeholder returns empty
@@ -1298,16 +1502,21 @@ mod tests {
         let value = 1000;
 
         // Create contract
-        let (address, result) = executor.create_contract(
-            sender, 0, init_code.clone(), value, 100_000
-        ).await.unwrap();
+        let (address, result) = executor
+            .create_contract(sender, 0, init_code.clone(), value, 100_000)
+            .await
+            .unwrap();
 
         // Verify address was calculated correctly
         assert_eq!(address, CodeStorage::calculate_create_address(sender, 0));
 
         // Verify contract was stored
         assert!(executor.code_storage().is_contract(&address).await);
-        let stored_code = executor.code_storage().get_code_by_address(&address).await.unwrap();
+        let stored_code = executor
+            .code_storage()
+            .get_code_by_address(&address)
+            .await
+            .unwrap();
         assert_eq!(stored_code, Some(init_code));
 
         // Verify execution result
@@ -1328,13 +1537,17 @@ mod tests {
         let value = 1000;
 
         // Create contract with CREATE2
-        let (address, result) = executor.create2_contract(
-            sender, salt, init_code.clone(), value, 100_000
-        ).await.unwrap();
+        let (address, result) = executor
+            .create2_contract(sender, salt, init_code.clone(), value, 100_000)
+            .await
+            .unwrap();
 
         // Verify address was calculated correctly
         let init_code_hash = Hash(Sha256::digest(&init_code).into());
-        assert_eq!(address, CodeStorage::calculate_create2_address(sender, salt, init_code_hash));
+        assert_eq!(
+            address,
+            CodeStorage::calculate_create2_address(sender, salt, init_code_hash)
+        );
 
         // Verify contract was stored
         assert!(executor.code_storage().is_contract(&address).await);
@@ -1354,9 +1567,9 @@ mod tests {
         let init_code = vec![0u8; 101]; // 101 bytes - exceeds limit
 
         // Should fail due to size limit
-        let result = executor.create_contract(
-            sender, 0, init_code, 0, 100_000
-        ).await;
+        let result = executor
+            .create_contract(sender, 0, init_code, 0, 100_000)
+            .await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1376,28 +1589,42 @@ mod tests {
         // First, create a contract to call
         let sender = Address([1u8; 20]);
         let init_code = vec![0x60, 0x60, 0x60]; // Simple bytecode
-        let (contract_address, _) = executor.create_contract(
-            sender, 0, init_code.clone(), 0, 100_000
-        ).await.unwrap();
+        let (contract_address, _) = executor
+            .create_contract(sender, 0, init_code.clone(), 0, 100_000)
+            .await
+            .unwrap();
 
         // Now call the contract
         let caller = Address([2u8; 20]);
         // Set up caller with sufficient balance for gas fees (gas_limit * gas_price + value)
-        state_manager.add_balance(&caller, &num_bigint::BigUint::from(1_000_000_000_000_000_000u128)).await.unwrap();
+        state_manager
+            .add_balance(
+                &caller,
+                &num_bigint::BigUint::from(1_000_000_000_000_000_000u128),
+            )
+            .await
+            .unwrap();
 
         let input_data = vec![0x01, 0x02, 0x03];
-        let result = executor.call_contract(
-            caller,
-            contract_address,
-            100, // value
-            input_data.clone(),
-            50_000, // gas_limit
-        ).await.unwrap();
+        let result = executor
+            .call_contract(
+                caller,
+                contract_address,
+                100, // value
+                input_data.clone(),
+                50_000, // gas_limit
+            )
+            .await
+            .unwrap();
 
         assert!(result.success);
         assert!(result.error.is_none());
         // Gas calculation varies - just check it's reasonable
-        assert!(result.gas_used > 0 && result.gas_used < 100_000, "Gas should be reasonable: {}", result.gas_used);
+        assert!(
+            result.gas_used > 0 && result.gas_used < 100_000,
+            "Gas should be reasonable: {}",
+            result.gas_used
+        );
     }
 
     #[tokio::test]
@@ -1411,13 +1638,9 @@ mod tests {
         let input_data = vec![0x01, 0x02];
 
         // Calling a non-contract address should fail
-        let result = executor.call_contract(
-            caller,
-            non_contract,
-            0,
-            input_data,
-            50_000,
-        ).await;
+        let result = executor
+            .call_contract(caller, non_contract, 0, input_data, 50_000)
+            .await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1437,19 +1660,18 @@ mod tests {
         // Create a contract with code
         let sender = Address([1u8; 20]);
         let init_code = vec![0x60, 0x60, 0x60];
-        let (code_address, _) = executor.create_contract(
-            sender, 0, init_code, 0, 100_000
-        ).await.unwrap();
+        let (code_address, _) = executor
+            .create_contract(sender, 0, init_code, 0, 100_000)
+            .await
+            .unwrap();
 
         // Perform delegate call
         let caller = Address([2u8; 20]);
         let input_data = vec![0x01, 0x02, 0x03, 0x04];
-        let result = executor.delegate_call(
-            caller,
-            code_address,
-            input_data.clone(),
-            50_000,
-        ).await.unwrap();
+        let result = executor
+            .delegate_call(caller, code_address, input_data.clone(), 50_000)
+            .await
+            .unwrap();
 
         assert!(result.success);
         assert_eq!(result.gas_used, 2_200 + input_data.len() as u64 * 16);
@@ -1464,19 +1686,18 @@ mod tests {
         // Create a contract
         let sender = Address([1u8; 20]);
         let init_code = vec![0x60, 0x60, 0x60];
-        let (contract_address, _) = executor.create_contract(
-            sender, 0, init_code, 0, 100_000
-        ).await.unwrap();
+        let (contract_address, _) = executor
+            .create_contract(sender, 0, init_code, 0, 100_000)
+            .await
+            .unwrap();
 
         // Perform static call
         let caller = Address([2u8; 20]);
         let input_data = vec![0x01, 0x02];
-        let result = executor.static_call(
-            caller,
-            contract_address,
-            input_data.clone(),
-            50_000,
-        ).await.unwrap();
+        let result = executor
+            .static_call(caller, contract_address, input_data.clone(), 50_000)
+            .await
+            .unwrap();
 
         assert!(result.success);
         assert_eq!(result.gas_used, 2_200 + input_data.len() as u64 * 16);
@@ -1493,12 +1714,9 @@ mod tests {
         let input_data = vec![0x01];
 
         // Static call to non-contract should fail
-        let result = executor.static_call(
-            caller,
-            non_contract,
-            input_data,
-            50_000,
-        ).await;
+        let result = executor
+            .static_call(caller, non_contract, input_data, 50_000)
+            .await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1540,7 +1758,10 @@ mod tests {
         let data = vec![0x01, 0x02];
 
         // Emit LOG1
-        executor.emit_log1(address, topic0, data.clone()).await.unwrap();
+        executor
+            .emit_log1(address, topic0, data.clone())
+            .await
+            .unwrap();
 
         let logs = executor.get_logs().await;
         assert_eq!(logs.len(), 1);
@@ -1560,7 +1781,10 @@ mod tests {
         let data = vec![0x01];
 
         // Emit LOG2
-        executor.emit_log2(address, topic0, topic1, data.clone()).await.unwrap();
+        executor
+            .emit_log2(address, topic0, topic1, data.clone())
+            .await
+            .unwrap();
 
         let logs = executor.get_logs().await;
         assert_eq!(logs.len(), 1);
@@ -1581,7 +1805,10 @@ mod tests {
         let topic2 = Hash([12u8; 32]);
         let data = vec![0x01];
 
-        executor.emit_log3(address, topic0, topic1, topic2, data).await.unwrap();
+        executor
+            .emit_log3(address, topic0, topic1, topic2, data)
+            .await
+            .unwrap();
 
         let logs = executor.get_logs().await;
         assert_eq!(logs.len(), 1);
@@ -1601,7 +1828,10 @@ mod tests {
         let topic3 = Hash([13u8; 32]);
         let data = vec![0x01];
 
-        executor.emit_log4(address, topic0, topic1, topic2, topic3, data).await.unwrap();
+        executor
+            .emit_log4(address, topic0, topic1, topic2, topic3, data)
+            .await
+            .unwrap();
 
         let logs = executor.get_logs().await;
         assert_eq!(logs.len(), 1);
@@ -1644,7 +1874,10 @@ mod tests {
         let data = vec![0x01];
 
         // Emit logs
-        executor.emit_log1(address, topic0, data.clone()).await.unwrap();
+        executor
+            .emit_log1(address, topic0, data.clone())
+            .await
+            .unwrap();
         executor.emit_log0(address, data.clone()).await.unwrap();
 
         assert_eq!(executor.get_logs().await.len(), 2);
@@ -1676,17 +1909,19 @@ mod tests {
         };
 
         // Create receipt
-        let receipt = executor.create_receipt(
-            tx_hash,
-            block_hash,
-            block_number,
-            tx_index,
-            from,
-            None, // to
-            &execution_result,
-            None,
-            21_000,
-        ).await;
+        let receipt = executor
+            .create_receipt(
+                tx_hash,
+                block_hash,
+                block_number,
+                tx_index,
+                from,
+                None, // to
+                &execution_result,
+                None,
+                21_000,
+            )
+            .await;
 
         assert_eq!(receipt.tx_hash, tx_hash);
         assert_eq!(receipt.block_number, block_number);
@@ -1707,7 +1942,10 @@ mod tests {
         let from = Address([4u8; 20]);
 
         // Emit some logs
-        executor.emit_log1(contract_address, Hash([10u8; 32]), vec![0x01]).await.unwrap();
+        executor
+            .emit_log1(contract_address, Hash([10u8; 32]), vec![0x01])
+            .await
+            .unwrap();
 
         let execution_result = EVMExecutionResult {
             success: true,
@@ -1718,17 +1956,19 @@ mod tests {
         };
 
         // Create receipt with contract address
-        let receipt = executor.create_receipt(
-            tx_hash,
-            block_hash,
-            100,
-            0,
-            from,
-            Some(contract_address),
-            &execution_result,
-            Some(contract_address),
-            100_000,
-        ).await;
+        let receipt = executor
+            .create_receipt(
+                tx_hash,
+                block_hash,
+                100,
+                0,
+                from,
+                Some(contract_address),
+                &execution_result,
+                Some(contract_address),
+                100_000,
+            )
+            .await;
 
         assert_eq!(receipt.contract_address, Some(contract_address));
         assert_eq!(receipt.logs.len(), 1);
@@ -1754,17 +1994,19 @@ mod tests {
         };
 
         // Create and store receipt
-        let receipt = executor.create_receipt(
-            tx_hash,
-            block_hash,
-            100,
-            0,
-            from,
-            None,
-            &execution_result,
-            None,
-            21_000,
-        ).await;
+        let receipt = executor
+            .create_receipt(
+                tx_hash,
+                block_hash,
+                100,
+                0,
+                from,
+                None,
+                &execution_result,
+                None,
+                21_000,
+            )
+            .await;
 
         executor.receipt_db().put_receipt(receipt).await.unwrap();
 
@@ -1784,27 +2026,22 @@ mod tests {
 
         // Create contract with size exactly at limit (should succeed)
         let valid_code = vec![0x60; 24_576]; // 24KB exactly
-        let result = executor.create_contract(
-            sender,
-            0,
-            valid_code.clone(),
-            0,
-            100_000,
-        ).await;
+        let result = executor
+            .create_contract(sender, 0, valid_code.clone(), 0, 100_000)
+            .await;
 
         assert!(result.is_ok(), "Contract at size limit should be accepted");
 
         // Create contract with size exceeding limit (should fail)
         let oversized_code = vec![0x60; 24_577]; // 24KB + 1
-        let result = executor.create_contract(
-            sender,
-            1,
-            oversized_code,
-            0,
-            100_000,
-        ).await;
+        let result = executor
+            .create_contract(sender, 1, oversized_code, 0, 100_000)
+            .await;
 
-        assert!(result.is_err(), "Contract exceeding size limit should be rejected");
+        assert!(
+            result.is_err(),
+            "Contract exceeding size limit should be rejected"
+        );
         match result.unwrap_err() {
             EVMError::ContractCreationFailed(msg) => {
                 assert!(msg.contains("too large"), "Error should mention size limit");
@@ -1824,27 +2061,25 @@ mod tests {
 
         // CREATE2 with size exactly at limit (should succeed)
         let valid_code = vec![0x60; 24_576];
-        let result = executor.create2_contract(
-            sender,
-            salt,
-            valid_code,
-            0,
-            100_000,
-        ).await;
+        let result = executor
+            .create2_contract(sender, salt, valid_code, 0, 100_000)
+            .await;
 
-        assert!(result.is_ok(), "CREATE2 contract at size limit should be accepted");
+        assert!(
+            result.is_ok(),
+            "CREATE2 contract at size limit should be accepted"
+        );
 
         // CREATE2 with size exceeding limit (should fail)
         let oversized_code = vec![0x60; 24_577];
-        let result = executor.create2_contract(
-            sender,
-            salt,
-            oversized_code,
-            0,
-            100_000,
-        ).await;
+        let result = executor
+            .create2_contract(sender, salt, oversized_code, 0, 100_000)
+            .await;
 
-        assert!(result.is_err(), "CREATE2 contract exceeding size limit should be rejected");
+        assert!(
+            result.is_err(),
+            "CREATE2 contract exceeding size limit should be rejected"
+        );
         match result.unwrap_err() {
             EVMError::ContractCreationFailed(msg) => {
                 assert!(msg.contains("too large"), "Error should mention size limit");
@@ -1868,27 +2103,25 @@ mod tests {
 
         // Contract at custom limit (should succeed)
         let valid_code = vec![0x60; 10_000];
-        let result = executor.create_contract(
-            sender,
-            0,
-            valid_code,
-            0,
-            100_000,
-        ).await;
+        let result = executor
+            .create_contract(sender, 0, valid_code, 0, 100_000)
+            .await;
 
-        assert!(result.is_ok(), "Contract at custom limit should be accepted");
+        assert!(
+            result.is_ok(),
+            "Contract at custom limit should be accepted"
+        );
 
         // Contract exceeding custom limit (should fail)
         let oversized_code = vec![0x60; 10_001];
-        let result = executor.create_contract(
-            sender,
-            1,
-            oversized_code,
-            0,
-            100_000,
-        ).await;
+        let result = executor
+            .create_contract(sender, 1, oversized_code, 0, 100_000)
+            .await;
 
-        assert!(result.is_err(), "Contract exceeding custom limit should be rejected");
+        assert!(
+            result.is_err(),
+            "Contract exceeding custom limit should be rejected"
+        );
     }
 
     // === revm Integration Tests ===
@@ -1903,19 +2136,24 @@ mod tests {
         let sender = Address([1u8; 20]);
         let receiver = Address([2u8; 20]);
 
-        state_manager.update_balance(&sender, BigUint::from(2_000_000_000_000_000_000u128)).await.unwrap(); // 2 ETH
+        state_manager
+            .update_balance(&sender, BigUint::from(2_000_000_000_000_000_000u128))
+            .await
+            .unwrap(); // 2 ETH
 
         let ctx = EVMContext::default();
 
         // Execute simple transfer using revm
-        let result = executor.execute_with_revm(
-            sender,
-            Some(receiver),
-            1_000_000_000_000_000_000u128, // 1 ETH
-            Vec::new(), // No call data
-            100_000,    // Gas limit
-            &ctx,
-        ).await;
+        let result = executor
+            .execute_with_revm(
+                sender,
+                Some(receiver),
+                1_000_000_000_000_000_000u128, // 1 ETH
+                Vec::new(),                    // No call data
+                100_000,                       // Gas limit
+                &ctx,
+            )
+            .await;
 
         assert!(result.is_ok(), "revm execution should succeed");
         let exec_result = result.unwrap();
@@ -1933,43 +2171,41 @@ mod tests {
         // Create a simple contract
         let creator = Address([1u8; 20]);
         // Set up creator with sufficient balance for gas fees
-        state_manager.add_balance(&creator, &num_bigint::BigUint::from(1_000_000_000_000_000u128)).await.unwrap();
+        state_manager
+            .add_balance(
+                &creator,
+                &num_bigint::BigUint::from(1_000_000_000_000_000u128),
+            )
+            .await
+            .unwrap();
 
         let contract_code = vec![
             0x60, 0x00, // PUSH1 0
             0x60, 0x00, // PUSH1 0
-            0x54,       // SLOAD
+            0x54, // SLOAD
             0x60, 0x01, // PUSH1 1
-            0x01,       // ADD
+            0x01, // ADD
             0x60, 0x00, // PUSH1 0
-            0x55,       // SSTORE
+            0x55, // SSTORE
             0x60, 0x00, // PUSH1 0
-            0x52,       // MSTORE
+            0x52, // MSTORE
             0x60, 0x20, // PUSH1 32
             0x60, 0x00, // PUSH1 0
-            0xF3,       // RETURN
+            0xF3, // RETURN
         ];
 
-        let (contract_address, _) = executor.create_contract(
-            creator,
-            0,
-            contract_code.clone(),
-            0,
-            1_000_000,
-        ).await.unwrap();
+        let (contract_address, _) = executor
+            .create_contract(creator, 0, contract_code.clone(), 0, 1_000_000)
+            .await
+            .unwrap();
 
         // Call the contract using revm
         let ctx = EVMContext::default();
         let call_data = vec![0x00, 0x00, 0x00, 0x00]; // Function selector
 
-        let result = executor.execute_with_revm(
-            creator,
-            Some(contract_address),
-            0,
-            call_data,
-            100_000,
-            &ctx,
-        ).await;
+        let result = executor
+            .execute_with_revm(creator, Some(contract_address), 0, call_data, 100_000, &ctx)
+            .await;
 
         assert!(result.is_ok(), "Contract call should execute");
         let exec_result = result.unwrap();
@@ -1986,45 +2222,55 @@ mod tests {
         // Create contract that uses storage
         let creator = Address([1u8; 20]);
         // Set up creator with sufficient balance for gas fees
-        state_manager.add_balance(&creator, &num_bigint::BigUint::from(1_000_000_000_000_000u128)).await.unwrap();
+        state_manager
+            .add_balance(
+                &creator,
+                &num_bigint::BigUint::from(1_000_000_000_000_000u128),
+            )
+            .await
+            .unwrap();
 
         // Simplest possible contract - just RETURN
         let contract_code = vec![
             0x60, 0x00, // PUSH1 0
             0x60, 0x00, // PUSH1 0
-            0x52,       // MSTORE
+            0x52, // MSTORE
             0x60, 0x20, // PUSH1 32
             0x60, 0x00, // PUSH1 0
-            0xF3,       // RETURN
+            0xF3, // RETURN
         ];
 
-        let (contract_address, _) = executor.create_contract(
-            creator,
-            0,
-            contract_code,
-            0,
-            1_000_000,
-        ).await.unwrap();
+        let (contract_address, _) = executor
+            .create_contract(creator, 0, contract_code, 0, 1_000_000)
+            .await
+            .unwrap();
 
         // Verify contract is properly stored
         eprintln!("Contract address: {:?}", contract_address);
-        eprintln!("Is contract: {}", executor.code_storage().is_contract(&contract_address).await);
+        eprintln!(
+            "Is contract: {}",
+            executor.code_storage().is_contract(&contract_address).await
+        );
 
         // Execute contract with revm
         let ctx = EVMContext::default();
-        let result = executor.execute_with_revm(
-            creator,
-            Some(contract_address),
-            0,
-            Vec::new(),
-            500_000,
-            &ctx,
-        ).await;
+        let result = executor
+            .execute_with_revm(
+                creator,
+                Some(contract_address),
+                0,
+                Vec::new(),
+                500_000,
+                &ctx,
+            )
+            .await;
 
         assert!(result.is_ok(), "Storage operation should succeed");
         let exec_result = result.unwrap();
-        eprintln!("exec_result.success={}, gas_used={}, error={:?}",
-            exec_result.success, exec_result.gas_used, exec_result.error);
+        eprintln!(
+            "exec_result.success={}, gas_used={}, error={:?}",
+            exec_result.success, exec_result.gas_used, exec_result.error
+        );
         // For now just check it doesn't panic - revm execution behavior may vary
     }
 
@@ -2037,26 +2283,34 @@ mod tests {
         let sender = Address([1u8; 20]);
         let receiver = Address([2u8; 20]);
 
-        state_manager.update_balance(&sender, BigUint::from(10_000_000_000_000_000_000u128)).await.unwrap();
+        state_manager
+            .update_balance(&sender, BigUint::from(10_000_000_000_000_000_000u128))
+            .await
+            .unwrap();
 
         let ctx = EVMContext::default();
 
         // Test different gas scenarios
-        let transfer_result = executor.execute_with_revm(
-            sender,
-            Some(receiver),
-            1_000_000_000_000_000_000u128,
-            Vec::new(),
-            21_000, // Exactly the gas needed for transfer
-            &ctx,
-        ).await;
+        let transfer_result = executor
+            .execute_with_revm(
+                sender,
+                Some(receiver),
+                1_000_000_000_000_000_000u128,
+                Vec::new(),
+                21_000, // Exactly the gas needed for transfer
+                &ctx,
+            )
+            .await;
 
         assert!(transfer_result.is_ok());
         let result = transfer_result.unwrap();
         assert!(result.success);
         // Gas used should be close to 21_000 for simple transfer
-        assert!(result.gas_used >= 21_000 && result.gas_used <= 25_000,
-                "Gas used should be reasonable for simple transfer: {}", result.gas_used);
+        assert!(
+            result.gas_used >= 21_000 && result.gas_used <= 25_000,
+            "Gas used should be reasonable for simple transfer: {}",
+            result.gas_used
+        );
     }
 
     #[tokio::test]
@@ -2068,7 +2322,13 @@ mod tests {
         // Create contract that emits logs
         let creator = Address([1u8; 20]);
         // Set up creator with sufficient balance for gas fees
-        state_manager.add_balance(&creator, &num_bigint::BigUint::from(1_000_000_000_000_000u128)).await.unwrap();
+        state_manager
+            .add_balance(
+                &creator,
+                &num_bigint::BigUint::from(1_000_000_000_000_000u128),
+            )
+            .await
+            .unwrap();
 
         // Contract with LOG1
         let contract_code = vec![
@@ -2076,38 +2336,39 @@ mod tests {
             0x60, 0x00, // PUSH1 0 (offset)
             0x60, 0x00, // PUSH1 0 (size)
             0x60, 0xAB, // PUSH1 topic
-            0xA1,       // LOG1
+            0xA1, // LOG1
             0x60, 0x00, // PUSH1 0
-            0x52,       // MSTORE
+            0x52, // MSTORE
             0x60, 0x20, // PUSH1 32
             0x60, 0x00, // PUSH1 0
-            0xF3,       // RETURN
+            0xF3, // RETURN
         ];
 
-        let (contract_address, _) = executor.create_contract(
-            creator,
-            0,
-            contract_code,
-            0,
-            1_000_000,
-        ).await.unwrap();
+        let (contract_address, _) = executor
+            .create_contract(creator, 0, contract_code, 0, 1_000_000)
+            .await
+            .unwrap();
 
         // Execute and capture logs
         let ctx = EVMContext::default();
-        let result = executor.execute_with_revm(
-            creator,
-            Some(contract_address),
-            0,
-            Vec::new(),
-            500_000,
-            &ctx,
-        ).await;
+        let result = executor
+            .execute_with_revm(
+                creator,
+                Some(contract_address),
+                0,
+                Vec::new(),
+                500_000,
+                &ctx,
+            )
+            .await;
 
         assert!(result.is_ok());
         let exec_result = result.unwrap();
         // Should have emitted a log
         // Note: log extraction may vary based on revm version
-        info!("Execution with logs: {} logs emitted", exec_result.logs.len());
+        info!(
+            "Execution with logs: {} logs emitted",
+            exec_result.logs.len()
+        );
     }
 }
-

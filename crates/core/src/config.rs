@@ -21,7 +21,9 @@ pub struct CoreConfig {
 
 pub fn init_config<P: AsRef<Path>>(path: P) -> Result<()> {
     let config: CoreConfig = load_config(path)?;
-    CORE_CONFIG.set(config).map_err(|_| anyhow::anyhow!("Config already initialized"))?;
+    CORE_CONFIG
+        .set(config)
+        .map_err(|_| anyhow::anyhow!("Config already initialized"))?;
     Ok(())
 }
 

@@ -8,7 +8,7 @@
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio_tungstenite::connect_async;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 use tracing_subscriber;
 
 #[tokio::main]
@@ -73,7 +73,10 @@ fn handle_message(msg: serde_json::Value) {
     // Check if it's a subscription notification
     if let Some(_subscription) = msg.get("subscription") {
         if let Some(result) = msg.get("result") {
-            info!("📨 Notification received: {}", serde_json::to_string_pretty(result).unwrap_or_default());
+            info!(
+                "📨 Notification received: {}",
+                serde_json::to_string_pretty(result).unwrap_or_default()
+            );
         }
     }
     // Check if it's a response to our subscription request
@@ -81,11 +84,17 @@ fn handle_message(msg: serde_json::Value) {
         if result.is_string() {
             info!("✅ Subscribed successfully! Subscription ID: {}", result);
         } else {
-            info!("Response: {}", serde_json::to_string_pretty(&msg).unwrap_or_default());
+            info!(
+                "Response: {}",
+                serde_json::to_string_pretty(&msg).unwrap_or_default()
+            );
         }
     }
     // Check if it's an error
     else if let Some(_error) = msg.get("error") {
-        warn!("❌ Error received: {}", serde_json::to_string_pretty(&msg).unwrap_or_default());
+        warn!(
+            "❌ Error received: {}",
+            serde_json::to_string_pretty(&msg).unwrap_or_default()
+        );
     }
 }

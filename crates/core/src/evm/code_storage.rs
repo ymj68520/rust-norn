@@ -4,11 +4,11 @@
 
 use crate::evm::{EVMError, EVMResult};
 use norn_common::types::{Address, Hash};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
-use sha2::{Sha256, Digest};
 
 /// Contract code storage
 pub struct CodeStorage {
@@ -32,11 +32,27 @@ impl CodeStorage {
         }
     }
 
+    /// Create an isolated deep copy for deterministic block execution.
+    pub async fn fork(&self) -> EVMResult<Self> {
+        let codes = self.codes.read().await.clone();
+        let address_to_code = self.address_to_code.read().await.clone();
+        let code_to_addresses = self.code_to_addresses.read().await.clone();
+        Ok(Self {
+            codes: Arc::new(RwLock::new(codes)),
+            address_to_code: Arc::new(RwLock::new(address_to_code)),
+            code_to_addresses: Arc::new(RwLock::new(code_to_addresses)),
+        })
+    }
+
     /// Store contract code
     pub async fn store_code(&self, code_hash: Hash, code: Vec<u8>) -> EVMResult<()> {
         let mut codes = self.codes.write().await;
         codes.insert(code_hash, code);
-        debug!("Stored code: hash={:?}, size={} bytes", code_hash, codes.get(&code_hash).map(|c| c.len()).unwrap_or(0));
+        debug!(
+            "Stored code: hash={:?}, size={} bytes",
+            code_hash,
+            codes.get(&code_hash).map(|c| c.len()).unwrap_or(0)
+        );
         Ok(())
     }
 
@@ -48,6 +64,7 @@ impl CodeStorage {
 
     /// Bind code to address
     pub async fn bind_code_to_address(&self, address: Address, code_hash: Hash) -> EVMResult<()> {
+        self.unbind_code_from_address(&address).await?;
         {
             let mut addr_to_code = self.address_to_code.write().await;
             addr_to_code.insert(address, code_hash);
@@ -55,10 +72,48 @@ impl CodeStorage {
 
         {
             let mut code_to_addrs = self.code_to_addresses.write().await;
-            code_to_addrs.entry(code_hash).or_insert_with(Vec::new).push(address);
+            code_to_addrs
+                .entry(code_hash)
+                .or_insert_with(Vec::new)
+                .push(address);
         }
 
-        info!("Bound code to address: address={:?}, code_hash={:?}", address, code_hash);
+        info!(
+            "Bound code to address: address={:?}, code_hash={:?}",
+            address, code_hash
+        );
+        Ok(())
+    }
+
+    /// Remove the address binding and return its previous code hash.
+    pub async fn unbind_code_from_address(&self, address: &Address) -> EVMResult<Option<Hash>> {
+        let previous = self.address_to_code.write().await.remove(address);
+        if let Some(code_hash) = previous {
+            let mut code_to_addresses = self.code_to_addresses.write().await;
+            if let Some(addresses) = code_to_addresses.get_mut(&code_hash) {
+                addresses.retain(|candidate| candidate != address);
+                if addresses.is_empty() {
+                    code_to_addresses.remove(&code_hash);
+                }
+            }
+        }
+        Ok(previous)
+    }
+
+    /// Apply one code-address mutation to this storage instance.
+    pub async fn apply_code_change(
+        &self,
+        address: Address,
+        code_hash: Hash,
+        code: Vec<u8>,
+        deleted: bool,
+    ) -> EVMResult<()> {
+        if deleted {
+            self.unbind_code_from_address(&address).await?;
+        } else {
+            self.store_code(code_hash, code).await?;
+            self.bind_code_to_address(address, code_hash).await?;
+        }
         Ok(())
     }
 
@@ -111,7 +166,7 @@ impl CodeStorage {
         salt: [u8; 32],
         init_code_hash: Hash,
     ) -> Address {
-        use sha2::{Sha256, Digest as _};
+        use sha2::{Digest as _, Sha256};
 
         let mut hasher = Sha256::new();
         hasher.update([0xff]);
@@ -165,7 +220,10 @@ mod tests {
 
         // Store and bind
         storage.store_code(code_hash, code.clone()).await.unwrap();
-        storage.bind_code_to_address(address, code_hash).await.unwrap();
+        storage
+            .bind_code_to_address(address, code_hash)
+            .await
+            .unwrap();
 
         // Check binding
         assert!(storage.is_contract(&address).await);
@@ -217,8 +275,14 @@ mod tests {
         let addr2 = Address([2u8; 20]);
 
         storage.store_code(code_hash, code).await.unwrap();
-        storage.bind_code_to_address(addr1, code_hash).await.unwrap();
-        storage.bind_code_to_address(addr2, code_hash).await.unwrap();
+        storage
+            .bind_code_to_address(addr1, code_hash)
+            .await
+            .unwrap();
+        storage
+            .bind_code_to_address(addr2, code_hash)
+            .await
+            .unwrap();
 
         let addresses = storage.get_addresses_with_code(&code_hash).await.unwrap();
         assert_eq!(addresses.len(), 2);

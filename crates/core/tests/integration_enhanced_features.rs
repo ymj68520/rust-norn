@@ -5,8 +5,8 @@
 //! - Fast sync mechanism (mocked)
 //! - RPC improvements (mocked)
 
+use norn_common::types::{Address, Hash, Transaction};
 use norn_core::txpool_enhanced::EnhancedTxPool;
-use norn_common::types::{Transaction, Address, Hash};
 use std::sync::Arc;
 
 #[tokio::test]

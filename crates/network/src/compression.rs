@@ -3,10 +3,10 @@
 //! This module provides compression utilities for network messages to reduce
 //! bandwidth usage and improve synchronization performance.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use tracing::{debug, trace};
-use serde::{Serialize, Deserialize};
 
 /// Compression algorithm
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,35 +114,26 @@ impl Compressor {
     pub fn compress(&self, data: &[u8]) -> Result<Vec<u8>> {
         // Skip compression if data is too small
         if self.config.adaptive && data.len() < self.config.min_size {
-            trace!("Skipping compression for small message ({} bytes)", data.len());
+            trace!(
+                "Skipping compression for small message ({} bytes)",
+                data.len()
+            );
             return Ok(data.to_vec());
         }
 
         match self.config.algorithm {
-            CompressionAlgorithm::None => {
-                Ok(data.to_vec())
-            }
-            CompressionAlgorithm::Zstd => {
-                self.compress_zstd(data)
-            }
-            CompressionAlgorithm::Snappy => {
-                self.compress_snappy(data)
-            }
+            CompressionAlgorithm::None => Ok(data.to_vec()),
+            CompressionAlgorithm::Zstd => self.compress_zstd(data),
+            CompressionAlgorithm::Snappy => self.compress_snappy(data),
         }
     }
 
     /// Decompress data
     pub fn decompress(&self, data: &[u8], algorithm: CompressionAlgorithm) -> Result<Vec<u8>> {
         match algorithm {
-            CompressionAlgorithm::None => {
-                Ok(data.to_vec())
-            }
-            CompressionAlgorithm::Zstd => {
-                self.decompress_zstd(data)
-            }
-            CompressionAlgorithm::Snappy => {
-                self.decompress_snappy(data)
-            }
+            CompressionAlgorithm::None => Ok(data.to_vec()),
+            CompressionAlgorithm::Zstd => self.decompress_zstd(data),
+            CompressionAlgorithm::Snappy => self.decompress_snappy(data),
         }
     }
 
@@ -167,7 +158,11 @@ impl Compressor {
     fn decompress_zstd(&self, data: &[u8]) -> Result<Vec<u8>> {
         // Use zstd bulk decompression API
         let decompressed = zstd::bulk::decompress(data, 10 * 1024 * 1024)?; // 10MB max output
-        debug!("Zstd decompression: {} -> {} bytes", data.len(), decompressed.len());
+        debug!(
+            "Zstd decompression: {} -> {} bytes",
+            data.len(),
+            decompressed.len()
+        );
 
         Ok(decompressed)
     }
@@ -192,7 +187,11 @@ impl Compressor {
         let mut decoder = snap::raw::Decoder::new();
         let decompressed = decoder.decompress_vec(data)?;
 
-        debug!("Snappy decompression: {} -> {} bytes", data.len(), decompressed.len());
+        debug!(
+            "Snappy decompression: {} -> {} bytes",
+            data.len(),
+            decompressed.len()
+        );
 
         Ok(decompressed)
     }
@@ -242,7 +241,9 @@ mod tests {
         assert!(compressed.len() < data.len() + 100);
 
         // Decompress and verify
-        let decompressed = compressor.decompress(&compressed, CompressionAlgorithm::Zstd).unwrap();
+        let decompressed = compressor
+            .decompress(&compressed, CompressionAlgorithm::Zstd)
+            .unwrap();
         assert_eq!(decompressed, data);
     }
 

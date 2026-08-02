@@ -3,10 +3,10 @@
 //! This module provides a wrapper for compressed network messages,
 //! allowing efficient transmission of large data structures.
 
-use serde::{Serialize, Deserialize};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
-use crate::compression::{CompressionAlgorithm, Compressor, CompressionConfig};
+use crate::compression::{CompressionAlgorithm, CompressionConfig, Compressor};
 
 /// Compressed message wrapper
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -25,11 +25,7 @@ pub struct CompressedMessage {
 
 impl CompressedMessage {
     /// Create a new compressed message
-    pub fn new(
-        data: Vec<u8>,
-        algorithm: CompressionAlgorithm,
-        original_size: usize,
-    ) -> Self {
+    pub fn new(data: Vec<u8>, algorithm: CompressionAlgorithm, original_size: usize) -> Self {
         Self {
             original_size,
             algorithm,
@@ -83,11 +79,7 @@ mod tests {
 
     #[test]
     fn test_compressed_message_creation() {
-        let msg = CompressedMessage::new(
-            vec![1, 2, 3],
-            CompressionAlgorithm::Zstd,
-            3,
-        );
+        let msg = CompressedMessage::new(vec![1, 2, 3], CompressionAlgorithm::Zstd, 3);
 
         assert_eq!(msg.original_size, 3);
         assert_eq!(msg.algorithm, CompressionAlgorithm::Zstd);

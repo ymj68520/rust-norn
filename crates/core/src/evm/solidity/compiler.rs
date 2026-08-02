@@ -35,10 +35,14 @@ impl SolidityCompilerExt for SolidityCompiler {
     ) -> SolidityResult<Vec<NornContractArtifact>> {
         let result = self.compile_source(source, contract_name)?;
 
-        result.contracts
+        result
+            .contracts
             .into_iter()
             .map(|contract| {
-                Ok(NornContractArtifact::from_compiled_contract(contract, self.version()))
+                Ok(NornContractArtifact::from_compiled_contract(
+                    contract,
+                    self.version(),
+                ))
             })
             .collect()
     }
@@ -50,10 +54,14 @@ impl SolidityCompilerExt for SolidityCompiler {
     ) -> SolidityResult<Vec<NornContractArtifact>> {
         let result = self.compile_files(files, contract_name)?;
 
-        result.contracts
+        result
+            .contracts
             .into_iter()
             .map(|contract| {
-                Ok(NornContractArtifact::from_compiled_contract(contract, self.version()))
+                Ok(NornContractArtifact::from_compiled_contract(
+                    contract,
+                    self.version(),
+                ))
             })
             .collect()
     }
@@ -89,29 +97,34 @@ pub struct NornContractArtifact {
 
 impl NornContractArtifact {
     /// Create from a compiled contract
-    fn from_compiled_contract(
-        contract: CompiledContract,
-        compiler_version: &str,
-    ) -> Self {
+    fn from_compiled_contract(contract: CompiledContract, compiler_version: &str) -> Self {
         let raw_abi = contract.abi.clone();
-        let abi_items: Vec<crate::evm::abi::ABIItem> = raw_abi.iter().filter_map(|item| {
-            match item {
-                norn_solidity::AbiItem::Function { name, inputs, outputs, .. } => {
-                    let core_inputs: Vec<crate::evm::abi::ABIParamType> = inputs.iter().map(|p| {
-                        crate::evm::abi::ABIParamType {
+        let abi_items: Vec<crate::evm::abi::ABIItem> = raw_abi
+            .iter()
+            .filter_map(|item| match item {
+                norn_solidity::AbiItem::Function {
+                    name,
+                    inputs,
+                    outputs,
+                    ..
+                } => {
+                    let core_inputs: Vec<crate::evm::abi::ABIParamType> = inputs
+                        .iter()
+                        .map(|p| crate::evm::abi::ABIParamType {
                             name: Some(p.name.clone()),
                             ty: parse_abi_type(&p.param_type),
                             indexed: p.indexed,
-                        }
-                    }).collect();
+                        })
+                        .collect();
 
-                    let core_outputs: Vec<crate::evm::abi::ABIParamType> = outputs.iter().map(|p| {
-                        crate::evm::abi::ABIParamType {
+                    let core_outputs: Vec<crate::evm::abi::ABIParamType> = outputs
+                        .iter()
+                        .map(|p| crate::evm::abi::ABIParamType {
                             name: Some(p.name.clone()),
                             ty: parse_abi_type(&p.param_type),
                             indexed: false,
-                        }
-                    }).collect();
+                        })
+                        .collect();
 
                     Some(crate::evm::abi::ABIItem::Function {
                         name: name.clone(),
@@ -120,13 +133,14 @@ impl NornContractArtifact {
                     })
                 }
                 norn_solidity::AbiItem::Event { name, inputs, .. } => {
-                    let core_inputs: Vec<crate::evm::abi::ABIParamType> = inputs.iter().map(|p| {
-                        crate::evm::abi::ABIParamType {
+                    let core_inputs: Vec<crate::evm::abi::ABIParamType> = inputs
+                        .iter()
+                        .map(|p| crate::evm::abi::ABIParamType {
                             name: Some(p.name.clone()),
                             ty: parse_abi_type(&p.param_type),
                             indexed: p.indexed,
-                        }
-                    }).collect();
+                        })
+                        .collect();
 
                     Some(crate::evm::abi::ABIItem::Event {
                         name: name.clone(),
@@ -134,16 +148,16 @@ impl NornContractArtifact {
                     })
                 }
                 _ => None,
-            }
-        }).collect();
+            })
+            .collect();
 
         // Compute function selectors
-        let selectors: Vec<(String, [u8; 4])> = abi_items.iter()
+        let selectors: Vec<(String, [u8; 4])> = abi_items
+            .iter()
             .filter_map(|item| {
                 if let crate::evm::abi::ABIItem::Function { name, inputs, .. } = item {
-                    let types: Vec<String> = inputs.iter().map(|p| {
-                        abi_type_to_string(&p.ty)
-                    }).collect();
+                    let types: Vec<String> =
+                        inputs.iter().map(|p| abi_type_to_string(&p.ty)).collect();
                     let sig = format!("{}({})", name, types.join(","));
                     let output = keccak256_bytes(sig.as_bytes());
                     let mut sel = [0u8; 4];
@@ -214,7 +228,10 @@ fn parse_abi_type(type_str: &str) -> crate::evm::abi::ABIType {
     use crate::evm::abi::ABIType;
 
     if type_str.starts_with("uint") || type_str.starts_with("int") {
-        return if let Some(bits_str) = type_str.strip_prefix("uint").or_else(|| type_str.strip_prefix("int")) {
+        return if let Some(bits_str) = type_str
+            .strip_prefix("uint")
+            .or_else(|| type_str.strip_prefix("int"))
+        {
             if let Ok(bits) = bits_str.parse::<u16>() {
                 if type_str.starts_with("uint") {
                     ABIType::Uint(bits)

@@ -1,8 +1,8 @@
+use async_trait::async_trait;
 use dashmap::DashMap;
 use norn_common::types::{Hash, Transaction};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use async_trait::async_trait;
-use tracing::{debug};
+use tracing::debug;
 
 // Trait to decouple TxPool from Blockchain
 #[async_trait]
@@ -61,7 +61,7 @@ impl TxPool {
         if self.count.load(Ordering::Relaxed) >= MAX_TX_POOL_SIZE {
             return;
         }
-        
+
         let hash = tx.body.hash;
         if self.txs.contains_key(&hash) {
             return;
@@ -94,7 +94,8 @@ impl TxPool {
         // But checking chain is async.
         // We can collect candidates first, then check async.
 
-        let candidates: Vec<(Hash, Transaction)> = self.txs
+        let candidates: Vec<(Hash, Transaction)> = self
+            .txs
             .iter()
             .take(MAX_TX_PACKAGE_COUNT * 2) // Take more to filter?
             .map(|r| (*r.key(), r.value().clone()))
@@ -111,8 +112,8 @@ impl TxPool {
             } else {
                 result.push(tx);
                 to_remove.push(hash); // Remove from pool as it is being packaged?
-                // Go code removes it from pool when packaging!
-                // "pool.txs.Delete(txHash)"
+                                      // Go code removes it from pool when packaging!
+                                      // "pool.txs.Delete(txHash)"
             }
         }
 
@@ -126,7 +127,11 @@ impl TxPool {
     pub async fn stats(&self) -> TxPoolStats {
         let size = self.count.load(Ordering::Relaxed);
         let total_gas_price = 0u64; // Standard pool doesn't track gas prices
-        let avg_gas_price = if size > 0 { total_gas_price / size as u64 } else { 0 };
+        let avg_gas_price = if size > 0 {
+            total_gas_price / size as u64
+        } else {
+            0
+        };
 
         TxPoolStats {
             size,
@@ -137,9 +142,7 @@ impl TxPool {
 }
 
 impl Default for TxPool {
-
     fn default() -> Self {
-
         Self::new()
     }
 }
@@ -182,46 +185,31 @@ pub mod tests {
 
     use async_trait::async_trait;
 
-
-
     pub struct MockChain;
 
     #[async_trait]
     impl ChainReader for MockChain {
-
         async fn get_transaction_by_hash(&self, _hash: &Hash) -> Option<Transaction> {
-
             None
-
         }
-
     }
 
-
-
     fn create_tx(byte: u8) -> Transaction {
-
         let mut tx = Transaction::default();
 
         tx.body.hash.0[0] = byte;
 
         tx
-
     }
-
-
 
     #[test]
 
     fn test_txpool_add_remove() {
-
         let pool = TxPool::new();
 
         let tx = create_tx(1);
 
         let hash = tx.body.hash;
-
-
 
         pool.add(tx.clone());
 
@@ -229,48 +217,34 @@ pub mod tests {
 
         assert!(pool.get(&hash).is_some());
 
-
-
         pool.remove(&hash);
 
         assert!(!pool.contains(&hash));
 
         assert!(pool.get(&hash).is_none());
-
     }
-
-
 
     #[tokio::test]
 
     async fn test_txpool_package() {
-
         let pool = TxPool::new();
 
         let tx1 = create_tx(1);
 
         let tx2 = create_tx(2);
 
-        
-
         pool.add(tx1.clone());
 
         pool.add(tx2.clone());
 
-        
-
         let chain = MockChain;
 
         let txs = pool.package(&chain).await;
-
-        
 
         assert_eq!(txs.len(), 2);
 
         assert!(!pool.contains(&tx1.body.hash));
 
         assert!(!pool.contains(&tx2.body.hash));
-
     }
-
 }

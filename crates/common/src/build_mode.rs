@@ -138,7 +138,7 @@ mod tests {
         // This is verified by checking the production flag behavior
         // In production mode (--features production), threshold = 128
         assert!(!IS_PRODUCTION_MODE); // This test runs without production feature
-        // Development mode (default, no features) should return 255
+                                      // Development mode (default, no features) should return 255
         assert_eq!(get_vrf_threshold(), 255);
     }
 

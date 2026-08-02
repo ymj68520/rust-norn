@@ -1,16 +1,16 @@
 //! Block synchronization module
-//! 
+//!
 //! This module handles block synchronization between peers.
 
-use std::sync::Arc;
-use std::time::Duration;
-use std::collections::HashMap;
-use tokio::sync::RwLock;
-use tokio::time::interval;
+use norn_common::types::{Block, Hash};
 use norn_core::blockchain::Blockchain;
 use norn_network::NetworkService;
-use norn_common::types::{Block, Hash};
-use tracing::{info, debug, warn, error};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio::time::interval;
+use tracing::{debug, error, info, warn};
 
 /// Block syncer state
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -94,12 +94,12 @@ impl BlockSyncer {
     /// Start the syncer
     pub async fn start(&self) {
         info!("Block syncer started");
-        
+
         let mut timer = interval(Duration::from_secs(self.config.check_interval_secs));
-        
+
         loop {
             timer.tick().await;
-            
+
             // Check if we need to sync
             if let Err(e) = self.sync_check().await {
                 error!("Sync check failed: {}", e);
@@ -115,7 +115,7 @@ impl BlockSyncer {
         };
 
         let target = *self.target_height.read().await;
-        
+
         if local_height >= target {
             let mut state = self.state.write().await;
             if *state != SyncState::Idle {
@@ -133,9 +133,9 @@ impl BlockSyncer {
         // Request missing blocks
         let from = local_height + 1;
         let to = std::cmp::min(from + self.config.batch_size as i64, target + 1);
-        
+
         self.request_blocks_internal(from, to).await;
-        
+
         Ok(())
     }
 
@@ -171,41 +171,47 @@ impl BlockSyncer {
             latest.header.height
         };
         let target = *self.target_height.read().await;
-        
+
         if target == 0 {
             return 1.0;
         }
-        
+
         (local_height as f64) / (target as f64)
     }
 
     /// Request blocks from peer
     async fn request_blocks_internal(&self, from_height: i64, to_height: i64) {
         debug!("Requesting blocks from {} to {}", from_height, to_height);
-        
+
         // Track pending requests
         let mut pending = self.pending_blocks.write().await;
         let now = std::time::Instant::now();
-        
+
         for height in from_height..to_height {
             if pending.len() >= self.config.max_pending_requests {
                 break;
             }
-            
+
             if !pending.contains_key(&height) {
-                pending.insert(height, PendingBlock {
+                pending.insert(
                     height,
-                    requested_at: now,
-                    retry_count: 0,
-                });
-                
+                    PendingBlock {
+                        height,
+                        requested_at: now,
+                        retry_count: 0,
+                    },
+                );
+
                 // Create block request message
                 let msg = BlockRequest { height }.to_bytes();
-                
+
                 // Broadcast request
-                if let Err(e) = self.network.command_tx.send(
-                    norn_network::service::NetworkCommand::BroadcastBlock(msg)
-                ).await {
+                if let Err(e) = self
+                    .network
+                    .command_tx
+                    .send(norn_network::service::NetworkCommand::BroadcastBlock(msg))
+                    .await
+                {
                     warn!("Failed to send block request: {}", e);
                 }
             }
@@ -221,27 +227,27 @@ impl BlockSyncer {
     pub async fn handle_block(&self, block: Block) -> anyhow::Result<()> {
         let height = block.header.height;
         debug!("Received block at height {}", height);
-        
+
         // Remove from pending
         let mut pending = self.pending_blocks.write().await;
         pending.remove(&height);
         drop(pending);
-        
+
         // Validate block height
         let expected_height = {
             let latest = self.blockchain.latest_block.read().await;
             latest.header.height + 1
         };
-        
+
         if height != expected_height {
             warn!("Received block {} but expected {}", height, expected_height);
             return Ok(());
         }
-        
+
         // Save block
         self.blockchain.save_block(&block).await?;
         info!("Applied block at height {}", height);
-        
+
         Ok(())
     }
 
@@ -258,11 +264,9 @@ impl BlockSyncer {
     pub async fn cleanup_pending(&self) {
         let timeout = Duration::from_secs(self.config.timeout_secs);
         let now = std::time::Instant::now();
-        
+
         let mut pending = self.pending_blocks.write().await;
-        pending.retain(|_, req| {
-            now.duration_since(req.requested_at) < timeout
-        });
+        pending.retain(|_, req| now.duration_since(req.requested_at) < timeout);
     }
 }
 

@@ -1,7 +1,7 @@
-use crate::chain_context::ChainContext;
-use crate::consensus_types::{StakeSnapshot, ValidatorRecord};
+use crate::chain_context::{ChainContext, MAX_BLOCK_MESSAGE_BYTES, MAX_TRANSACTION_MESSAGE_BYTES};
+use crate::consensus_types::{StakeSnapshot, ValidatorRecord, MAX_CONSENSUS_CERTIFICATE_VOTES};
 use crate::error::{NornError, Result};
-use crate::types::{Block, BlockHeader, ChainId, Hash, GenesisParams, ProtocolVersion};
+use crate::types::{Block, BlockHeader, ChainId, GenesisParams, Hash, ProtocolVersion};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -9,11 +9,82 @@ use std::path::Path;
 pub const GENESIS_SCHEMA_VERSION: u16 = 2;
 pub const GENESIS_IDENTITY_KEY: &[u8] = b"genesis_identity_v2";
 
+/// Consensus resource limits. They are part of the canonical Genesis
+/// document so validators cannot silently choose different execution bounds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolResourceLimits {
+    pub max_block_bytes: u64,
+    pub max_transactions_per_block: u32,
+    pub max_block_gas: u64,
+    pub max_transaction_bytes: u64,
+    pub max_transaction_gas: u64,
+    pub max_overlay_writes: u32,
+    pub max_certificate_members: u32,
+    pub max_future_height: u64,
+    pub max_future_round: u32,
+    pub max_verification_tasks: u32,
+    pub max_verification_queue: u32,
+}
+
+impl Default for ProtocolResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_block_bytes: 8 * 1024 * 1024,
+            max_transactions_per_block: 10_000,
+            max_block_gas: 10_000_000,
+            max_transaction_bytes: 256 * 1024,
+            max_transaction_gas: 10_000_000,
+            max_overlay_writes: 100_000,
+            max_certificate_members: MAX_CONSENSUS_CERTIFICATE_VOTES as u32,
+            max_future_height: 2,
+            max_future_round: 2,
+            max_verification_tasks: 64,
+            max_verification_queue: 256,
+        }
+    }
+}
+
+impl ProtocolResourceLimits {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_block_bytes == 0
+            || self.max_transactions_per_block == 0
+            || self.max_block_gas == 0
+            || self.max_transaction_bytes == 0
+            || self.max_transaction_gas == 0
+            || self.max_overlay_writes == 0
+            || self.max_certificate_members == 0
+            || self.max_verification_tasks == 0
+            || self.max_verification_queue == 0
+        {
+            return Err(NornError::Config(
+                "Genesis resource limits must be non-zero".into(),
+            ));
+        }
+        if self.max_transaction_bytes > self.max_block_bytes
+            || self.max_transaction_gas > self.max_block_gas
+            || self.max_certificate_members as usize > MAX_CONSENSUS_CERTIFICATE_VOTES
+            || self.max_verification_tasks > self.max_verification_queue
+            || self.max_block_bytes > MAX_BLOCK_MESSAGE_BYTES as u64
+            || self.max_transaction_bytes > MAX_TRANSACTION_MESSAGE_BYTES as u64
+            || self.max_block_gas > i64::MAX as u64
+            || self.max_block_bytes > usize::MAX as u64
+            || self.max_transaction_bytes > usize::MAX as u64
+        {
+            return Err(NornError::Config(
+                "Genesis transaction limits cannot exceed block limits".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Versioned, canonical network bootstrap document.
 ///
 /// The validator vector is normalized by ValidatorId when hashing, so the
 /// ordering in a JSON file cannot create different network identities.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GenesisConfig {
     pub schema_version: u16,
     pub protocol_version: ProtocolVersion,
@@ -21,6 +92,7 @@ pub struct GenesisConfig {
     pub epoch: u64,
     pub epoch_length: u64,
     pub initial_randomness: Hash,
+    pub resource_limits: ProtocolResourceLimits,
     pub genesis_block: Block,
     pub validators: Vec<ValidatorRecord>,
 }
@@ -35,6 +107,7 @@ impl GenesisConfig {
             epoch: genesis_block.header.epoch as u64,
             epoch_length: 1_000,
             initial_randomness: genesis_block.header.parent_randomness,
+            resource_limits: ProtocolResourceLimits::default(),
             genesis_block,
             validators: Vec::new(),
         }
@@ -70,27 +143,42 @@ impl GenesisConfig {
             )));
         }
         if self.protocol_version.0 == 0 {
-            return Err(NornError::Config("Genesis protocol version must be non-zero".into()));
+            return Err(NornError::Config(
+                "Genesis protocol version must be non-zero".into(),
+            ));
         }
         if self.chain_id.0 == Hash::default() {
-            return Err(NornError::Config("Genesis chain ID must be non-zero".into()));
+            return Err(NornError::Config(
+                "Genesis chain ID must be non-zero".into(),
+            ));
         }
         if self.epoch_length == 0 {
-            return Err(NornError::Config("Genesis epoch length must be non-zero".into()));
+            return Err(NornError::Config(
+                "Genesis epoch length must be non-zero".into(),
+            ));
         }
         if self.initial_randomness == Hash::default() {
-            return Err(NornError::Config("Genesis initial randomness must be non-zero".into()));
+            return Err(NornError::Config(
+                "Genesis initial randomness must be non-zero".into(),
+            ));
         }
+        self.resource_limits.validate()?;
 
         let header = &self.genesis_block.header;
         if header.height != 0 {
-            return Err(NornError::Config("Genesis block height must be zero".into()));
+            return Err(NornError::Config(
+                "Genesis block height must be zero".into(),
+            ));
         }
         if header.prev_block_hash != Hash::default() {
-            return Err(NornError::Config("Genesis previous hash must be zero".into()));
+            return Err(NornError::Config(
+                "Genesis previous hash must be zero".into(),
+            ));
         }
         if !self.genesis_block.transactions.is_empty() {
-            return Err(NornError::Config("Genesis block must not contain transactions".into()));
+            return Err(NornError::Config(
+                "Genesis block must not contain transactions".into(),
+            ));
         }
         if header.protocol_version != self.protocol_version {
             return Err(NornError::Config(
@@ -113,7 +201,9 @@ impl GenesisConfig {
             ));
         }
         if header.block_hash == Hash::default() {
-            return Err(NornError::Config("Genesis block hash must be non-zero".into()));
+            return Err(NornError::Config(
+                "Genesis block hash must be non-zero".into(),
+            ));
         }
         let calculated_header_hash = header
             .calculate_hash()
@@ -143,6 +233,18 @@ impl GenesisConfig {
         StakeSnapshot::from_genesis(self.epoch, self.validators.clone())
     }
 
+    /// Deterministic height-to-epoch rule shared by block validation and
+    /// consensus replay.  Height one is in the Genesis epoch; an epoch
+    /// boundary is crossed only after `epoch_length` finalized blocks.
+    pub fn epoch_for_height(&self, height: u64) -> Result<u64> {
+        if self.epoch_length == 0 {
+            return Err(NornError::Config("Genesis epoch length is zero".into()));
+        }
+        self.epoch
+            .checked_add(height.saturating_sub(1) / self.epoch_length)
+            .ok_or_else(|| NornError::Config("Genesis epoch overflow".into()))
+    }
+
     pub fn context(&self) -> ChainContext {
         ChainContext::new(
             self.schema_version,
@@ -163,10 +265,26 @@ impl GenesisConfig {
         bytes.extend_from_slice(b"NORN_GENESIS_V2");
         bytes.extend_from_slice(&self.schema_version.to_be_bytes());
         bytes.extend_from_slice(&self.protocol_version.0.to_be_bytes());
-        bytes.extend_from_slice(&self.chain_id.0.0);
+        bytes.extend_from_slice(&self.chain_id.0 .0);
         bytes.extend_from_slice(&self.epoch.to_be_bytes());
         bytes.extend_from_slice(&self.epoch_length.to_be_bytes());
         bytes.extend_from_slice(&self.initial_randomness.0);
+        bytes.extend_from_slice(&self.resource_limits.max_block_bytes.to_be_bytes());
+        bytes.extend_from_slice(
+            &self
+                .resource_limits
+                .max_transactions_per_block
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(&self.resource_limits.max_block_gas.to_be_bytes());
+        bytes.extend_from_slice(&self.resource_limits.max_transaction_bytes.to_be_bytes());
+        bytes.extend_from_slice(&self.resource_limits.max_transaction_gas.to_be_bytes());
+        bytes.extend_from_slice(&self.resource_limits.max_overlay_writes.to_be_bytes());
+        bytes.extend_from_slice(&self.resource_limits.max_certificate_members.to_be_bytes());
+        bytes.extend_from_slice(&self.resource_limits.max_future_height.to_be_bytes());
+        bytes.extend_from_slice(&self.resource_limits.max_future_round.to_be_bytes());
+        bytes.extend_from_slice(&self.resource_limits.max_verification_tasks.to_be_bytes());
+        bytes.extend_from_slice(&self.resource_limits.max_verification_queue.to_be_bytes());
         append_block_header(&mut bytes, &self.genesis_block.header);
 
         let mut validators = self.validators.clone();
@@ -181,7 +299,7 @@ impl GenesisConfig {
 
 fn append_block_header(bytes: &mut Vec<u8>, header: &BlockHeader) {
     bytes.extend_from_slice(&header.protocol_version.0.to_be_bytes());
-    bytes.extend_from_slice(&header.chain_id.0.0);
+    bytes.extend_from_slice(&header.chain_id.0 .0);
     bytes.extend_from_slice(&header.height.to_be_bytes());
     bytes.extend_from_slice(&header.epoch.to_be_bytes());
     bytes.extend_from_slice(&header.round.to_be_bytes());
@@ -237,10 +355,8 @@ pub fn get_genesis_block() -> Block {
 /// 创世块的固定哈希
 /// 使用预计算的哈希值，确保所有节点一致
 pub const GENESIS_BLOCK_HASH: Hash = Hash([
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
 ]);
 
 /// 创世时间戳 (Unix timestamp)
@@ -270,14 +386,10 @@ fn serialize_genesis_params() -> Vec<u8> {
 
 /// 创世块的VDF参数 - 大数阶（128字节）
 pub const GENESIS_ORDER: [u8; 128] = [
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 ];
 
 /// 创世块的VDF时间参数
@@ -285,18 +397,14 @@ pub const GENESIS_TIME_PARAM: i64 = 10_000_000; // 10 million iterations
 
 /// 创世块的VRF/VDF种子
 pub const GENESIS_SEED: Hash = Hash([
-    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
-    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
-    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
-    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+    0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
 ]);
 
 /// 创世块的VDF验证参数
 pub const GENESIS_VERIFY_PARAM: Hash = Hash([
-    0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43,
-    0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43,
-    0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43,
-    0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43,
+    0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43,
+    0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43, 0x43,
 ]);
 
 /// 验证是否为有效的创世块
@@ -314,7 +422,9 @@ pub async fn validate_genesis_start<F, Fut>(
 ) -> std::result::Result<bool, Box<dyn std::error::Error>>
 where
     F: Fn(Hash) -> Fut,
-    Fut: std::future::Future<Output = std::result::Result<Option<Block>, Box<dyn std::error::Error>>>,
+    Fut: std::future::Future<
+        Output = std::result::Result<Option<Block>, Box<dyn std::error::Error>>,
+    >,
 {
     // 尝试获取高度为0的区块
     match get_block(GENESIS_BLOCK_HASH).await {
@@ -351,7 +461,9 @@ mod tests {
         assert!(!is_valid_genesis_block(&invalid_genesis));
 
         invalid_genesis = valid_genesis.clone();
-        invalid_genesis.transactions.push(crate::types::Transaction::default());
+        invalid_genesis
+            .transactions
+            .push(crate::types::Transaction::default());
         assert!(!is_valid_genesis_block(&invalid_genesis));
     }
 
@@ -390,7 +502,23 @@ mod tests {
         assert!(first.validate().is_ok());
         assert!(second.validate().is_ok());
         assert_eq!(first.genesis_hash(), second.genesis_hash());
-        assert_eq!(first.stake_snapshot().unwrap(), second.stake_snapshot().unwrap());
+        assert_eq!(
+            first.stake_snapshot().unwrap(),
+            second.stake_snapshot().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_epoch_schedule_is_height_deterministic() {
+        let mut genesis = GenesisConfig::from_fixed_genesis();
+        genesis.epoch = 7;
+        genesis.epoch_length = 3;
+
+        assert_eq!(genesis.epoch_for_height(0).unwrap(), 7);
+        assert_eq!(genesis.epoch_for_height(1).unwrap(), 7);
+        assert_eq!(genesis.epoch_for_height(3).unwrap(), 7);
+        assert_eq!(genesis.epoch_for_height(4).unwrap(), 8);
+        assert_eq!(genesis.epoch_for_height(7).unwrap(), 9);
     }
 
     #[test]
@@ -414,5 +542,16 @@ mod tests {
         ];
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_genesis_rejects_unknown_json_fields() {
+        let mut value = serde_json::to_value(GenesisConfig::from_fixed_genesis()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected_field".into(), serde_json::Value::Null);
+
+        assert!(serde_json::from_value::<GenesisConfig>(value).is_err());
     }
 }

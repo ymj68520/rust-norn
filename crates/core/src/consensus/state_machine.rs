@@ -4,12 +4,13 @@ use super::safety_store::{ConsensusSafetyStore, ConsensusSigner, VoteSignRequest
 use super::types::{ConsensusConfig, ConsensusStep, ElectionMath};
 use super::vote_pool::{AddVoteResult, VotePool};
 use anyhow::{anyhow, Result};
+use k256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use norn_common::consensus_types::{
-    CommitCertificate, PrevoteCertificate, Proposal, SignedVote, StakeSnapshot, VoteStep,
+    CommitCertificate, FinalizedConsensusState, PrevoteCertificate, Proposal, SignedVote,
+    StakeSnapshot, VoteStep,
 };
-use norn_common::types::{Block, BlockId, ValidatorId};
-use norn_crypto::vrf::{VrfContext, VRFCalculator, VRFOutputData, VRFPreOutBytes, VRFProofBytes};
-use k256::ecdsa::{VerifyingKey, Signature, signature::Verifier};
+use norn_common::types::{Block, BlockHeader, BlockId, BlockV2, ValidatorId};
+use norn_crypto::vrf::{VRFPreOutBytes, VRFProofBytes, VerifiedVrfOutput, VrfContext};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -31,6 +32,185 @@ pub struct TendermintStateMachine {
     pub vote_pool: VotePool,
     pub safety_store: Arc<dyn ConsensusSafetyStore>,
     pub local_validator_id: Option<ValidatorId>,
+}
+
+/// A side-effect-free request emitted by the consensus state machine.  The
+/// driver must persist and sign it before acknowledging it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoteIntent {
+    pub request: VoteSignRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsensusAction {
+    SignVote(VoteIntent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsensusEvent {
+    VotePersisted(SignedVote),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::consensus::safety_store::MemorySafetyStore;
+    use norn_common::types::{Hash, StakeSnapshotHash};
+    use std::collections::BTreeMap;
+
+    struct DummySigner;
+
+    impl ConsensusSigner for DummySigner {
+        fn sign_canonical_bytes(&self, _bytes: &[u8]) -> Result<[u8; 64]> {
+            Ok([9u8; 64])
+        }
+    }
+
+    struct FailingSigner;
+
+    impl ConsensusSigner for FailingSigner {
+        fn sign_canonical_bytes(&self, _bytes: &[u8]) -> Result<[u8; 64]> {
+            Err(anyhow!("injected signer failure"))
+        }
+    }
+
+    #[test]
+    fn finalized_randomness_is_the_only_next_height_parent_seed() {
+        let snapshot = StakeSnapshot {
+            epoch: 1,
+            validators: BTreeMap::new(),
+            snapshot_hash: StakeSnapshotHash([7; 32]),
+        };
+        let safety_store = Arc::new(MemorySafetyStore::new());
+        let mut state_machine = TendermintStateMachine::new(
+            ConsensusConfig::default(),
+            snapshot.clone(),
+            Hash([1; 32]),
+            safety_store,
+            None,
+        );
+        let finalized = FinalizedConsensusState {
+            height: 1,
+            finalized_block_id: BlockId(Hash([2; 32])),
+            commit_certificate_hash: Hash([3; 32]),
+            next_randomness: Hash([4; 32]),
+            active_stake_snapshot_hash: snapshot.snapshot_hash,
+        };
+
+        state_machine
+            .start_new_height_from_finalized(&finalized, snapshot)
+            .unwrap();
+        assert_eq!(state_machine.height, 2);
+        assert_eq!(state_machine.parent_randomness, Hash([4; 32]));
+    }
+
+    #[test]
+    fn vote_intent_ack_round_trip_does_not_mutate_consensus_state() {
+        let snapshot = StakeSnapshot {
+            epoch: 0,
+            validators: BTreeMap::new(),
+            snapshot_hash: StakeSnapshotHash([8; 32]),
+        };
+        let safety_store = Arc::new(MemorySafetyStore::new());
+        let state_machine = TendermintStateMachine::new(
+            ConsensusConfig::default(),
+            snapshot,
+            Hash([1; 32]),
+            safety_store,
+            Some(ValidatorId([3; 32])),
+        );
+
+        let original_step = state_machine.step;
+        let intent = state_machine
+            .build_vote_intent(VoteStep::Prevote, None)
+            .unwrap();
+        let event = state_machine
+            .execute_action(ConsensusAction::SignVote(intent.clone()), &DummySigner)
+            .unwrap();
+        let vote = state_machine.apply_consensus_event(&intent, event).unwrap();
+
+        assert_eq!(vote.step, VoteStep::Prevote);
+        assert_eq!(vote.block_id, None);
+        assert_eq!(state_machine.step, original_step);
+        assert!(state_machine.locked_block.is_none());
+    }
+
+    #[test]
+    fn signer_failure_does_not_advance_timeout_step() {
+        let snapshot = StakeSnapshot {
+            epoch: 0,
+            validators: BTreeMap::new(),
+            snapshot_hash: StakeSnapshotHash([8; 32]),
+        };
+        let safety_store = Arc::new(MemorySafetyStore::new());
+        let mut state_machine = TendermintStateMachine::new(
+            ConsensusConfig::default(),
+            snapshot,
+            Hash([1; 32]),
+            safety_store,
+            Some(ValidatorId([3; 32])),
+        );
+
+        assert!(state_machine.on_timeout_propose(&FailingSigner).is_err());
+        assert_eq!(state_machine.step, ConsensusStep::NewHeight);
+        assert!(state_machine.locked_block.is_none());
+    }
+
+    #[test]
+    fn bounded_lock_model_preserves_tendermint_unlock_rule() {
+        let first = BlockId(Hash([1; 32]));
+        let second = BlockId(Hash([2; 32]));
+
+        for locked_round in 0..=3 {
+            for candidate in [first, second] {
+                for valid_round in (0..=4).map(Some).chain([None]) {
+                    for certificate_round in (0..=4).map(Some).chain([None]) {
+                        for certificate_block in [Some(first), Some(second), None] {
+                            for certificate_valid in [false, true] {
+                                let accepted = can_prevote_with_lock(
+                                    Some(first),
+                                    Some(locked_round),
+                                    candidate,
+                                    valid_round,
+                                    certificate_round,
+                                    certificate_block,
+                                    certificate_valid,
+                                );
+                                if candidate != first && accepted {
+                                    assert!(certificate_valid);
+                                    assert!(valid_round.is_some_and(|round| round >= locked_round));
+                                    assert_eq!(valid_round, certificate_round);
+                                    assert_eq!(certificate_block, Some(candidate));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn can_prevote_with_lock(
+    locked_block: Option<BlockId>,
+    locked_round: Option<u32>,
+    candidate: BlockId,
+    valid_round: Option<u32>,
+    certificate_round: Option<u32>,
+    certificate_block: Option<BlockId>,
+    certificate_valid: bool,
+) -> bool {
+    match (locked_block, locked_round) {
+        (None, _) => true,
+        (Some(locked), Some(_)) if locked == candidate => true,
+        (Some(_), Some(locked_round)) => {
+            certificate_valid
+                && valid_round.is_some_and(|round| round >= locked_round)
+                && valid_round == certificate_round
+                && certificate_block == Some(candidate)
+        }
+        _ => false,
+    }
 }
 
 impl TendermintStateMachine {
@@ -60,7 +240,12 @@ impl TendermintStateMachine {
     }
 
     /// Advance to next height
-    pub fn start_new_height(&mut self, height: u64, snapshot: StakeSnapshot, parent_randomness: norn_common::types::Hash) {
+    pub fn start_new_height(
+        &mut self,
+        height: u64,
+        snapshot: StakeSnapshot,
+        parent_randomness: norn_common::types::Hash,
+    ) {
         self.height = height;
         self.round = 0;
         self.step = ConsensusStep::NewHeight;
@@ -87,7 +272,7 @@ impl TendermintStateMachine {
     pub fn get_current_proposer(&self) -> Option<ValidatorId> {
         ElectionMath::select_deterministic_proposer(
             &self.config.chain_id,
-            self.config.epoch,
+            self.current_epoch().ok()?,
             self.height,
             self.round,
             &self.parent_randomness,
@@ -95,9 +280,15 @@ impl TendermintStateMachine {
         )
     }
 
+    pub fn current_epoch(&self) -> Result<u64> {
+        self.config.epoch_for_height(self.height)
+    }
+
     /// Check if local node is current round's proposer
     pub fn is_local_proposer(&self) -> bool {
-        if let (Some(local_id), Some(proposer)) = (self.local_validator_id, self.get_current_proposer()) {
+        if let (Some(local_id), Some(proposer)) =
+            (self.local_validator_id, self.get_current_proposer())
+        {
             local_id == proposer
         } else {
             false
@@ -105,9 +296,17 @@ impl TendermintStateMachine {
     }
 
     /// Verify a PrevoteCertificate POL proof
-    pub fn verify_prevote_certificate(cert: &PrevoteCertificate, snapshot: &StakeSnapshot) -> Result<()> {
+    pub fn verify_prevote_certificate(
+        cert: &PrevoteCertificate,
+        snapshot: &StakeSnapshot,
+    ) -> Result<()> {
         if cert.stake_snapshot_hash != snapshot.snapshot_hash {
             return Err(anyhow!("PrevoteCertificate snapshot hash mismatch"));
+        }
+        if cert.prevotes.len() > snapshot.validators.len() {
+            return Err(anyhow!(
+                "PrevoteCertificate has more votes than the stake snapshot"
+            ));
         }
 
         let mut pool = VotePool::new();
@@ -123,16 +322,19 @@ impl TendermintStateMachine {
             }
         }
 
-        if pool.check_quorum(
-            cert.protocol_version.clone(),
-            cert.chain_id.clone(),
-            cert.epoch,
-            cert.height,
-            cert.round,
-            VoteStep::Prevote,
-            Some(cert.block_id),
-            snapshot,
-        ).is_none() {
+        if pool
+            .check_quorum(
+                cert.protocol_version.clone(),
+                cert.chain_id.clone(),
+                cert.epoch,
+                cert.height,
+                cert.round,
+                VoteStep::Prevote,
+                Some(cert.block_id),
+                snapshot,
+            )
+            .is_none()
+        {
             return Err(anyhow!("PrevoteCertificate failed > 2/3 quorum check"));
         }
 
@@ -146,43 +348,154 @@ impl TendermintStateMachine {
         block: &Block,
         signer: &dyn ConsensusSigner,
     ) -> Result<SignedVote> {
+        self.handle_proposal_header(proposal, &block.header, signer)
+            .map(|(vote, _)| vote)
+    }
+
+    /// Handle a V2 proposal after its full block/overlay commitments have
+    /// been validated by the caller. The consensus safety logic is shared
+    /// with legacy proposals, but the V2 payload is never converted into a
+    /// legacy transaction list.
+    pub fn handle_proposal_v2(
+        &mut self,
+        proposal: &Proposal,
+        block: &BlockV2,
+        signer: &dyn ConsensusSigner,
+    ) -> Result<SignedVote> {
+        self.handle_proposal_header(proposal, &block.header, signer)
+            .map(|(vote, _)| vote)
+    }
+
+    /// Handle a V2 proposal and return the verified randomness that will be
+    /// committed as the parent randomness of the next finalized height.
+    pub fn handle_proposal_v2_with_vrf(
+        &mut self,
+        proposal: &Proposal,
+        block: &BlockV2,
+        signer: &dyn ConsensusSigner,
+    ) -> Result<(SignedVote, Option<VerifiedVrfOutput>)> {
+        self.handle_proposal_header(proposal, &block.header, signer)
+    }
+
+    /// Verify the proposer VRF against the complete active-height context.
+    /// The returned randomness is derived only after proof verification and is
+    /// therefore safe to persist as the next-height consensus seed.
+    pub fn verify_proposal_vrf(
+        &self,
+        proposal: &Proposal,
+        block_header: &BlockHeader,
+    ) -> Result<VerifiedVrfOutput> {
+        let expected_epoch = self.current_epoch()?;
+        if proposal.height != self.height
+            || proposal.round != self.round
+            || proposal.epoch != expected_epoch
+            || proposal.protocol_version != self.config.protocol_version
+            || proposal.chain_id != self.config.chain_id
+            || proposal.parent_block_hash != block_header.prev_block_hash
+            || block_header.height < 0
+            || proposal.height != block_header.height as u64
+            || block_header.epoch != expected_epoch
+            || block_header.parent_randomness != self.parent_randomness
+        {
+            return Err(anyhow!("proposal VRF context mismatch"));
+        }
+        let record = self
+            .snapshot
+            .validators
+            .get(&proposal.proposer)
+            .ok_or_else(|| anyhow!("proposal proposer is not in the active snapshot"))?;
+        let context = VrfContext {
+            protocol_version: self.config.protocol_version.clone(),
+            chain_id: self.config.chain_id.clone(),
+            epoch: expected_epoch,
+            height: self.height,
+            round: self.round,
+            parent_block_hash: proposal.parent_block_hash,
+            stake_snapshot_hash: self.snapshot.snapshot_hash,
+            validator_id: proposal.proposer,
+        };
+        norn_crypto::vrf::verify_and_derive(
+            &record.vrf_public_key.0,
+            &context,
+            &VRFPreOutBytes(proposal.vrf_preout),
+            &VRFProofBytes(proposal.vrf_proof),
+        )
+        .map_err(|e| anyhow!("proposal VRF verification failed: {e}"))
+    }
+
+    fn handle_proposal_header(
+        &mut self,
+        proposal: &Proposal,
+        block_header: &BlockHeader,
+        signer: &dyn ConsensusSigner,
+    ) -> Result<(SignedVote, Option<VerifiedVrfOutput>)> {
+        let expected_epoch = self.current_epoch()?;
         if proposal.height != self.height || proposal.round != self.round {
             return Err(anyhow!(
                 "Proposal height/round mismatch: expected ({},{}), got ({},{})",
-                self.height, self.round, proposal.height, proposal.round
+                self.height,
+                self.round,
+                proposal.height,
+                proposal.round
             ));
         }
 
-        if proposal.chain_id != self.config.chain_id || proposal.protocol_version != self.config.protocol_version {
-            return Err(anyhow!("Proposal chain_id / protocol_version mismatch"));
+        if proposal.chain_id != self.config.chain_id
+            || proposal.protocol_version != self.config.protocol_version
+            || proposal.epoch != expected_epoch
+        {
+            return Err(anyhow!(
+                "Proposal chain_id / protocol_version / epoch mismatch"
+            ));
         }
 
         if proposal.stake_snapshot_hash != self.snapshot.snapshot_hash {
             return Err(anyhow!("Proposal stake_snapshot_hash mismatch"));
         }
+        if self.snapshot.epoch != expected_epoch {
+            return Err(anyhow!(
+                "local stake snapshot epoch does not match block height"
+            ));
+        }
 
-        let calculated_block_id = BlockId(block.header.block_hash);
+        if block_header.height < 0
+            || proposal.height != block_header.height as u64
+            || proposal.parent_block_hash != block_header.prev_block_hash
+            || block_header.epoch != expected_epoch
+            || block_header.parent_randomness != self.parent_randomness
+        {
+            return Err(anyhow!(
+                "proposal block header does not match the active consensus context"
+            ));
+        }
+
+        let calculated_block_id = BlockId(block_header.block_hash);
         if proposal.block_id != calculated_block_id {
-            return Err(anyhow!("Proposal block_id does not match actual block header hash"));
+            return Err(anyhow!(
+                "Proposal block_id does not match actual block header hash"
+            ));
         }
 
         let expected_proposer = self
             .get_current_proposer()
             .ok_or_else(|| anyhow!("No proposer available"))?;
         if proposal.proposer != expected_proposer {
-            warn!("Proposal from invalid proposer: expected {:?}, got {:?}", expected_proposer, proposal.proposer);
-            return self.cast_vote(VoteStep::Prevote, None, signer);
+            warn!(
+                "Proposal from invalid proposer: expected {:?}, got {:?}",
+                expected_proposer, proposal.proposer
+            );
+            return Ok((self.cast_vote(VoteStep::Prevote, None, signer)?, None));
         }
 
         let Some(record) = self.snapshot.validators.get(&proposal.proposer) else {
             warn!("Proposer not found in stake snapshot");
-            return self.cast_vote(VoteStep::Prevote, None, signer);
+            return Ok((self.cast_vote(VoteStep::Prevote, None, signer)?, None));
         };
 
         // 1. Strict fail-closed ECDSA signature verification
         if record.consensus_public_key.0 == [0u8; 33] || proposal.signature == [0u8; 64] {
             warn!("Rejected proposal with zero key or zero signature");
-            return self.cast_vote(VoteStep::Prevote, None, signer);
+            return Ok((self.cast_vote(VoteStep::Prevote, None, signer)?, None));
         }
 
         let verifying_key = VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0)
@@ -192,62 +505,58 @@ impl TendermintStateMachine {
 
         if sig.normalize_s().is_some() {
             warn!("Rejected non-canonical high-S proposal signature");
-            return self.cast_vote(VoteStep::Prevote, None, signer);
+            return Ok((self.cast_vote(VoteStep::Prevote, None, signer)?, None));
         }
 
         let msg_bytes = proposal.canonical_bytes();
         if verifying_key.verify(&msg_bytes, &sig).is_err() {
             warn!("Proposal ECDSA signature verification failed");
-            return self.cast_vote(VoteStep::Prevote, None, signer);
+            return Ok((self.cast_vote(VoteStep::Prevote, None, signer)?, None));
         }
 
-        // 2. Strict VRF verification with VrfContext
-        let context = VrfContext {
-            protocol_version: self.config.protocol_version.clone(),
-            chain_id: self.config.chain_id.clone(),
-            epoch: self.config.epoch,
-            height: self.height,
-            round: self.round,
-            parent_block_hash: proposal.parent_block_hash.clone(),
-            stake_snapshot_hash: self.snapshot.snapshot_hash.clone(),
-            validator_id: proposal.proposer,
+        // 2. Strict VRF verification with the complete V2 context
+        let verified_vrf = match self.verify_proposal_vrf(proposal, block_header) {
+            Ok(output) => output,
+            Err(_) => {
+                warn!("Proposal VRF proof verification failed");
+                return Ok((self.cast_vote(VoteStep::Prevote, None, signer)?, None));
+            }
         };
-
-        if norn_crypto::vrf::verify_and_derive(
-            &record.vrf_public_key.0,
-            &context,
-            &VRFPreOutBytes(proposal.vrf_preout),
-            &VRFProofBytes(proposal.vrf_proof),
-        ).is_err() {
-            warn!("Proposal VRF proof verification failed");
-            return self.cast_vote(VoteStep::Prevote, None, signer);
-        }
 
         // 3. Evaluate Tendermint unlocking rule
-        let can_prevote = match (self.locked_block, self.locked_round) {
-            (None, _) => true,
-            (Some(locked_bid), Some(locked_r)) => {
-                if locked_bid == calculated_block_id {
-                    true
-                } else if let (Some(vr), Some(cert)) = (proposal.valid_round, &proposal.valid_round_certificate) {
-                    if vr >= locked_r && vr == cert.round && cert.block_id == calculated_block_id {
-                        Self::verify_prevote_certificate(cert, &self.snapshot).is_ok()
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
+        let (certificate_round, certificate_block, certificate_valid) = proposal
+            .valid_round_certificate
+            .as_ref()
+            .map(|certificate| {
+                (
+                    Some(certificate.round),
+                    Some(certificate.block_id),
+                    Self::verify_prevote_certificate(certificate, &self.snapshot).is_ok(),
+                )
+            })
+            .unwrap_or((None, None, false));
+        let can_prevote = can_prevote_with_lock(
+            self.locked_block,
+            self.locked_round,
+            calculated_block_id,
+            proposal.valid_round,
+            certificate_round,
+            certificate_block,
+            certificate_valid,
+        );
 
         if can_prevote {
             info!("Casting Prevote for block {:?}", calculated_block_id);
-            self.cast_vote(VoteStep::Prevote, Some(calculated_block_id), signer)
+            Ok((
+                self.cast_vote(VoteStep::Prevote, Some(calculated_block_id), signer)?,
+                Some(verified_vrf),
+            ))
         } else {
             warn!("Locked on different block, casting NIL Prevote");
-            self.cast_vote(VoteStep::Prevote, None, signer)
+            Ok((
+                self.cast_vote(VoteStep::Prevote, None, signer)?,
+                Some(verified_vrf),
+            ))
         }
     }
 
@@ -261,6 +570,25 @@ impl TendermintStateMachine {
         let round = vote.round;
         let step = vote.step;
 
+        if vote.protocol_version != self.config.protocol_version
+            || vote.chain_id != self.config.chain_id
+            || vote.epoch != self.config.epoch_for_height(height)?
+        {
+            return Ok((None, None));
+        }
+
+        let height_in_window = height >= self.height
+            && height
+                .checked_sub(self.height)
+                .is_some_and(|delta| delta <= self.config.max_future_height);
+        let round_in_window = round >= self.round
+            && round
+                .checked_sub(self.round)
+                .is_some_and(|delta| delta <= self.config.max_future_round);
+        if !height_in_window || (height == self.height && !round_in_window) {
+            return Ok((None, None));
+        }
+
         match self.vote_pool.add_vote(vote.clone(), &self.snapshot) {
             AddVoteResult::Added => {}
             AddVoteResult::DuplicateVote => return Ok((None, None)),
@@ -268,9 +596,18 @@ impl TendermintStateMachine {
                 warn!("Equivocation detected from validator {:?}", validator);
                 return Ok((None, None));
             }
-            AddVoteResult::UnknownValidator | AddVoteResult::InvalidSignature | AddVoteResult::SnapshotMismatch => {
+            AddVoteResult::UnknownValidator
+            | AddVoteResult::InvalidSignature
+            | AddVoteResult::SnapshotMismatch => {
                 return Ok((None, None));
             }
+        }
+
+        // Future votes are bounded and retained for the corresponding round,
+        // but they must not drive locks or certificates for the current
+        // round. They become actionable when the state machine advances.
+        if height != self.height || round != self.round {
+            return Ok((None, None));
         }
 
         // Check if 2/3 Prevote Polka is reached
@@ -279,7 +616,7 @@ impl TendermintStateMachine {
             if let Some(prevotes) = self.vote_pool.check_quorum(
                 self.config.protocol_version.clone(),
                 self.config.chain_id.clone(),
-                self.config.epoch,
+                self.current_epoch()?,
                 height,
                 round,
                 VoteStep::Prevote,
@@ -287,7 +624,15 @@ impl TendermintStateMachine {
                 &self.snapshot,
             ) {
                 if let Some(bid) = checked_block {
-                    info!("2/3 Prevotes (Polka) reached for block {:?}, updating locks", bid);
+                    info!(
+                        "2/3 Prevotes (Polka) reached for block {:?}, updating locks",
+                        bid
+                    );
+                    let precommit_vote = if self.local_validator_id.is_some() {
+                        Some(self.cast_vote(VoteStep::Precommit, Some(bid), signer)?)
+                    } else {
+                        None
+                    };
                     self.locked_block = Some(bid);
                     self.locked_round = Some(round);
                     self.valid_block = Some(bid);
@@ -295,7 +640,7 @@ impl TendermintStateMachine {
                     self.valid_round_certificate = Some(PrevoteCertificate {
                         protocol_version: self.config.protocol_version.clone(),
                         chain_id: self.config.chain_id.clone(),
-                        epoch: self.config.epoch,
+                        epoch: self.current_epoch()?,
                         height: self.height,
                         round: self.round,
                         block_id: bid,
@@ -303,11 +648,11 @@ impl TendermintStateMachine {
                         prevotes,
                     });
 
-                    // Cast local Precommit vote
-                    if self.local_validator_id.is_some() {
-                        if let Ok(precommit_vote) = self.cast_vote(VoteStep::Precommit, Some(bid), signer) {
-                            return Ok((Some(precommit_vote), None));
-                        }
+                    // The locks above are committed only after the local
+                    // precommit intent has been durably signed and
+                    // acknowledged by SafetyStore.
+                    if let Some(precommit_vote) = precommit_vote {
+                        return Ok((Some(precommit_vote), None));
                     }
                 }
             }
@@ -319,13 +664,21 @@ impl TendermintStateMachine {
                 if let Some(cert) = self.vote_pool.create_commit_certificate(
                     self.config.protocol_version.clone(),
                     self.config.chain_id.clone(),
-                    self.config.epoch,
+                    self.current_epoch()?,
                     height,
                     round,
                     bid,
                     &self.snapshot,
                 ) {
-                    info!("2/3 Precommits reached! CommitCertificate formed for block {:?}", bid);
+                    if cert.precommits.len() > self.config.max_certificate_members as usize {
+                        return Err(anyhow!(
+                            "CommitCertificate exceeds Genesis certificate member limit"
+                        ));
+                    }
+                    info!(
+                        "2/3 Precommits reached! CommitCertificate formed for block {:?}",
+                        bid
+                    );
                     self.step = ConsensusStep::Commit;
                     return Ok((None, Some(cert)));
                 }
@@ -342,47 +695,175 @@ impl TendermintStateMachine {
         block_id: Option<BlockId>,
         signer: &dyn ConsensusSigner,
     ) -> Result<SignedVote> {
+        let intent = self.build_vote_intent(step, block_id)?;
+        let event = self.execute_action(ConsensusAction::SignVote(intent.clone()), signer)?;
+        self.apply_consensus_event(&intent, event)
+    }
+
+    /// Build a vote intent without changing any consensus state.
+    pub fn build_vote_intent(
+        &self,
+        step: VoteStep,
+        block_id: Option<BlockId>,
+    ) -> Result<VoteIntent> {
         let local_id = self
             .local_validator_id
             .ok_or_else(|| anyhow!("Local node is not a validator"))?;
 
-        let sign_req = VoteSignRequest {
-            protocol_version: self.config.protocol_version.clone(),
-            chain_id: self.config.chain_id.clone(),
-            epoch: self.config.epoch,
-            height: self.height,
-            round: self.round,
-            step,
-            block_id,
-            stake_snapshot_hash: self.snapshot.snapshot_hash.clone(),
-            validator_id: local_id,
-        };
+        Ok(VoteIntent {
+            request: VoteSignRequest {
+                protocol_version: self.config.protocol_version.clone(),
+                chain_id: self.config.chain_id.clone(),
+                epoch: self.current_epoch()?,
+                height: self.height,
+                round: self.round,
+                step,
+                block_id,
+                stake_snapshot_hash: self.snapshot.snapshot_hash.clone(),
+                validator_id: local_id,
+            },
+        })
+    }
 
-        let signed_vote = self
-            .safety_store
-            .sign_vote_once(sign_req, signer)
-            .map_err(|e| anyhow!("Safety store signing error: {:?}", e))?;
+    /// Execute the driver side of an intent. SafetyStore persists the intent
+    /// before invoking the signer and persists the completion before the
+    /// resulting event is acknowledged to the state machine.
+    pub fn execute_action(
+        &self,
+        action: ConsensusAction,
+        signer: &dyn ConsensusSigner,
+    ) -> Result<ConsensusEvent> {
+        match action {
+            ConsensusAction::SignVote(intent) => {
+                let signed_vote = self
+                    .safety_store
+                    .sign_vote_once(intent.request, signer)
+                    .map_err(|e| anyhow!("Safety store signing error: {:?}", e))?;
+                Ok(ConsensusEvent::VotePersisted(signed_vote))
+            }
+        }
+    }
 
-        Ok(signed_vote)
+    /// Apply the execution acknowledgement. This validates that the signer
+    /// acknowledged exactly the intent that was persisted; callers cannot
+    /// substitute another block after a WAL/signing/broadcast failure.
+    pub fn apply_consensus_event(
+        &self,
+        intent: &VoteIntent,
+        event: ConsensusEvent,
+    ) -> Result<SignedVote> {
+        let ConsensusEvent::VotePersisted(vote) = event;
+        let request = &intent.request;
+        if vote.protocol_version != request.protocol_version
+            || vote.chain_id != request.chain_id
+            || vote.epoch != request.epoch
+            || vote.height != request.height
+            || vote.round != request.round
+            || vote.step != request.step
+            || vote.block_id != request.block_id
+            || vote.stake_snapshot_hash != request.stake_snapshot_hash
+            || vote.validator != request.validator_id
+            || vote.signature == [0u8; 64]
+        {
+            return Err(anyhow!("signed vote does not acknowledge its vote intent"));
+        }
+        Ok(vote)
     }
 
     /// Proposal timeout trigger -> cast NIL Prevote
     pub fn on_timeout_propose(&mut self, signer: &dyn ConsensusSigner) -> Result<SignedVote> {
-        info!("Proposal timeout in round {}, casting NIL Prevote", self.round);
+        info!(
+            "Proposal timeout in round {}, casting NIL Prevote",
+            self.round
+        );
+        let vote = self.cast_vote(VoteStep::Prevote, None, signer)?;
         self.step = ConsensusStep::PrevoteWait;
-        self.cast_vote(VoteStep::Prevote, None, signer)
+        Ok(vote)
     }
 
     /// Prevote timeout trigger -> cast NIL Precommit
     pub fn on_timeout_prevote(&mut self, signer: &dyn ConsensusSigner) -> Result<SignedVote> {
-        info!("Prevote timeout in round {}, casting NIL Precommit", self.round);
+        info!(
+            "Prevote timeout in round {}, casting NIL Precommit",
+            self.round
+        );
+        let vote = self.cast_vote(VoteStep::Precommit, None, signer)?;
         self.step = ConsensusStep::PrecommitWait;
-        self.cast_vote(VoteStep::Precommit, None, signer)
+        Ok(vote)
     }
 
     /// Precommit timeout trigger -> advance to next round
     pub fn on_timeout_precommit(&mut self) {
-        info!("Precommit timeout in round {}, advancing to round {}", self.round, self.round + 1);
+        info!(
+            "Precommit timeout in round {}, advancing to round {}",
+            self.round,
+            self.round + 1
+        );
         self.start_new_round(self.round + 1);
+    }
+
+    /// Advance only after the finalized block and its consensus state have
+    /// been durably accepted by the finality driver.  The next height cannot
+    /// choose an arbitrary randomness value: it must use the VRF-derived
+    /// value recorded by the finalized state.
+    pub fn start_new_height_from_finalized(
+        &mut self,
+        finalized: &FinalizedConsensusState,
+        snapshot: StakeSnapshot,
+    ) -> Result<()> {
+        if finalized.height != self.height {
+            return Err(anyhow!(
+                "finalized height {} does not advance current height {}",
+                finalized.height,
+                self.height
+            ));
+        }
+        if finalized.active_stake_snapshot_hash != self.snapshot.snapshot_hash {
+            return Err(anyhow!(
+                "finalized state active snapshot does not match current snapshot"
+            ));
+        }
+        let next_height = finalized
+            .height
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("consensus height overflow"))?;
+        let expected_epoch = self.config.epoch_for_height(next_height)?;
+        if snapshot.epoch != expected_epoch {
+            return Err(anyhow!(
+                "next snapshot epoch {} does not match height {} epoch {}",
+                snapshot.epoch,
+                next_height,
+                expected_epoch
+            ));
+        }
+        let parent_randomness = finalized.parent_randomness_for_height(next_height)?;
+        self.start_new_height(next_height, snapshot, parent_randomness);
+        Ok(())
+    }
+
+    /// Restore the next consensus height from a durable finalized record during
+    /// startup. Unlike the live transition, this does not assume that the
+    /// in-memory state has replayed every prior height.
+    pub fn restore_after_finalized(
+        &mut self,
+        finalized: &FinalizedConsensusState,
+        snapshot: StakeSnapshot,
+    ) -> Result<()> {
+        let next_height = finalized
+            .height
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("consensus height overflow"))?;
+        let expected_epoch = self.config.epoch_for_height(next_height)?;
+        if snapshot.epoch != expected_epoch {
+            return Err(anyhow!(
+                "recovery snapshot epoch {} does not match height {} epoch {}",
+                snapshot.epoch,
+                next_height,
+                expected_epoch
+            ));
+        }
+        let parent_randomness = finalized.parent_randomness_for_height(next_height)?;
+        self.start_new_height(next_height, snapshot, parent_randomness);
+        Ok(())
     }
 }

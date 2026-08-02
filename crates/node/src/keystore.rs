@@ -7,8 +7,8 @@ use rand::thread_rng;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use zeroize::Zeroizing;
 use tracing::info;
+use zeroize::Zeroizing;
 
 pub struct NodeKeyStore {
     key_dir: PathBuf,
@@ -20,6 +20,24 @@ impl NodeKeyStore {
     pub fn open_or_create(dir: impl AsRef<Path>) -> Result<Self> {
         let key_dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&key_dir)?;
+        Self::open_files(&key_dir, true)
+    }
+
+    /// Open an already provisioned validator keystore without creating any
+    /// directory or key material. Production validators use this path.
+    pub fn open_existing(dir: impl AsRef<Path>) -> Result<Self> {
+        let key_dir = dir.as_ref().to_path_buf();
+        if !key_dir.is_dir() {
+            return Err(anyhow!(
+                "validator keystore directory does not exist: {:?}",
+                key_dir
+            ));
+        }
+        Self::open_files(&key_dir, false)
+    }
+
+    fn open_files(key_dir: &Path, create_missing: bool) -> Result<Self> {
+        let key_dir = key_dir.to_path_buf();
 
         let consensus_path = key_dir.join("consensus.key");
         let vrf_path = key_dir.join("vrf.key");
@@ -27,15 +45,26 @@ impl NodeKeyStore {
         let consensus_key = if consensus_path.exists() {
             let bytes = Zeroizing::new(Self::read_key_file(&consensus_path)?);
             if bytes.len() != 32 {
-                return Err(anyhow!("Corrupted consensus key file at {:?}", consensus_path));
+                return Err(anyhow!(
+                    "Corrupted consensus key file at {:?}",
+                    consensus_path
+                ));
             }
             SigningKey::from_slice(&bytes)
                 .map_err(|_| anyhow!("Invalid consensus secret key bytes"))?
+        } else if !create_missing {
+            return Err(anyhow!(
+                "missing production consensus key file at {:?}",
+                consensus_path
+            ));
         } else {
             let key = SigningKey::random(&mut thread_rng());
             let bytes = Zeroizing::new(key.to_bytes().to_vec());
             Self::write_key_file_atomic(&consensus_path, &bytes)?;
-            info!("Generated and saved new consensus signing key to {:?}", consensus_path);
+            info!(
+                "Generated and saved new consensus signing key to {:?}",
+                consensus_path
+            );
             key
         };
 
@@ -47,6 +76,8 @@ impl NodeKeyStore {
             let mut secret_arr = [0u8; 64];
             secret_arr.copy_from_slice(&bytes);
             VRFKeyPair::from_secret_key_bytes(&secret_arr)?
+        } else if !create_missing {
+            return Err(anyhow!("missing production VRF key file at {:?}", vrf_path));
         } else {
             let key = VRFKeyPair::generate();
             let secret_bytes = Zeroizing::new(key.private_key_bytes().to_vec());
@@ -79,7 +110,10 @@ impl NodeKeyStore {
 
     fn write_key_file_atomic(path: &Path, content: &[u8]) -> Result<()> {
         let parent = path.parent().ok_or_else(|| anyhow!("Invalid key path"))?;
-        let tmp_path = parent.join(format!(".tmp_{}", path.file_name().unwrap().to_string_lossy()));
+        let tmp_path = parent.join(format!(
+            ".tmp_{}",
+            path.file_name().unwrap().to_string_lossy()
+        ));
 
         {
             let mut file = OpenOptions::new()
@@ -133,5 +167,17 @@ mod tests {
         let consensus_path = temp_dir.path().join("consensus.key");
         std::fs::write(&consensus_path, b"corrupted").unwrap();
         assert!(NodeKeyStore::open_or_create(temp_dir.path()).is_err());
+    }
+
+    #[test]
+    fn production_open_existing_does_not_create_missing_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        assert!(NodeKeyStore::open_existing(temp_dir.path()).is_err());
+        assert!(!temp_dir.path().join("consensus.key").exists());
+        assert!(!temp_dir.path().join("vrf.key").exists());
+
+        let key_dir = temp_dir.path().join("keys");
+        assert!(NodeKeyStore::open_existing(&key_dir).is_err());
+        assert!(!key_dir.exists());
     }
 }

@@ -3,14 +3,14 @@
 //! This module provides recovery functionality using the WAL,
 //! allowing the database to recover to a consistent state after a crash.
 
-use crate::wal::{WAL, WALEntry, WALConfig};
+use crate::wal::{WALConfig, WALEntry, WAL};
 use norn_common::error::{NornError, Result};
 use norn_common::types::Hash;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn, error, debug};
-use std::collections::HashMap;
+use tracing::{debug, error, info, warn};
 
 use crate::SledDB;
 
@@ -27,9 +27,7 @@ pub enum RecoveryStatus {
     },
 
     /// Recovery failed
-    Failed {
-        reason: String,
-    },
+    Failed { reason: String },
 }
 
 /// WAL recovery manager
@@ -91,12 +89,18 @@ impl WALRecoveryManager {
                         if tid == id {
                             debug!("Rolled back transaction {}", id);
                         } else {
-                            warn!("Transaction rollback ID mismatch: expected {}, got {}", tid, id);
+                            warn!(
+                                "Transaction rollback ID mismatch: expected {}, got {}",
+                                tid, id
+                            );
                         }
                     }
                 }
 
-                WALEntry::Checkpoint { block_number, block_hash: _ } => {
+                WALEntry::Checkpoint {
+                    block_number,
+                    block_hash: _,
+                } => {
                     checkpoint_block = Some(block_number);
                     info!("Found checkpoint at block {}", block_number);
                 }
@@ -132,8 +136,10 @@ impl WALRecoveryManager {
             }
         }
 
-        info!("WAL recovery completed: {} entries applied, checkpoint at {:?}",
-              entries_applied, checkpoint_block);
+        info!(
+            "WAL recovery completed: {} entries applied, checkpoint at {:?}",
+            entries_applied, checkpoint_block
+        );
 
         Ok(RecoveryStatus::Recovered {
             entries_applied,
@@ -146,41 +152,44 @@ impl WALRecoveryManager {
         match entry {
             WALEntry::CreateAccount { address, data } => {
                 let key = format!("account_{}", hex::encode(address));
-                self.db.insert_sync(key.as_bytes(), data)
+                self.db
+                    .insert_sync(key.as_bytes(), data)
                     .map_err(|e| NornError::Internal(format!("Failed to insert account: {}", e)))?;
                 debug!("Recovered account {}", hex::encode(address));
             }
 
             WALEntry::UpdateAccount { address, data } => {
                 let key = format!("account_{}", hex::encode(address));
-                self.db.insert_sync(key.as_bytes(), data)
+                self.db
+                    .insert_sync(key.as_bytes(), data)
                     .map_err(|e| NornError::Internal(format!("Failed to update account: {}", e)))?;
                 debug!("Updated account {}", hex::encode(address));
             }
 
             WALEntry::DeleteAccount { address } => {
                 let key = format!("account_{}", hex::encode(address));
-                self.db.remove_sync(key.as_bytes())
+                self.db
+                    .remove_sync(key.as_bytes())
                     .map_err(|e| NornError::Internal(format!("Failed to delete account: {}", e)))?;
                 debug!("Deleted account {}", hex::encode(address));
             }
 
-            WALEntry::WriteStorage { address, key, value } => {
-                let storage_key = format!("storage_{}_{}",
-                    hex::encode(address),
-                    hex::encode(key)
-                );
-                self.db.insert_sync(storage_key.as_bytes(), value)
+            WALEntry::WriteStorage {
+                address,
+                key,
+                value,
+            } => {
+                let storage_key = format!("storage_{}_{}", hex::encode(address), hex::encode(key));
+                self.db
+                    .insert_sync(storage_key.as_bytes(), value)
                     .map_err(|e| NornError::Internal(format!("Failed to write storage: {}", e)))?;
                 debug!("Recovered storage for {}", hex::encode(address));
             }
 
             WALEntry::DeleteStorage { address, key } => {
-                let storage_key = format!("storage_{}_{}",
-                    hex::encode(address),
-                    hex::encode(key)
-                );
-                self.db.remove_sync(storage_key.as_bytes())
+                let storage_key = format!("storage_{}_{}", hex::encode(address), hex::encode(key));
+                self.db
+                    .remove_sync(storage_key.as_bytes())
                     .map_err(|e| NornError::Internal(format!("Failed to delete storage: {}", e)))?;
                 debug!("Deleted storage for {}", hex::encode(address));
             }
@@ -260,7 +269,8 @@ mod tests {
         wal.write(WALEntry::CreateAccount {
             address: [1u8; 20],
             data: vec![2, 3, 4],
-        }).unwrap();
+        })
+        .unwrap();
 
         wal.checkpoint(100, [5u8; 32]).unwrap();
         wal.sync().unwrap();
@@ -270,7 +280,10 @@ mod tests {
         let status = recovery.recover().await.unwrap();
 
         match status {
-            RecoveryStatus::Recovered { entries_applied, checkpoint_block } => {
+            RecoveryStatus::Recovered {
+                entries_applied,
+                checkpoint_block,
+            } => {
                 assert_eq!(entries_applied, 1);
                 assert_eq!(checkpoint_block, Some(100));
             }

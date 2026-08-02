@@ -1,7 +1,7 @@
+use anyhow::Result;
 use libp2p::identity::Keypair;
 use std::fs;
 use std::path::Path;
-use anyhow::Result;
 use tracing::info;
 
 pub fn load_or_generate_keypair<P: AsRef<Path>>(path: P) -> Result<Keypair> {

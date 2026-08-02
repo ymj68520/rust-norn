@@ -3,7 +3,7 @@
 use crate::error::{FaucetError, FaucetResult};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sled::{Db, Tree, IVec};
+use sled::{Db, IVec, Tree};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -69,9 +69,15 @@ impl FaucetDatabase {
             .open()
             .map_err(FaucetError::DatabaseError)?;
 
-        let distributions = db.open_tree("distributions").map_err(FaucetError::DatabaseError)?;
-        let address_tracker = db.open_tree("address_tracker").map_err(FaucetError::DatabaseError)?;
-        let ip_tracker = db.open_tree("ip_tracker").map_err(FaucetError::DatabaseError)?;
+        let distributions = db
+            .open_tree("distributions")
+            .map_err(FaucetError::DatabaseError)?;
+        let address_tracker = db
+            .open_tree("address_tracker")
+            .map_err(FaucetError::DatabaseError)?;
+        let ip_tracker = db
+            .open_tree("ip_tracker")
+            .map_err(FaucetError::DatabaseError)?;
 
         Ok(Self {
             db: Arc::new(db),
@@ -84,8 +90,8 @@ impl FaucetDatabase {
     /// Record a distribution
     pub fn add_distribution(&self, record: DistributionRecord) -> FaucetResult<()> {
         let key = format!("{}:{}", record.address, record.timestamp);
-        let value = bincode::serialize(&record)
-            .map_err(|e| FaucetError::InternalError(e.to_string()))?;
+        let value =
+            bincode::serialize(&record).map_err(|e| FaucetError::InternalError(e.to_string()))?;
 
         self.distributions
             .insert(key, value)
@@ -112,11 +118,9 @@ impl FaucetDatabase {
             .map_err(FaucetError::DatabaseError)?
         {
             Some(bytes) => {
-                let timestamp = i64::from_be_bytes(
-                    bytes.as_ref().try_into().map_err(|_| {
-                        FaucetError::InternalError("Invalid timestamp format".to_string())
-                    })?,
-                );
+                let timestamp = i64::from_be_bytes(bytes.as_ref().try_into().map_err(|_| {
+                    FaucetError::InternalError("Invalid timestamp format".to_string())
+                })?);
                 Ok(Some(timestamp))
             }
             None => Ok(None),
@@ -241,7 +245,10 @@ impl FaucetDatabase {
             removed += 1;
         }
 
-        info!("Cleaned up {} old records (older than {} days)", removed, days);
+        info!(
+            "Cleaned up {} old records (older than {} days)",
+            removed, days
+        );
         Ok(removed)
     }
 }

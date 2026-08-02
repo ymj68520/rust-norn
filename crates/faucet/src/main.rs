@@ -95,7 +95,10 @@ async fn main() -> anyhow::Result<()> {
     info!("  Server address: {}", config.server_addr);
     info!("  RPC URL: {}", config.rpc_url);
     info!("  Dispense amount: {} wei", config.dispense_amount);
-    info!("  Rate limit: {} requests / {}s", config.max_requests_per_window, config.rate_limit_window_secs);
+    info!(
+        "  Rate limit: {} requests / {}s",
+        config.max_requests_per_window, config.rate_limit_window_secs
+    );
     info!("  Address cooldown: {}s", config.address_cooldown_secs);
 
     // Initialize database

@@ -1,5 +1,5 @@
 //! VDF & Delay Benchmark Module
-//! 
+//!
 //! [SECURITY NOTICE]: The `SequentialDelayBenchmark` in this module is based on sequential squaring
 //! modulo a known-order prime (secp256k1 prime). IT IS NOT A CRYPTOGRAPHICALLY SECURE VDF
 //! AND MUST NOT BE USED FOR CONSENSUS FINALITY OR RANDOMNESS UNPREDICTABILITY IN PRODUCTION NETWORKS.
@@ -286,7 +286,9 @@ impl SequentialDelayBenchmark {
         params: &GeneralParams,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let iterations = if params.t.len() >= 8 {
-            let bytes: [u8; 8] = params.t[..8].try_into().map_err(|_| "Invalid t parameter")?;
+            let bytes: [u8; 8] = params.t[..8]
+                .try_into()
+                .map_err(|_| "Invalid t parameter")?;
             u64::from_le_bytes(bytes)
         } else if !params.t.is_empty() {
             let mut bytes = [0u8; 8];
@@ -440,7 +442,9 @@ impl VDFManager {
         params: &GeneralParams,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         if params.t.len() >= 8 {
-            let bytes: [u8; 8] = params.t[..8].try_into().map_err(|_| "Invalid t parameter")?;
+            let bytes: [u8; 8] = params.t[..8]
+                .try_into()
+                .map_err(|_| "Invalid t parameter")?;
             Ok(u64::from_le_bytes(bytes))
         } else if !params.t.is_empty() {
             let mut bytes = [0u8; 8];

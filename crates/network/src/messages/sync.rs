@@ -1,26 +1,26 @@
 use norn_common::types::{Block, BlockHeader, Hash, Transaction};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // Re-export compression utilities
-use crate::compression::{Compressor, CompressionConfig, CompressionAlgorithm};
+use crate::compression::{CompressionAlgorithm, CompressionConfig, Compressor};
 
 /// 网络消息类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum NetworkMessage {
     /// 基础消息
     Basic(BasicMessage),
-    
+
     /// 同步消息
     Sync(SyncMessage),
-    
+
     /// 共识消息
     Consensus(ConsensusMessage),
-    
+
     /// 交易消息
     Transaction(TransactionMessage),
-    
+
     /// 状态消息
     State(StateMessage),
 }
@@ -30,13 +30,13 @@ pub enum NetworkMessage {
 pub enum BasicMessage {
     /// 握手
     Handshake(HandshakeMessage),
-    
+
     /// Ping
     Ping(PingMessage),
-    
+
     /// Pong
     Pong(PongMessage),
-    
+
     /// 断开连接
     Disconnect(DisconnectMessage),
 }
@@ -46,22 +46,22 @@ pub enum BasicMessage {
 pub enum SyncMessage {
     /// 区块请求
     BlockRequest(BlockRequestMessage),
-    
+
     /// 区块响应
     BlockResponse(BlockResponseMessage),
-    
+
     /// 区块头请求
     HeaderRequest(HeaderRequestMessage),
-    
+
     /// 区块头响应
     HeaderResponse(HeaderResponseMessage),
-    
+
     /// 同步状态
     SyncStatus(SyncStatusMessage),
-    
+
     /// 链请求
     ChainRequest(ChainRequestMessage),
-    
+
     /// 链响应
     ChainResponse(ChainResponseMessage),
 }
@@ -71,13 +71,13 @@ pub enum SyncMessage {
 pub enum ConsensusMessage {
     /// 区块提议
     BlockProposal(BlockProposalMessage),
-    
+
     /// 投票
     Vote(VoteMessage),
-    
+
     /// VDF 完成
     VDFComplete(VDFCompleteMessage),
-    
+
     /// 共识状态
     ConsensusStatus(ConsensusStatusMessage),
 }
@@ -87,13 +87,13 @@ pub enum ConsensusMessage {
 pub enum TransactionMessage {
     /// 交易广播
     TransactionBroadcast(TransactionBroadcastMessage),
-    
+
     /// 交易请求
     TransactionRequest(TransactionRequestMessage),
-    
+
     /// 交易响应
     TransactionResponse(TransactionResponseMessage),
-    
+
     /// 交易池状态
     TransactionPoolStatus(TransactionPoolStatusMessage),
 }
@@ -103,13 +103,13 @@ pub enum TransactionMessage {
 pub enum StateMessage {
     /// 状态请求
     StateRequest(StateRequestMessage),
-    
+
     /// 状态响应
     StateResponse(StateResponseMessage),
-    
+
     /// 账户状态
     AccountState(AccountStateMessage),
-    
+
     /// 存储状态
     StorageState(StorageStateMessage),
 }
@@ -119,19 +119,19 @@ pub enum StateMessage {
 pub struct HandshakeMessage {
     /// 协议版本
     pub version: String,
-    
+
     /// 节点 ID
     pub node_id: Vec<u8>,
-    
+
     /// 支持的功能
     pub capabilities: Vec<String>,
-    
+
     /// 当前高度
     pub height: u64,
-    
+
     /// 最新区块哈希
     pub latest_hash: Hash,
-    
+
     /// 时间戳
     pub timestamp: u64,
 }
@@ -141,7 +141,7 @@ pub struct HandshakeMessage {
 pub struct PingMessage {
     /// 随机数
     pub nonce: u64,
-    
+
     /// 时间戳
     pub timestamp: u64,
 }
@@ -151,7 +151,7 @@ pub struct PingMessage {
 pub struct PongMessage {
     /// 对应的 ping nonce
     pub nonce: u64,
-    
+
     /// 时间戳
     pub timestamp: u64,
 }
@@ -161,7 +161,7 @@ pub struct PongMessage {
 pub struct DisconnectMessage {
     /// 断开原因
     pub reason: DisconnectReason,
-    
+
     /// 消息
     pub message: Option<String>,
 }
@@ -171,16 +171,16 @@ pub struct DisconnectMessage {
 pub enum DisconnectReason {
     /// 正常断开
     Normal,
-    
+
     /// 协议错误
     ProtocolError,
-    
+
     /// 超时
     Timeout,
-    
+
     /// 被拒绝
     Rejected,
-    
+
     /// 其他
     Other(String),
 }
@@ -190,19 +190,19 @@ pub enum DisconnectReason {
 pub struct BlockRequestMessage {
     /// 请求 ID
     pub request_id: u64,
-    
+
     /// 起始高度
     pub start_height: u64,
-    
+
     /// 结束高度
     pub end_height: u64,
-    
+
     /// 最大区块数
     pub max_blocks: u32,
-    
+
     /// 是否包含交易
     pub include_transactions: bool,
-    
+
     /// 哈希列表（可选）
     pub hashes: Option<Vec<Hash>>,
 }
@@ -212,16 +212,16 @@ pub struct BlockRequestMessage {
 pub struct BlockResponseMessage {
     /// 请求 ID
     pub request_id: u64,
-    
+
     /// 区块列表
     pub blocks: Vec<Block>,
-    
+
     /// 起始高度
     pub start_height: u64,
-    
+
     /// 是否有更多
     pub has_more: bool,
-    
+
     /// 总区块数
     pub total_blocks: u64,
 }
@@ -231,16 +231,16 @@ pub struct BlockResponseMessage {
 pub struct HeaderRequestMessage {
     /// 请求 ID
     pub request_id: u64,
-    
+
     /// 起始高度
     pub start_height: u64,
-    
+
     /// 结束高度
     pub end_height: u64,
-    
+
     /// 最大头数
     pub max_headers: u32,
-    
+
     /// 哈希列表（可选）
     pub hashes: Option<Vec<Hash>>,
 }
@@ -250,16 +250,16 @@ pub struct HeaderRequestMessage {
 pub struct HeaderResponseMessage {
     /// 请求 ID
     pub request_id: u64,
-    
+
     /// 区块头列表
     pub headers: Vec<BlockHeader>,
-    
+
     /// 起始高度
     pub start_height: u64,
-    
+
     /// 是否有更多
     pub has_more: bool,
-    
+
     /// 总头数
     pub total_headers: u64,
 }
@@ -269,22 +269,22 @@ pub struct HeaderResponseMessage {
 pub struct SyncStatusMessage {
     /// 当前高度
     pub current_height: u64,
-    
+
     /// 最新哈希
     pub latest_hash: Hash,
-    
+
     /// 同步状态
     pub sync_state: String,
-    
+
     /// 目标高度
     pub target_height: Option<u64>,
-    
+
     /// 已下载区块数
     pub downloaded_blocks: u64,
-    
+
     /// 已验证区块数
     pub verified_blocks: u64,
-    
+
     /// 估算剩余时间
     pub estimated_time_remaining: Option<u64>,
 }
@@ -294,13 +294,13 @@ pub struct SyncStatusMessage {
 pub struct ChainRequestMessage {
     /// 请求 ID
     pub request_id: u64,
-    
+
     /// 起始哈希
     pub start_hash: Hash,
-    
+
     /// 最大长度
     pub max_length: u32,
-    
+
     /// 是否包含交易
     pub include_transactions: bool,
 }
@@ -310,16 +310,16 @@ pub struct ChainRequestMessage {
 pub struct ChainResponseMessage {
     /// 请求 ID
     pub request_id: u64,
-    
+
     /// 区块链
     pub blocks: Vec<Block>,
-    
+
     /// 起始哈希
     pub start_hash: Hash,
-    
+
     /// 是否有更多
     pub has_more: bool,
-    
+
     /// 总长度
     pub total_length: u64,
 }
@@ -329,16 +329,16 @@ pub struct ChainResponseMessage {
 pub struct BlockProposalMessage {
     /// 提议者
     pub proposer: Vec<u8>,
-    
+
     /// 区块
     pub block: Block,
-    
+
     /// VRF 输出
     pub vrf_output: Vec<u8>,
-    
+
     /// 轮次
     pub round: u64,
-    
+
     /// 签名
     pub signature: Vec<u8>,
 }
@@ -348,16 +348,16 @@ pub struct BlockProposalMessage {
 pub struct VoteMessage {
     /// 投票者
     pub voter: Vec<u8>,
-    
+
     /// 区块哈希
     pub block_hash: Hash,
-    
+
     /// 轮次
     pub round: u64,
-    
+
     /// 投票类型
     pub vote_type: String,
-    
+
     /// 签名
     pub signature: Vec<u8>,
 }
@@ -367,13 +367,13 @@ pub struct VoteMessage {
 pub struct VDFCompleteMessage {
     /// 区块哈希
     pub block_hash: Hash,
-    
+
     /// VDF 输出
     pub vdf_output: Vec<u8>,
-    
+
     /// 轮次
     pub round: u64,
-    
+
     /// 证明
     pub proof: Vec<u8>,
 }
@@ -383,16 +383,16 @@ pub struct VDFCompleteMessage {
 pub struct ConsensusStatusMessage {
     /// 当前轮次
     pub current_round: u64,
-    
+
     /// 共识状态
     pub consensus_state: String,
-    
+
     /// 当前高度
     pub current_height: u64,
-    
+
     /// 验证者数量
     pub validator_count: u32,
-    
+
     /// 活跃验证者数量
     pub active_validators: u32,
 }
@@ -402,10 +402,10 @@ pub struct ConsensusStatusMessage {
 pub struct TransactionBroadcastMessage {
     /// 交易
     pub transaction: Transaction,
-    
+
     /// 来源节点
     pub source_node: Option<Vec<u8>>,
-    
+
     /// 广播时间
     pub timestamp: u64,
 }
@@ -415,7 +415,7 @@ pub struct TransactionBroadcastMessage {
 pub struct TransactionRequestMessage {
     /// 请求 ID
     pub request_id: u64,
-    
+
     /// 交易哈希
     pub tx_hash: Hash,
 }
@@ -425,10 +425,10 @@ pub struct TransactionRequestMessage {
 pub struct TransactionResponseMessage {
     /// 请求 ID
     pub request_id: u64,
-    
+
     /// 交易
     pub transaction: Option<Transaction>,
-    
+
     /// 是否找到
     pub found: bool,
 }
@@ -438,13 +438,13 @@ pub struct TransactionResponseMessage {
 pub struct TransactionPoolStatusMessage {
     /// 池中交易数量
     pub pool_size: u64,
-    
+
     /// 待处理交易数量
     pub pending_count: u64,
-    
+
     /// 已验证交易数量
     pub verified_count: u64,
-    
+
     /// 池容量
     pub pool_capacity: u64,
 }
@@ -454,10 +454,10 @@ pub struct TransactionPoolStatusMessage {
 pub struct StateRequestMessage {
     /// 请求 ID
     pub request_id: u64,
-    
+
     /// 状态哈希
     pub state_hash: Hash,
-    
+
     /// 请求类型
     pub request_type: StateRequestType,
 }
@@ -467,13 +467,13 @@ pub struct StateRequestMessage {
 pub enum StateRequestType {
     /// 完整状态
     Full,
-    
+
     /// 账户状态
     Account(Vec<u8>),
-    
+
     /// 存储状态
     Storage(Vec<u8>, Vec<u8>),
-    
+
     /// 证明
     Proof(Vec<u8>),
 }
@@ -483,13 +483,13 @@ pub enum StateRequestType {
 pub struct StateResponseMessage {
     /// 请求 ID
     pub request_id: u64,
-    
+
     /// 状态数据
     pub state_data: Vec<u8>,
-    
+
     /// 状态哈希
     pub state_hash: Hash,
-    
+
     /// 是否找到
     pub found: bool,
 }
@@ -499,13 +499,13 @@ pub struct StateResponseMessage {
 pub struct AccountStateMessage {
     /// 账户地址
     pub address: Vec<u8>,
-    
+
     /// 账户数据
     pub account_data: Vec<u8>,
-    
+
     /// 状态哈希
     pub state_hash: Hash,
-    
+
     /// 证明
     pub proof: Option<Vec<u8>>,
 }
@@ -515,16 +515,16 @@ pub struct AccountStateMessage {
 pub struct StorageStateMessage {
     /// 账户地址
     pub address: Vec<u8>,
-    
+
     /// 存储键
     pub storage_key: Vec<u8>,
-    
+
     /// 存储值
     pub storage_value: Vec<u8>,
-    
+
     /// 状态哈希
     pub state_hash: Hash,
-    
+
     /// 证明
     pub proof: Option<Vec<u8>>,
 }
@@ -534,16 +534,16 @@ pub struct StorageStateMessage {
 pub struct NetworkMessageConfig {
     /// 最大消息大小
     pub max_message_size: usize,
-    
+
     /// 消息超时时间
     pub message_timeout: Duration,
-    
+
     /// 重试次数
     pub max_retries: u32,
-    
+
     /// 批量大小
     pub batch_size: usize,
-    
+
     /// 压缩阈值
     pub compression_threshold: usize,
 }
@@ -591,7 +591,7 @@ impl MessageEncoder {
     /// 编码消息
     pub fn encode(&self, message: &NetworkMessage) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let data = serde_json::to_vec(message)?;
-        
+
         // 检查消息大小
         if data.len() > self.config.max_message_size {
             return Err("Message too large".into());
@@ -611,7 +611,7 @@ impl MessageEncoder {
     pub fn decode(&self, data: &[u8]) -> Result<NetworkMessage, Box<dyn std::error::Error>> {
         // 尝试解压缩
         let decompressed_data = self.try_decompress(data)?;
-        
+
         serde_json::from_slice(&decompressed_data).map_err(Into::into)
     }
 
@@ -656,7 +656,8 @@ impl MessageEncoder {
         };
 
         // Decompress using the appropriate algorithm
-        self.compressor.decompress(compressed_data, algorithm)
+        self.compressor
+            .decompress(compressed_data, algorithm)
             .map_err(|e| format!("Decompression failed: {:?}", e).into())
     }
 }
@@ -685,7 +686,10 @@ impl MessageValidator {
     }
 
     /// 验证基础消息
-    fn validate_basic_message(&self, message: &BasicMessage) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_basic_message(
+        &self,
+        message: &BasicMessage,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match message {
             BasicMessage::Handshake(handshake) => {
                 if handshake.version.is_empty() {
@@ -713,7 +717,10 @@ impl MessageValidator {
     }
 
     /// 验证同步消息
-    fn validate_sync_message(&self, message: &SyncMessage) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_sync_message(
+        &self,
+        message: &SyncMessage,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match message {
             SyncMessage::BlockRequest(req) => {
                 if req.start_height > req.end_height {
@@ -749,7 +756,10 @@ impl MessageValidator {
     }
 
     /// 验证共识消息
-    fn validate_consensus_message(&self, message: &ConsensusMessage) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_consensus_message(
+        &self,
+        message: &ConsensusMessage,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match message {
             ConsensusMessage::BlockProposal(proposal) => {
                 if proposal.proposer.is_empty() {
@@ -775,7 +785,10 @@ impl MessageValidator {
     }
 
     /// 验证交易消息
-    fn validate_transaction_message(&self, message: &TransactionMessage) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_transaction_message(
+        &self,
+        message: &TransactionMessage,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match message {
             TransactionMessage::TransactionBroadcast(broadcast) => {
                 if broadcast.transaction.body.signature.is_empty() {
@@ -796,7 +809,10 @@ impl MessageValidator {
     }
 
     /// 验证状态消息
-    fn validate_state_message(&self, message: &StateMessage) -> Result<(), Box<dyn std::error::Error>> {
+    fn validate_state_message(
+        &self,
+        message: &StateMessage,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match message {
             StateMessage::StateRequest(req) => {
                 if req.state_hash == Hash::default() {
@@ -834,7 +850,7 @@ mod tests {
     fn test_message_encoding_decoding() {
         let config = NetworkMessageConfig::default();
         let encoder = MessageEncoder::new(config.clone());
-        
+
         let message = NetworkMessage::Basic(BasicMessage::Ping(PingMessage {
             nonce: 12345,
             timestamp: SystemTime::now()
@@ -845,7 +861,7 @@ mod tests {
 
         let encoded = encoder.encode(&message).unwrap();
         let decoded = encoder.decode(&encoded).unwrap();
-        
+
         assert_eq!(message, decoded);
     }
 
@@ -853,7 +869,7 @@ mod tests {
     fn test_message_validation() {
         let config = NetworkMessageConfig::default();
         let validator = MessageValidator::new(config);
-        
+
         // 测试有效消息
         let valid_message = NetworkMessage::Basic(BasicMessage::Ping(PingMessage {
             nonce: 12345,
@@ -862,7 +878,7 @@ mod tests {
                 .unwrap()
                 .as_secs(),
         }));
-        
+
         assert!(validator.validate(&valid_message).is_ok());
 
         // 测试无效消息
@@ -870,7 +886,7 @@ mod tests {
             nonce: 12345,
             timestamp: 0, // 无效时间戳
         }));
-        
+
         assert!(validator.validate(&invalid_message).is_err());
     }
 

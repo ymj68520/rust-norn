@@ -1,13 +1,7 @@
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-    routing::get,
-    Router,
-};
+use crate::utils::metrics::{MetricsConfig, NornMetrics};
+use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
 use std::sync::Arc;
 use tracing::{error, info};
-use crate::utils::metrics::{NornMetrics, MetricsConfig};
 
 /// HTTP server for exposing Prometheus metrics
 pub struct MetricsServer {
@@ -40,9 +34,7 @@ impl MetricsServer {
 }
 
 /// Handler for /metrics endpoint
-async fn metrics_handler(
-    State(metrics): State<Arc<NornMetrics>>,
-) -> Result<String, StatusCode> {
+async fn metrics_handler(State(metrics): State<Arc<NornMetrics>>) -> Result<String, StatusCode> {
     match metrics.gather() {
         Ok(metrics_text) => Ok(metrics_text),
         Err(err) => {
@@ -53,9 +45,7 @@ async fn metrics_handler(
 }
 
 /// Handler for /health endpoint
-async fn health_handler(
-    State(_metrics): State<Arc<NornMetrics>>,
-) -> Json<serde_json::Value> {
+async fn health_handler(State(_metrics): State<Arc<NornMetrics>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "healthy",
         "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -81,7 +71,7 @@ mod tests {
         let config = MetricsConfig::default();
         let metrics = Arc::new(NornMetrics::new(&config).unwrap());
         let server = MetricsServer::new(metrics.clone(), &config);
-        
+
         assert_eq!(server.bind_address, "0.0.0.0:9090");
     }
 
@@ -89,11 +79,11 @@ mod tests {
     async fn test_metrics_handler() {
         let config = MetricsConfig::default();
         let metrics = Arc::new(NornMetrics::new(&config).unwrap());
-        
+
         // Test metrics gathering
         let result = metrics.gather();
         assert!(result.is_ok());
-        
+
         // Test handler
         let response = metrics_handler(State(metrics)).await;
         assert!(response.is_ok());
@@ -103,10 +93,10 @@ mod tests {
     async fn test_health_handler() {
         let config = MetricsConfig::default();
         let metrics = Arc::new(NornMetrics::new(&config).unwrap());
-        
+
         let response = health_handler(State(metrics)).await;
         let json = response.0;
-        
+
         assert_eq!(json["status"], "healthy");
         assert_eq!(json["metrics_enabled"], true);
         assert!(json["timestamp"].is_string());

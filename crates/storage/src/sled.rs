@@ -14,19 +14,19 @@ impl SledDB {
         let db = sled::open(path).context("Failed to open Sled database")?;
 
         // Use the default tree for now, could support multiple trees later
-        let tree = db.open_tree("default").context("Failed to open default tree")?;
+        let tree = db
+            .open_tree("default")
+            .context("Failed to open default tree")?;
 
-        Ok(Self {
-            db: Arc::new(tree),
-        })
+        Ok(Self { db: Arc::new(tree) })
     }
 
     /// Create a new SledDB instance from an existing sled::Db
     pub fn from_db(db: sled::Db) -> Result<Self> {
-        let tree = db.open_tree("default").context("Failed to open default tree")?;
-        Ok(Self {
-            db: Arc::new(tree),
-        })
+        let tree = db
+            .open_tree("default")
+            .context("Failed to open default tree")?;
+        Ok(Self { db: Arc::new(tree) })
     }
 }
 
@@ -37,13 +37,12 @@ impl DBInterface for SledDB {
         let key = key.to_vec();
 
         // Sled operations are generally fast, but we'll use spawn_blocking for consistency
-        tokio::task::spawn_blocking(move || {
-            match db.get(&key) {
-                Ok(Some(value)) => Ok(Some(value.to_vec())),
-                Ok(None) => Ok(None),
-                Err(e) => Err(anyhow::anyhow!("Failed to get from SledDB: {}", e)),
-            }
-        }).await?
+        tokio::task::spawn_blocking(move || match db.get(&key) {
+            Ok(Some(value)) => Ok(Some(value.to_vec())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("Failed to get from SledDB: {}", e)),
+        })
+        .await?
     }
 
     async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -55,7 +54,8 @@ impl DBInterface for SledDB {
             db.insert(key.as_slice(), value.as_slice())
                 .map(|_| ())
                 .map_err(|e| anyhow::anyhow!("Failed to insert into SledDB: {}", e))
-        }).await?
+        })
+        .await?
     }
 
     async fn remove(&self, key: &[u8]) -> Result<()> {
@@ -66,7 +66,8 @@ impl DBInterface for SledDB {
             db.remove(key.as_slice())
                 .map(|_| ())
                 .map_err(|e| anyhow::anyhow!("Failed to remove from SledDB: {}", e))
-        }).await?
+        })
+        .await?
     }
 
     async fn batch_insert(&self, keys: &[Vec<u8>], values: &[Vec<u8>]) -> Result<()> {
@@ -88,7 +89,8 @@ impl DBInterface for SledDB {
             db.flush()
                 .map_err(|e| anyhow::anyhow!("Failed to flush SledDB: {}", e))?;
             Ok(())
-        }).await?
+        })
+        .await?
     }
 
     async fn batch_delete(&self, keys: &[Vec<u8>]) -> Result<()> {
@@ -105,7 +107,8 @@ impl DBInterface for SledDB {
             db.flush()
                 .map_err(|e| anyhow::anyhow!("Failed to flush SledDB: {}", e))?;
             Ok(())
-        }).await?
+        })
+        .await?
     }
 }
 
@@ -124,37 +127,40 @@ impl SledDB {
         tokio::task::spawn_blocking(move || {
             db.contains_key(&key)
                 .map_err(|e| anyhow::anyhow!("Failed to check key existence in SledDB: {}", e))
-        }).await?
+        })
+        .await?
     }
 
     /// Synchronous insert (for compatibility with persistent state module)
     pub fn insert_sync(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.db.insert(key, value)
+        self.db
+            .insert(key, value)
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("Failed to insert into SledDB: {}", e))
     }
 
     /// Synchronous get (for compatibility with persistent state module)
     pub fn get_sync(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.db.get(key)
+        self.db
+            .get(key)
             .map(|v| v.map(|ivec| ivec.to_vec()))
             .map_err(|e| anyhow::anyhow!("Failed to get from SledDB: {}", e))
     }
 
     /// Synchronous remove (for compatibility with persistent state module)
     pub fn remove_sync(&self, key: &[u8]) -> Result<()> {
-        self.db.remove(key)
+        self.db
+            .remove(key)
             .map(|_| ())
             .map_err(|e| anyhow::anyhow!("Failed to remove from SledDB: {}", e))
     }
 
     /// Iterate over keys with a prefix
     pub fn iter_prefix(&self, prefix: &[u8]) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {
-        self.db.scan_prefix(prefix)
-            .map(|res| {
-                res.map(|(k, v)| (k.to_vec(), v.to_vec()))
-                    .map_err(|e| anyhow::anyhow!("DB iteration error: {}", e))
-            })
+        self.db.scan_prefix(prefix).map(|res| {
+            res.map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .map_err(|e| anyhow::anyhow!("DB iteration error: {}", e))
+        })
     }
 }
 

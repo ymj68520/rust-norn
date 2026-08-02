@@ -1,8 +1,8 @@
 use libp2p::gossipsub;
 use libp2p::identify;
 use libp2p::kad::{store::MemoryStore, Behaviour as KadBehaviour};
-use libp2p::swarm::NetworkBehaviour;
 use libp2p::mdns;
+use libp2p::swarm::NetworkBehaviour;
 
 #[derive(NetworkBehaviour)]
 pub struct NornBehaviour {

@@ -13,15 +13,15 @@
 //! solc-select use 0.8.20
 //! ```
 
-use crate::artifact::{CompilationError, CompiledContract, CompileResult, SolcOutput};
+use crate::artifact::{CompilationError, CompileResult, CompiledContract, SolcOutput};
 use crate::config::{EvmVersion, OptimizationSettings, SolcConfig};
 use crate::error::{SolidityError, SolidityResult};
-use tiny_keccak::{Hasher, Keccak};
 use regex::Regex;
 use serde_json::json;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tiny_keccak::{Hasher, Keccak};
 use tracing::{debug, info, warn};
 
 lazy_static::lazy_static! {
@@ -180,23 +180,17 @@ impl SolidityCompiler {
             detected, required
         );
 
-        let detected_ver = semver::Version::parse(
-            detected
-                .split('+')
-                .next()
-                .unwrap_or(detected)
-        )
-        .map_err(|_| SolidityError::VersionMismatch {
+        let detected_ver = semver::Version::parse(detected.split('+').next().unwrap_or(detected))
+            .map_err(|_| SolidityError::VersionMismatch {
             found: detected.to_string(),
             required: required.to_string(),
         })?;
 
-        let required_ver = semver::Version::parse(required).map_err(|_| {
-            SolidityError::VersionMismatch {
+        let required_ver =
+            semver::Version::parse(required).map_err(|_| SolidityError::VersionMismatch {
                 found: detected.to_string(),
                 required: required.to_string(),
-            }
-        })?;
+            })?;
 
         if detected_ver >= required_ver {
             Ok(())
@@ -231,10 +225,7 @@ impl SolidityCompiler {
         source: &str,
         contract_name: Option<&str>,
     ) -> SolidityResult<CompileResult> {
-        info!(
-            "Compiling Solidity source (length={} bytes)",
-            source.len()
-        );
+        info!("Compiling Solidity source (length={} bytes)", source.len());
         debug!("Source preview: {}", &source[..source.len().min(200)]);
 
         // Write source to temporary file
@@ -264,10 +255,7 @@ impl SolidityCompiler {
             });
         }
 
-        info!(
-            "Compiling {} Solidity files",
-            files.len()
-        );
+        info!("Compiling {} Solidity files", files.len());
 
         // Build standard JSON input
         let json_input = self.build_standard_json(files)?;
@@ -310,15 +298,14 @@ impl SolidityCompiler {
         );
 
         // Parse the output
-        let solc_output: SolcOutput = serde_json::from_str(&output_json).map_err(|e| {
-            SolidityError::ParseError {
+        let solc_output: SolcOutput =
+            serde_json::from_str(&output_json).map_err(|e| SolidityError::ParseError {
                 message: format!(
                     "Failed to parse solc output: {}. Output: {}",
                     e,
                     &output_json[..output_json.len().min(500)]
                 ),
-            }
-        })?;
+            })?;
 
         // Process compilation errors
         let actual_errors: Vec<CompilationError> = solc_output

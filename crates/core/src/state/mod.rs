@@ -2,37 +2,50 @@
 //!
 //! Provides state management for blockchain accounts and storage.
 
+pub mod account; // Comprehensive account state implementation
+pub mod cache; // Synchronous cache for async/sync bridging
+pub mod history; // State change history tracking
 pub mod merkle;
 pub mod persistent;
-pub mod account;  // Comprehensive account state implementation
-pub mod cache;    // Synchronous cache for async/sync bridging
-pub mod traits;   // Unified trait for account state management
-pub mod history;  // State change history tracking
-pub mod pruning;  // State pruning for storage optimization
+pub mod pruning;
+pub mod traits; // Unified trait for account state management // State pruning for storage optimization
 
 // Re-export the comprehensive account state manager and trait
-pub use account::{AccountState, AccountType, AccountStateConfig, AccountStateManager};
+pub use account::{AccountState, AccountStateConfig, AccountStateManager, AccountType};
+pub use history::{StateChangeRecord, StateChangeType, StateHistory, StateSnapshot};
+pub use persistent::{PersistentConfig, PersistentStateManager};
+pub use pruning::{PruningConfig, PruningResult, PruningStats, StatePruningManager};
 pub use traits::{AccountStateManagerTrait, SharedAccountStateManager};
-pub use history::{StateHistory, StateChangeRecord, StateChangeType, StateSnapshot};
-pub use persistent::{PersistentStateManager, PersistentConfig};
-pub use pruning::{PruningConfig, PruningStats, StatePruningManager, PruningResult};
 
-use norn_common::types::{Hash, Address};
 use norn_common::error::{NornError, Result};
-use serde::{Serialize, Deserialize};
+use norn_common::types::{Address, Hash};
+use num_bigint::BigUint;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info};
-use num_bigint::BigUint;
 
 /// State change record
 #[derive(Debug, Clone)]
 pub enum StateChange {
-    AccountCreated { address: Address, account: AccountState },
-    AccountUpdated { address: Address, old: AccountState, new: AccountState },
-    AccountDeleted { address: Address },
-    BalanceChanged { address: Address, old_balance: String, new_balance: String },
+    AccountCreated {
+        address: Address,
+        account: AccountState,
+    },
+    AccountUpdated {
+        address: Address,
+        old: AccountState,
+        new: AccountState,
+    },
+    AccountDeleted {
+        address: Address,
+    },
+    BalanceChanged {
+        address: Address,
+        old_balance: String,
+        new_balance: String,
+    },
 }
 
 #[cfg(test)]
@@ -67,4 +80,3 @@ mod tests {
         assert_eq!(retrieved.unwrap().balance, BigUint::from(1000u64));
     }
 }
-

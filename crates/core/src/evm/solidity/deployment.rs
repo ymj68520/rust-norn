@@ -176,16 +176,24 @@ impl ContractDeployer {
         let call_data = ABI::encode_function_call(function_name, params)?;
 
         // Execute the call
-        let result = self.executor
+        let result = self
+            .executor
             .call_contract(from, contract_address, value, call_data, gas_limit)
             .await?;
 
         // Find the function in the ABI to determine return types
-        let return_types: Vec<ABIType> = artifact.abi_items.iter()
+        let return_types: Vec<ABIType> = artifact
+            .abi_items
+            .iter()
             .filter_map(|item| {
                 if let crate::evm::abi::ABIItem::Function { name, outputs, .. } = item {
                     if name == function_name {
-                        Some(outputs.iter().map(|p| p.ty.clone()).collect::<Vec<ABIType>>())
+                        Some(
+                            outputs
+                                .iter()
+                                .map(|p| p.ty.clone())
+                                .collect::<Vec<ABIType>>(),
+                        )
                     } else {
                         None
                     }
@@ -225,15 +233,23 @@ impl ContractDeployer {
     ) -> EVMResult<CallResult> {
         let call_data = ABI::encode_function_call(function_name, params)?;
 
-        let result = self.executor
+        let result = self
+            .executor
             .static_call(from, contract_address, call_data, gas_limit)
             .await?;
 
-        let return_types: Vec<ABIType> = artifact.abi_items.iter()
+        let return_types: Vec<ABIType> = artifact
+            .abi_items
+            .iter()
             .filter_map(|item| {
                 if let crate::evm::abi::ABIItem::Function { name, outputs, .. } = item {
                     if name == function_name {
-                        Some(outputs.iter().map(|p| p.ty.clone()).collect::<Vec<ABIType>>())
+                        Some(
+                            outputs
+                                .iter()
+                                .map(|p| p.ty.clone())
+                                .collect::<Vec<ABIType>>(),
+                        )
                     } else {
                         None
                     }
@@ -261,10 +277,7 @@ impl ContractDeployer {
     }
 
     /// Estimate gas for a contract deployment
-    pub async fn estimate_deploy_gas(
-        &self,
-        bytecode: &[u8],
-    ) -> EVMResult<u64> {
+    pub async fn estimate_deploy_gas(&self, bytecode: &[u8]) -> EVMResult<u64> {
         // Estimate gas based on bytecode length
         // Base cost for CREATE: 32000
         // Memory expansion cost

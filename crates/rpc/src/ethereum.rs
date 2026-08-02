@@ -3,22 +3,22 @@
 //! Provides Ethereum-compatible JSON-RPC methods for interacting with the norn blockchain.
 //! Supports standard eth_* methods like eth_getBalance, eth_call, eth_getBlockByNumber, etc.
 
-use std::sync::Arc;
-use std::net::SocketAddr;
+use anyhow::anyhow;
 use jsonrpsee::core::{async_trait, RpcResult};
 use jsonrpsee::proc_macros::rpc;
-use jsonrpsee::types::{error::ErrorCode, ErrorObject};
 use jsonrpsee::server::ServerBuilder;
-use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
-use anyhow::anyhow;
-use norn_core::blockchain::Blockchain;
-use norn_core::state::{AccountStateManager, AccountStateConfig};
-use norn_core::evm::{EVMExecutor, EVMConfig, EVMContext};
-use norn_core::TxPool;
-use norn_common::types::{Address, Hash, Transaction, PublicKey};
-use num_bigint::BigUint;
+use jsonrpsee::types::{error::ErrorCode, ErrorObject};
 use keccak_hash::keccak256;
+use norn_common::types::{Address, Hash, PublicKey, Transaction};
+use norn_core::blockchain::Blockchain;
+use norn_core::evm::{EVMConfig, EVMContext, EVMExecutor};
+use norn_core::state::{AccountStateConfig, AccountStateManager};
+use norn_core::TxPool;
+use num_bigint::BigUint;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// Ethereum JSON-RPC API
 #[rpc(server)]
@@ -41,11 +41,19 @@ pub trait EthereumRpc {
 
     /// Get information about a block by hash
     #[method(name = "eth_getBlockByHash")]
-    async fn get_block_by_hash(&self, hash: Hash, full_transactions: bool) -> RpcResult<Option<Block>>;
+    async fn get_block_by_hash(
+        &self,
+        hash: Hash,
+        full_transactions: bool,
+    ) -> RpcResult<Option<Block>>;
 
     /// Get information about a block by number
     #[method(name = "eth_getBlockByNumber")]
-    async fn get_block_by_number(&self, block: BlockNumber, full_transactions: bool) -> RpcResult<Option<Block>>;
+    async fn get_block_by_number(
+        &self,
+        block: BlockNumber,
+        full_transactions: bool,
+    ) -> RpcResult<Option<Block>>;
 
     /// Get the code at a specific address
     #[method(name = "eth_getCode")]
@@ -53,11 +61,20 @@ pub trait EthereumRpc {
 
     /// Get the storage value at a specific position
     #[method(name = "eth_getStorageAt")]
-    async fn get_storage_at(&self, address: Address, position: String, block: BlockNumber) -> RpcResult<String>;
+    async fn get_storage_at(
+        &self,
+        address: Address,
+        position: String,
+        block: BlockNumber,
+    ) -> RpcResult<String>;
 
     /// Get the number of transactions sent from an address
     #[method(name = "eth_getTransactionCount")]
-    async fn get_transaction_count(&self, address: Address, block: BlockNumber) -> RpcResult<String>;
+    async fn get_transaction_count(
+        &self,
+        address: Address,
+        block: BlockNumber,
+    ) -> RpcResult<String>;
 
     /// Get the current gas price
     #[method(name = "eth_gasPrice")]
@@ -109,11 +126,19 @@ pub trait EthereumRpc {
 
     /// Get uncle by block hash and index (always null for PoVF consensus)
     #[method(name = "eth_getUncleByBlockHashAndIndex")]
-    async fn get_uncle_by_block_hash_and_index(&self, hash: Hash, index: String) -> RpcResult<Option<Block>>;
+    async fn get_uncle_by_block_hash_and_index(
+        &self,
+        hash: Hash,
+        index: String,
+    ) -> RpcResult<Option<Block>>;
 
     /// Get uncle by block number and index (always null for PoVF consensus)
     #[method(name = "eth_getUncleByBlockNumberAndIndex")]
-    async fn get_uncle_by_block_number_and_index(&self, block: BlockNumber, index: String) -> RpcResult<Option<Block>>;
+    async fn get_uncle_by_block_number_and_index(
+        &self,
+        block: BlockNumber,
+        index: String,
+    ) -> RpcResult<Option<Block>>;
 
     /// Get available compilers (returns empty list)
     #[method(name = "eth_getCompilers")]
@@ -141,7 +166,12 @@ pub trait EthereumRpc {
 
     /// Get base fee and reward percentiles for a range of blocks
     #[method(name = "eth_feeHistory")]
-    async fn fee_history(&self, block_count: String, newest_block: BlockNumber, reward_percentiles: Option<Vec<f64>>) -> RpcResult<FeeHistory>;
+    async fn fee_history(
+        &self,
+        block_count: String,
+        newest_block: BlockNumber,
+        reward_percentiles: Option<Vec<f64>>,
+    ) -> RpcResult<FeeHistory>;
 
     // ========== Development Only Methods ==========
 
@@ -412,7 +442,9 @@ impl EthereumRpcImpl {
     /// Convert norn block to RPC block format
     fn convert_block(&self, block: &norn_common::types::Block) -> Block {
         let mut miner_address = Address([0u8; 20]);
-        miner_address.0.copy_from_slice(&block.header.proposer.0[..20]);
+        miner_address
+            .0
+            .copy_from_slice(&block.header.proposer.0[..20]);
         Block {
             hash: format!("0x{}", block.header.block_hash),
             parent_hash: format!("0x{}", block.header.prev_block_hash),
@@ -444,11 +476,16 @@ impl EthereumRpcServer for EthereumRpcImpl {
     }
 
     async fn get_balance(&self, address: Address, block: BlockNumber) -> RpcResult<String> {
-        let _block_num = self.resolve_block_number(block).await
+        let _block_num = self
+            .resolve_block_number(block)
+            .await
             .ok_or_else(|| ErrorObject::from(ErrorCode::InvalidParams))?;
 
         // Get balance from state manager
-        let balance = self.state_manager.get_balance(&address).await
+        let balance = self
+            .state_manager
+            .get_balance(&address)
+            .await
             .map_err(|_| ErrorObject::from(ErrorCode::InternalError))?;
 
         // Convert BigUint to hex string (in wei)
@@ -460,13 +497,23 @@ impl EthereumRpcServer for EthereumRpcImpl {
         Ok(format!("0x{:x}", latest.header.height))
     }
 
-    async fn get_block_by_hash(&self, hash: Hash, _full_transactions: bool) -> RpcResult<Option<Block>> {
+    async fn get_block_by_hash(
+        &self,
+        hash: Hash,
+        _full_transactions: bool,
+    ) -> RpcResult<Option<Block>> {
         let block = self.blockchain.get_block_by_hash(&hash).await;
         Ok(block.map(|b| self.convert_block(&b)))
     }
 
-    async fn get_block_by_number(&self, block: BlockNumber, _full_transactions: bool) -> RpcResult<Option<Block>> {
-        let block_num = self.resolve_block_number(block).await
+    async fn get_block_by_number(
+        &self,
+        block: BlockNumber,
+        _full_transactions: bool,
+    ) -> RpcResult<Option<Block>> {
+        let block_num = self
+            .resolve_block_number(block)
+            .await
             .ok_or_else(|| ErrorObject::from(ErrorCode::InvalidParams))?;
 
         // For now, only latest is supported
@@ -485,13 +532,20 @@ impl EthereumRpcServer for EthereumRpcImpl {
 
     async fn get_code(&self, address: Address, _block: BlockNumber) -> RpcResult<String> {
         // Get account to check code hash
-        let account = self.state_manager.get_account(&address).await
+        let account = self
+            .state_manager
+            .get_account(&address)
+            .await
             .map_err(|_| ErrorObject::from(ErrorCode::InternalError))?;
 
         if let Some(acc) = account {
             if acc.account_type == norn_core::state::AccountType::Contract {
                 // Get code from code storage
-                let code = self.evm_executor.code_storage().get_code_by_address(&address).await;
+                let code = self
+                    .evm_executor
+                    .code_storage()
+                    .get_code_by_address(&address)
+                    .await;
                 if let Ok(Some(bytecode)) = code {
                     return Ok(format!("0x{}", hex::encode(&bytecode)));
                 }
@@ -501,7 +555,12 @@ impl EthereumRpcServer for EthereumRpcImpl {
         Ok("0x".to_string())
     }
 
-    async fn get_storage_at(&self, address: Address, position: String, _block: BlockNumber) -> RpcResult<String> {
+    async fn get_storage_at(
+        &self,
+        address: Address,
+        position: String,
+        _block: BlockNumber,
+    ) -> RpcResult<String> {
         // Parse position as hex string and convert to bytes
         let pos = if position.starts_with("0x") {
             &position[2..]
@@ -517,14 +576,24 @@ impl EthereumRpcServer for EthereumRpcImpl {
         }
 
         // Get storage value
-        let value = self.state_manager.get_storage(&address, &key).await
+        let value = self
+            .state_manager
+            .get_storage(&address, &key)
+            .await
             .map_err(|_| ErrorObject::from(ErrorCode::InternalError))?;
 
         Ok(format!("0x{}", hex::encode(value.unwrap_or_default())))
     }
 
-    async fn get_transaction_count(&self, address: Address, _block: BlockNumber) -> RpcResult<String> {
-        let nonce = self.state_manager.get_nonce(&address).await
+    async fn get_transaction_count(
+        &self,
+        address: Address,
+        _block: BlockNumber,
+    ) -> RpcResult<String> {
+        let nonce = self
+            .state_manager
+            .get_nonce(&address)
+            .await
             .map_err(|_| ErrorObject::from(ErrorCode::InternalError))?;
 
         Ok(format!("0x{:x}", nonce))
@@ -540,24 +609,35 @@ impl EthereumRpcServer for EthereumRpcImpl {
         // Create EVM context
         let latest = self.blockchain.latest_block.read().await;
         let mut coinbase_addr = Address([0u8; 20]);
-        coinbase_addr.0.copy_from_slice(&latest.header.proposer.0[..20]);
+        coinbase_addr
+            .0
+            .copy_from_slice(&latest.header.proposer.0[..20]);
         let ctx = EVMContext {
             block_number: latest.header.height as u64,
             block_timestamp: latest.header.timestamp as u64,
             block_coinbase: coinbase_addr,
             block_gas_limit: latest.header.gas_limit as u64,
             tx_gas_price: 1_000_000_000, // 1 Gwei
+            tx_nonce: None,
         };
 
         // Parse call data
-        let data = request.data.and_then(|d| if d.starts_with("0x") {
-            hex::decode(&d[2..]).ok()
-        } else {
-            hex::decode(&d).ok()
-        }).unwrap_or_default();
+        let data = request
+            .data
+            .and_then(|d| {
+                if d.starts_with("0x") {
+                    hex::decode(&d[2..]).ok()
+                } else {
+                    hex::decode(&d).ok()
+                }
+            })
+            .unwrap_or_default();
 
         let from = request.from.unwrap_or(Address::default());
-        let value = request.value.and_then(|v| v.parse::<u128>().ok()).unwrap_or(0);
+        let value = request
+            .value
+            .and_then(|v| v.parse::<u128>().ok())
+            .unwrap_or(0);
 
         // Check if this is a contract creation (to is None)
         if request.to.is_none() && !data.is_empty() {
@@ -568,16 +648,14 @@ impl EthereumRpcServer for EthereumRpcImpl {
         } else {
             // Contract call
             let to = request.to.unwrap_or(Address::default());
-            let _result = self.evm_executor.call_contract(
-                from,
-                to,
-                value,
-                data,
-                1_000_000,
-            ).await.map_err(|e| {
-                tracing::error!("call_contract failed in estimate_gas: {:?}", e);
-                ErrorObject::from(ErrorCode::InternalError)
-            })?;
+            let _result = self
+                .evm_executor
+                .call_contract(from, to, value, data, 1_000_000)
+                .await
+                .map_err(|e| {
+                    tracing::error!("call_contract failed in estimate_gas: {:?}", e);
+                    ErrorObject::from(ErrorCode::InternalError)
+                })?;
 
             // Return estimated gas (simplified - should be actual gas used)
             Ok("0x5208".to_string()) // 21000 in hex
@@ -586,14 +664,22 @@ impl EthereumRpcServer for EthereumRpcImpl {
 
     async fn call(&self, request: CallRequest, _block: BlockNumber) -> RpcResult<String> {
         // Parse call data
-        let data = request.data.and_then(|d| if d.starts_with("0x") {
-            hex::decode(&d[2..]).ok()
-        } else {
-            hex::decode(&d).ok()
-        }).unwrap_or_default();
+        let data = request
+            .data
+            .and_then(|d| {
+                if d.starts_with("0x") {
+                    hex::decode(&d[2..]).ok()
+                } else {
+                    hex::decode(&d).ok()
+                }
+            })
+            .unwrap_or_default();
 
         let from = request.from.unwrap_or(Address::default());
-        let value = request.value.and_then(|v| v.parse::<u128>().ok()).unwrap_or(0);
+        let value = request
+            .value
+            .and_then(|v| v.parse::<u128>().ok())
+            .unwrap_or(0);
 
         // Check if this is a contract creation (to is None)
         if request.to.is_none() && !data.is_empty() {
@@ -601,16 +687,20 @@ impl EthereumRpcServer for EthereumRpcImpl {
             return Err(ErrorObject::from(ErrorCode::InvalidRequest));
         }
 
-        let result = self.evm_executor.call_contract(
-            from,
-            request.to.unwrap_or(Address::default()),
-            value,
-            data,
-            5_000_000,
-        ).await.map_err(|e| {
-            tracing::error!("call_contract failed: {:?}", e);
-            ErrorObject::from(ErrorCode::InternalError)
-        })?;
+        let result = self
+            .evm_executor
+            .call_contract(
+                from,
+                request.to.unwrap_or(Address::default()),
+                value,
+                data,
+                5_000_000,
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!("call_contract failed: {:?}", e);
+                ErrorObject::from(ErrorCode::InternalError)
+            })?;
 
         Ok(format!("0x{}", hex::encode(&result.output)))
     }
@@ -637,21 +727,29 @@ impl EthereumRpcServer for EthereumRpcImpl {
                     gas_used: format!("0x{:x}", r.gas_used),
                     cumulative_gas_used: format!("0x{:x}", r.cumulative_gas_used),
                     contract_address: r.contract_address,
-                    logs: r.logs.iter().map(|l| Log {
-                        log_index: format!("0x{:x}", l.log_index),
-                        transaction_index: format!("0x{:x}", l.log_index),
-                        transaction_hash: l.tx_hash,
-                        block_hash: l.block_hash,
-                        block_number: format!("0x{:x}", l.block_number),
-                        address: l.address,
-                        topics: l.topics.clone(),
-                        data: format!("0x{}", hex::encode(&l.data)),
-                    }).collect(),
+                    logs: r
+                        .logs
+                        .iter()
+                        .map(|l| Log {
+                            log_index: format!("0x{:x}", l.log_index),
+                            transaction_index: format!("0x{:x}", l.log_index),
+                            transaction_hash: l.tx_hash,
+                            block_hash: l.block_hash,
+                            block_number: format!("0x{:x}", l.block_number),
+                            address: l.address,
+                            topics: l.topics.clone(),
+                            data: format!("0x{}", hex::encode(&l.data)),
+                        })
+                        .collect(),
                     logs_bloom: format!("0x{}", hex::encode(&r.logs_bloom.as_bytes())),
-                    status: if r.status { "0x1".to_string() } else { "0x0".to_string() },
+                    status: if r.status {
+                        "0x1".to_string()
+                    } else {
+                        "0x0".to_string()
+                    },
                 };
                 Ok(Some(converted))
-            },
+            }
             Ok(None) => Ok(None),
             Err(_) => Ok(None),
         }
@@ -667,8 +765,8 @@ impl EthereumRpcServer for EthereumRpcImpl {
             &data
         };
 
-        let tx_bytes = hex::decode(raw_tx)
-            .map_err(|_| ErrorObject::from(ErrorCode::InvalidParams))?;
+        let tx_bytes =
+            hex::decode(raw_tx).map_err(|_| ErrorObject::from(ErrorCode::InvalidParams))?;
 
         // Parse RLP-encoded Ethereum transaction
         let eth_tx = match EthereumTransaction::parse(&tx_bytes) {
@@ -690,41 +788,64 @@ impl EthereumRpcServer for EthereumRpcImpl {
 
         // Validate transaction
         // 1. Check nonce
-        let current_nonce = self.state_manager.get_nonce(&norn_tx.body.address).await
+        let current_nonce = self
+            .state_manager
+            .get_nonce(&norn_tx.body.address)
+            .await
             .map_err(|e| {
                 tracing::error!("Failed to get nonce: {:?}", e);
                 ErrorObject::from(ErrorCode::InternalError)
             })?;
 
         if (norn_tx.body.nonce as u64) < current_nonce {
-            tracing::error!("Transaction nonce {} is too old (current: {})",
-                norn_tx.body.nonce, current_nonce);
+            tracing::error!(
+                "Transaction nonce {} is too old (current: {})",
+                norn_tx.body.nonce,
+                current_nonce
+            );
             return Err(ErrorObject::from(ErrorCode::InvalidParams));
         }
 
         if norn_tx.body.nonce as u64 > current_nonce + 10 {
-            tracing::warn!("Transaction nonce {} is too far in the future (current: {})",
-                norn_tx.body.nonce, current_nonce);
+            tracing::warn!(
+                "Transaction nonce {} is too far in the future (current: {})",
+                norn_tx.body.nonce,
+                current_nonce
+            );
             // Don't reject, but warn
         }
 
         // 2. Check balance
-        let balance = self.state_manager.get_balance(&norn_tx.body.address).await
+        let balance = self
+            .state_manager
+            .get_balance(&norn_tx.body.address)
+            .await
             .map_err(|e| {
                 tracing::error!("Failed to get balance: {:?}", e);
                 ErrorObject::from(ErrorCode::InternalError)
             })?;
 
         // balance is already BigUint, convert value to BigUint for comparison
-        let value_biguint = norn_tx.body.value.clone().unwrap_or_else(|| "0".to_string())
-            .parse::<num_bigint::BigUint>().unwrap_or_else(|_| num_bigint::BigUint::from(0u32));
+        let value_biguint = norn_tx
+            .body
+            .value
+            .clone()
+            .unwrap_or_else(|| "0".to_string())
+            .parse::<num_bigint::BigUint>()
+            .unwrap_or_else(|_| num_bigint::BigUint::from(0u32));
 
         // Simplified gas cost calculation (gas_limit * gas_price + value)
         // In production, this should use the actual gas calculator
-        let gas_cost_biguint = BigUint::from(norn_tx.body.gas as u64) * BigUint::from(1_000_000_000u64) + value_biguint;
+        let gas_cost_biguint = BigUint::from(norn_tx.body.gas as u64)
+            * BigUint::from(1_000_000_000u64)
+            + value_biguint;
 
         if balance < gas_cost_biguint {
-            tracing::error!("Insufficient balance: have {}, need {}", balance, gas_cost_biguint);
+            tracing::error!(
+                "Insufficient balance: have {}, need {}",
+                balance,
+                gas_cost_biguint
+            );
             return Err(ErrorObject::from(ErrorCode::InvalidParams));
         }
 
@@ -753,19 +874,26 @@ impl EthereumRpcServer for EthereumRpcImpl {
             return Err(ErrorObject::from(ErrorCode::InternalError));
         }
 
-        tracing::info!("eth_sendTransaction called (TEST MODE ONLY): from={:?}, to={:?}, value={:?}",
-            request.from, request.to, request.value);
+        tracing::info!(
+            "eth_sendTransaction called (TEST MODE ONLY): from={:?}, to={:?}, value={:?}",
+            request.from,
+            request.to,
+            request.value
+        );
 
         // In test mode, create and sign a transaction using a test keypair
         // This allows easy testing without requiring wallet software
 
         // 1. Validate parameters
-        let to = request.to.ok_or_else(|| ErrorObject::from(ErrorCode::InvalidParams))?;
+        let to = request
+            .to
+            .ok_or_else(|| ErrorObject::from(ErrorCode::InvalidParams))?;
         let from = request.from;
 
         // 2. Parse value
         let value_str = request.value.unwrap_or_else(|| "0".to_string());
-        let value: num_bigint::BigUint = value_str.parse()
+        let value: num_bigint::BigUint = value_str
+            .parse()
             .unwrap_or_else(|_| num_bigint::BigUint::from(0u32));
 
         // 3. Get nonce
@@ -797,21 +925,32 @@ impl EthereumRpcServer for EthereumRpcImpl {
         hash_bytes.copy_from_slice(&buffer[..32]);
 
         tracing::warn!("TEST MODE: eth_sendTransaction creates unsigned transaction");
-        tracing::warn!("In production, use eth_sendRawTransaction with properly signed transactions");
+        tracing::warn!(
+            "In production, use eth_sendRawTransaction with properly signed transactions"
+        );
 
         Ok(Hash(hash_bytes))
     }
 
     async fn dev_faucet(&self, address: Address, amount: String) -> RpcResult<bool> {
         // Development only: Mint ETH to an address
-        tracing::info!("dev_faucet called: address={:?}, amount={}", address, amount);
+        tracing::info!(
+            "dev_faucet called: address={:?}, amount={}",
+            address,
+            amount
+        );
 
         // Parse amount to BigUint
-        let amount_biguint: num_bigint::BigUint = amount.parse()
+        let amount_biguint: num_bigint::BigUint = amount
+            .parse()
             .unwrap_or_else(|_| num_bigint::BigUint::from(0u32));
 
         // Update account balance in state manager
-        match self.state_manager.update_balance(&address, amount_biguint).await {
+        match self
+            .state_manager
+            .update_balance(&address, amount_biguint)
+            .await
+        {
             Ok(_) => {
                 tracing::info!("Successfully minted {} ETH to {:?}", amount, address);
                 Ok(true)
@@ -831,11 +970,19 @@ impl EthereumRpcServer for EthereumRpcImpl {
         Ok("0x0".to_string())
     }
 
-    async fn get_uncle_by_block_hash_and_index(&self, _hash: Hash, _index: String) -> RpcResult<Option<Block>> {
+    async fn get_uncle_by_block_hash_and_index(
+        &self,
+        _hash: Hash,
+        _index: String,
+    ) -> RpcResult<Option<Block>> {
         Ok(None)
     }
 
-    async fn get_uncle_by_block_number_and_index(&self, _block: BlockNumber, _index: String) -> RpcResult<Option<Block>> {
+    async fn get_uncle_by_block_number_and_index(
+        &self,
+        _block: BlockNumber,
+        _index: String,
+    ) -> RpcResult<Option<Block>> {
         Ok(None)
     }
 
@@ -864,7 +1011,9 @@ impl EthereumRpcServer for EthereumRpcImpl {
     }
 
     async fn get_block_transaction_count_by_number(&self, block: BlockNumber) -> RpcResult<String> {
-        let block_num = self.resolve_block_number(block).await
+        let block_num = self
+            .resolve_block_number(block)
+            .await
             .ok_or_else(|| ErrorObject::from(ErrorCode::InvalidParams))?;
 
         if block_num == 0 {
@@ -880,16 +1029,22 @@ impl EthereumRpcServer for EthereumRpcImpl {
         }
     }
 
-    async fn fee_history(&self, block_count: String, newest_block: BlockNumber, _reward_percentiles: Option<Vec<f64>>) -> RpcResult<FeeHistory> {
+    async fn fee_history(
+        &self,
+        block_count: String,
+        newest_block: BlockNumber,
+        _reward_percentiles: Option<Vec<f64>>,
+    ) -> RpcResult<FeeHistory> {
         let block_count_num: u64 = if block_count.starts_with("0x") {
-            u64::from_str_radix(&block_count[2..], 16)
-                .unwrap_or(1)
+            u64::from_str_radix(&block_count[2..], 16).unwrap_or(1)
         } else {
             block_count.parse().unwrap_or(1)
         };
 
-        let newest_block_num = self.resolve_block_number(newest_block).await
-            .ok_or_else(|| ErrorObject::from(ErrorCode::InvalidParams))? as u64;
+        let newest_block_num =
+            self.resolve_block_number(newest_block)
+                .await
+                .ok_or_else(|| ErrorObject::from(ErrorCode::InvalidParams))? as u64;
 
         let oldest_block_num = if newest_block_num >= block_count_num {
             newest_block_num - block_count_num
@@ -953,13 +1108,15 @@ impl EthereumRpcServer for EthereumRpcImpl {
         let topics = filter.topics.unwrap_or_default();
 
         // Query receipts
-        let receipts = receipt_db.filter_receipts(
-            None, // block_hash - not used when we have range
-            from_block,
-            to_block,
-            filter.address.as_ref(),
-            &topics,
-        ).await
+        let receipts = receipt_db
+            .filter_receipts(
+                None, // block_hash - not used when we have range
+                from_block,
+                to_block,
+                filter.address.as_ref(),
+                &topics,
+            )
+            .await
             .map_err(|e| {
                 tracing::error!("Failed to filter receipts: {:?}", e);
                 ErrorObject::from(ErrorCode::InternalError)
@@ -980,8 +1137,8 @@ impl EthereumRpcServer for EthereumRpcImpl {
                 let mut topics_match = true;
                 for (i, topic_opt) in topics.iter().enumerate() {
                     if let Some(topic) = topic_opt {
-                        let log_has_topic = receipt_log.topics.get(i)
-                            .map_or(false, |t| *t == *topic);
+                        let log_has_topic =
+                            receipt_log.topics.get(i).map_or(false, |t| *t == *topic);
                         if !log_has_topic {
                             topics_match = false;
                             break;
@@ -1017,16 +1174,14 @@ pub async fn start_ethereum_rpc_server(
     addr: SocketAddr,
     ethereum_rpc: EthereumRpcImpl,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use jsonrpsee::server::ServerBuilder;
     use jsonrpsee::server::RpcModule;
-    use tracing::info;
+    use jsonrpsee::server::ServerBuilder;
     use std::sync::Arc;
+    use tracing::info;
 
     info!("Starting Ethereum JSON-RPC server on {}", addr);
 
-    let server = ServerBuilder::default()
-        .build(addr)
-        .await?;
+    let server = ServerBuilder::default().build(addr).await?;
 
     let addr = server.local_addr()?;
     info!("Ethereum JSON-RPC server listening on {}", addr);
@@ -1040,16 +1195,12 @@ pub async fn start_ethereum_rpc_server(
     // Register all RPC methods using async closures
     module.register_async_method("web3_clientVersion", move |_params, ethereum_rpc| {
         let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            ethereum_rpc.client_version().await
-        }
+        async move { ethereum_rpc.client_version().await }
     })?;
 
     module.register_async_method("eth_accounts", move |_params, ethereum_rpc| {
         let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            ethereum_rpc.accounts().await
-        }
+        async move { ethereum_rpc.accounts().await }
     })?;
 
     module.register_async_method("eth_getBalance", move |params, ethereum_rpc| {
@@ -1062,9 +1213,7 @@ pub async fn start_ethereum_rpc_server(
 
     module.register_async_method("eth_blockNumber", move |_params, ethereum_rpc| {
         let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            ethereum_rpc.block_number().await
-        }
+        async move { ethereum_rpc.block_number().await }
     })?;
 
     module.register_async_method("eth_getBlockByHash", move |params, ethereum_rpc| {
@@ -1125,16 +1274,12 @@ pub async fn start_ethereum_rpc_server(
 
     module.register_async_method("eth_chainId", move |_params, ethereum_rpc| {
         let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            ethereum_rpc.chain_id().await
-        }
+        async move { ethereum_rpc.chain_id().await }
     })?;
 
     module.register_async_method("net_version", move |_params, ethereum_rpc| {
         let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            ethereum_rpc.chain_id().await
-        }
+        async move { ethereum_rpc.chain_id().await }
     })?;
 
     module.register_async_method("eth_getLogs", move |params, ethereum_rpc| {
@@ -1145,87 +1290,109 @@ pub async fn start_ethereum_rpc_server(
         }
     })?;
 
-    module.register_async_method("eth_getUncleCountByBlockHash", move |params, ethereum_rpc| {
-        let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            let hash: Hash = params.parse()?;
-            ethereum_rpc.get_uncle_count_by_block_hash(hash).await
-        }
-    })?;
+    module.register_async_method(
+        "eth_getUncleCountByBlockHash",
+        move |params, ethereum_rpc| {
+            let ethereum_rpc = ethereum_rpc.clone();
+            async move {
+                let hash: Hash = params.parse()?;
+                ethereum_rpc.get_uncle_count_by_block_hash(hash).await
+            }
+        },
+    )?;
 
-    module.register_async_method("eth_getUncleCountByBlockNumber", move |params, ethereum_rpc| {
-        let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            let block: BlockNumber = params.parse()?;
-            ethereum_rpc.get_uncle_count_by_block_number(block).await
-        }
-    })?;
+    module.register_async_method(
+        "eth_getUncleCountByBlockNumber",
+        move |params, ethereum_rpc| {
+            let ethereum_rpc = ethereum_rpc.clone();
+            async move {
+                let block: BlockNumber = params.parse()?;
+                ethereum_rpc.get_uncle_count_by_block_number(block).await
+            }
+        },
+    )?;
 
-    module.register_async_method("eth_getUncleByBlockHashAndIndex", move |params, ethereum_rpc| {
-        let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            let (hash, index): (Hash, String) = params.parse()?;
-            ethereum_rpc.get_uncle_by_block_hash_and_index(hash, index).await
-        }
-    })?;
+    module.register_async_method(
+        "eth_getUncleByBlockHashAndIndex",
+        move |params, ethereum_rpc| {
+            let ethereum_rpc = ethereum_rpc.clone();
+            async move {
+                let (hash, index): (Hash, String) = params.parse()?;
+                ethereum_rpc
+                    .get_uncle_by_block_hash_and_index(hash, index)
+                    .await
+            }
+        },
+    )?;
 
-    module.register_async_method("eth_getUncleByBlockNumberAndIndex", move |params, ethereum_rpc| {
-        let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            let (block, index): (BlockNumber, String) = params.parse()?;
-            ethereum_rpc.get_uncle_by_block_number_and_index(block, index).await
-        }
-    })?;
+    module.register_async_method(
+        "eth_getUncleByBlockNumberAndIndex",
+        move |params, ethereum_rpc| {
+            let ethereum_rpc = ethereum_rpc.clone();
+            async move {
+                let (block, index): (BlockNumber, String) = params.parse()?;
+                ethereum_rpc
+                    .get_uncle_by_block_number_and_index(block, index)
+                    .await
+            }
+        },
+    )?;
 
     module.register_async_method("eth_getCompilers", move |_params, ethereum_rpc| {
         let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            ethereum_rpc.get_compilers().await
-        }
+        async move { ethereum_rpc.get_compilers().await }
     })?;
 
     module.register_async_method("eth_hashrate", move |_params, ethereum_rpc| {
         let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            ethereum_rpc.hashrate().await
-        }
+        async move { ethereum_rpc.hashrate().await }
     })?;
 
     module.register_async_method("eth_mining", move |_params, ethereum_rpc| {
         let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            ethereum_rpc.mining().await
-        }
+        async move { ethereum_rpc.mining().await }
     })?;
 
     module.register_async_method("eth_syncing", move |_params, ethereum_rpc| {
         let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            ethereum_rpc.syncing().await
-        }
+        async move { ethereum_rpc.syncing().await }
     })?;
 
-    module.register_async_method("eth_getBlockTransactionCountByHash", move |params, ethereum_rpc| {
-        let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            let hash: Hash = params.parse()?;
-            ethereum_rpc.get_block_transaction_count_by_hash(hash).await
-        }
-    })?;
+    module.register_async_method(
+        "eth_getBlockTransactionCountByHash",
+        move |params, ethereum_rpc| {
+            let ethereum_rpc = ethereum_rpc.clone();
+            async move {
+                let hash: Hash = params.parse()?;
+                ethereum_rpc.get_block_transaction_count_by_hash(hash).await
+            }
+        },
+    )?;
 
-    module.register_async_method("eth_getBlockTransactionCountByNumber", move |params, ethereum_rpc| {
-        let ethereum_rpc = ethereum_rpc.clone();
-        async move {
-            let block: BlockNumber = params.parse()?;
-            ethereum_rpc.get_block_transaction_count_by_number(block).await
-        }
-    })?;
+    module.register_async_method(
+        "eth_getBlockTransactionCountByNumber",
+        move |params, ethereum_rpc| {
+            let ethereum_rpc = ethereum_rpc.clone();
+            async move {
+                let block: BlockNumber = params.parse()?;
+                ethereum_rpc
+                    .get_block_transaction_count_by_number(block)
+                    .await
+            }
+        },
+    )?;
 
     module.register_async_method("eth_feeHistory", move |params, ethereum_rpc| {
         let ethereum_rpc = ethereum_rpc.clone();
         async move {
-            let (block_count, newest_block, reward_percentiles): (String, BlockNumber, Option<Vec<f64>>) = params.parse()?;
-            ethereum_rpc.fee_history(block_count, newest_block, reward_percentiles).await
+            let (block_count, newest_block, reward_percentiles): (
+                String,
+                BlockNumber,
+                Option<Vec<f64>>,
+            ) = params.parse()?;
+            ethereum_rpc
+                .fee_history(block_count, newest_block, reward_percentiles)
+                .await
         }
     })?;
 
@@ -1281,7 +1448,10 @@ mod tests {
         let db = Arc::new(SledDB::new(temp_dir.path().to_str().unwrap()).unwrap());
         let blockchain = norn_core::blockchain::Blockchain::new_with_fixed_genesis(db).await;
         let state_manager = Arc::new(AccountStateManager::default());
-        let evm_executor = Arc::new(EVMExecutor::new(state_manager.clone(), EVMConfig::default()));
+        let evm_executor = Arc::new(EVMExecutor::new(
+            state_manager.clone(),
+            EVMConfig::default(),
+        ));
         let tx_pool = Arc::new(norn_core::TxPool::new());
 
         let rpc = EthereumRpcImpl::new(blockchain, state_manager, evm_executor, tx_pool, 31337);
@@ -1299,7 +1469,10 @@ mod tests {
         let db = Arc::new(SledDB::new(temp_dir.path().to_str().unwrap()).unwrap());
         let blockchain = norn_core::blockchain::Blockchain::new_with_fixed_genesis(db).await;
         let state_manager = Arc::new(AccountStateManager::default());
-        let evm_executor = Arc::new(EVMExecutor::new(state_manager.clone(), EVMConfig::default()));
+        let evm_executor = Arc::new(EVMExecutor::new(
+            state_manager.clone(),
+            EVMConfig::default(),
+        ));
         let tx_pool = Arc::new(norn_core::TxPool::new());
 
         let rpc = EthereumRpcImpl::new(blockchain, state_manager, evm_executor, tx_pool, 31337);

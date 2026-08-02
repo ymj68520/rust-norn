@@ -1,13 +1,13 @@
 //! Tendermint BFT Vote Aggregation & Quorum Certificate Pool
-//! 
+//!
 //! Aggregates Prevote and Precommit votes, computes 2/3 voting power thresholds,
 //! detects equivocation (double-voting), and constructs CommitCertificates.
 
+use k256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use norn_common::consensus_types::{CommitCertificate, SignedVote, StakeSnapshot, VoteStep};
 use norn_common::types::{BlockId, ChainId, ProtocolVersion, StakeSnapshotHash, ValidatorId};
 use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, warn};
-use k256::ecdsa::{VerifyingKey, Signature, signature::Verifier};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VotePoolKey {
@@ -52,7 +52,10 @@ impl VotePool {
     /// Add and verify a vote against the stake snapshot
     pub fn add_vote(&mut self, vote: SignedVote, snapshot: &StakeSnapshot) -> AddVoteResult {
         if vote.stake_snapshot_hash != snapshot.snapshot_hash {
-            warn!("Vote snapshot hash mismatch for validator {:?}", vote.validator);
+            warn!(
+                "Vote snapshot hash mismatch for validator {:?}",
+                vote.validator
+            );
             return AddVoteResult::SnapshotMismatch;
         }
 
@@ -63,12 +66,19 @@ impl VotePool {
 
         // Strict fail-closed secp256k1 ECDSA verification over canonical bytes
         if record.consensus_public_key.0 == [0u8; 33] || vote.signature == [0u8; 64] {
-            warn!("Rejected vote with zero public key or zero signature for validator {:?}", vote.validator);
+            warn!(
+                "Rejected vote with zero public key or zero signature for validator {:?}",
+                vote.validator
+            );
             return AddVoteResult::InvalidSignature;
         }
 
-        let Ok(verifying_key) = VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0) else {
-            warn!("Malformed SEC1 public key for validator {:?}", vote.validator);
+        let Ok(verifying_key) = VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0)
+        else {
+            warn!(
+                "Malformed SEC1 public key for validator {:?}",
+                vote.validator
+            );
             return AddVoteResult::InvalidSignature;
         };
 
@@ -79,7 +89,10 @@ impl VotePool {
 
         // Reject non-canonical high-S signatures
         if sig.normalize_s().is_some() {
-            warn!("Non-canonical high-S signature for validator {:?}", vote.validator);
+            warn!(
+                "Non-canonical high-S signature for validator {:?}",
+                vote.validator
+            );
             return AddVoteResult::InvalidSignature;
         }
 
@@ -104,9 +117,15 @@ impl VotePool {
             if existing.block_id == vote.block_id {
                 return AddVoteResult::DuplicateVote;
             } else {
-                warn!("Equivocation detected for validator {:?} at height {} round {:?}", vote.validator, vote.height, vote.round);
+                warn!(
+                    "Equivocation detected for validator {:?} at height {} round {:?}",
+                    vote.validator, vote.height, vote.round
+                );
                 let eq_pair = (existing.clone(), vote.clone());
-                self.equivocation_records.entry(vote.validator).or_default().push(eq_pair);
+                self.equivocation_records
+                    .entry(vote.validator)
+                    .or_default()
+                    .push(eq_pair);
                 return AddVoteResult::EquivocationDetected {
                     validator: vote.validator,
                     existing_vote: existing.clone(),
@@ -153,10 +172,11 @@ impl VotePool {
         for (validator_id, vote) in step_votes {
             if vote.block_id == block_id {
                 if let Some(record) = snapshot.validators.get(validator_id) {
-                    accumulated_power = match accumulated_power.checked_add(record.voting_power as u128) {
-                        Some(val) => val,
-                        None => return None,
-                    };
+                    accumulated_power =
+                        match accumulated_power.checked_add(record.voting_power as u128) {
+                            Some(val) => val,
+                            None => return None,
+                        };
                     matching_votes.push(vote.clone());
                 }
             }
@@ -190,7 +210,16 @@ impl VotePool {
         block_id: BlockId,
         snapshot: &StakeSnapshot,
     ) -> Option<CommitCertificate> {
-        let precommits = self.check_quorum(protocol_version.clone(), chain_id.clone(), epoch, height, round, VoteStep::Precommit, Some(block_id), snapshot)?;
+        let precommits = self.check_quorum(
+            protocol_version.clone(),
+            chain_id.clone(),
+            epoch,
+            height,
+            round,
+            VoteStep::Precommit,
+            Some(block_id),
+            snapshot,
+        )?;
 
         Some(CommitCertificate {
             protocol_version,
@@ -204,7 +233,10 @@ impl VotePool {
         })
     }
 
-    pub fn get_equivocations(&self, validator: &ValidatorId) -> Option<&Vec<(SignedVote, SignedVote)>> {
+    pub fn get_equivocations(
+        &self,
+        validator: &ValidatorId,
+    ) -> Option<&Vec<(SignedVote, SignedVote)>> {
         self.equivocation_records.get(validator)
     }
 
@@ -222,8 +254,8 @@ impl Default for VotePool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k256::ecdsa::SigningKey;
     use k256::ecdsa::signature::Signer;
+    use k256::ecdsa::SigningKey;
     use rand::thread_rng;
 
     #[test]
@@ -237,28 +269,52 @@ mod tests {
         let key2 = SigningKey::random(&mut thread_rng());
         let key3 = SigningKey::random(&mut thread_rng());
 
-        let pk1_bytes: [u8; 33] = key1.verifying_key().to_sec1_bytes().as_ref().try_into().unwrap();
-        let pk2_bytes: [u8; 33] = key2.verifying_key().to_sec1_bytes().as_ref().try_into().unwrap();
-        let pk3_bytes: [u8; 33] = key3.verifying_key().to_sec1_bytes().as_ref().try_into().unwrap();
+        let pk1_bytes: [u8; 33] = key1
+            .verifying_key()
+            .to_sec1_bytes()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let pk2_bytes: [u8; 33] = key2
+            .verifying_key()
+            .to_sec1_bytes()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let pk3_bytes: [u8; 33] = key3
+            .verifying_key()
+            .to_sec1_bytes()
+            .as_ref()
+            .try_into()
+            .unwrap();
 
-        snapshot.validators.insert(val1, norn_common::consensus_types::ValidatorRecord {
-            validator_id: val1,
-            consensus_public_key: norn_common::types::ConsensusPublicKey(pk1_bytes),
-            vrf_public_key: norn_common::types::VrfPublicKey::default(),
-            voting_power: 10,
-        });
-        snapshot.validators.insert(val2, norn_common::consensus_types::ValidatorRecord {
-            validator_id: val2,
-            consensus_public_key: norn_common::types::ConsensusPublicKey(pk2_bytes),
-            vrf_public_key: norn_common::types::VrfPublicKey::default(),
-            voting_power: 10,
-        });
-        snapshot.validators.insert(val3, norn_common::consensus_types::ValidatorRecord {
-            validator_id: val3,
-            consensus_public_key: norn_common::types::ConsensusPublicKey(pk3_bytes),
-            vrf_public_key: norn_common::types::VrfPublicKey::default(),
-            voting_power: 10,
-        });
+        snapshot.validators.insert(
+            val1,
+            norn_common::consensus_types::ValidatorRecord {
+                validator_id: val1,
+                consensus_public_key: norn_common::types::ConsensusPublicKey(pk1_bytes),
+                vrf_public_key: norn_common::types::VrfPublicKey::default(),
+                voting_power: 10,
+            },
+        );
+        snapshot.validators.insert(
+            val2,
+            norn_common::consensus_types::ValidatorRecord {
+                validator_id: val2,
+                consensus_public_key: norn_common::types::ConsensusPublicKey(pk2_bytes),
+                vrf_public_key: norn_common::types::VrfPublicKey::default(),
+                voting_power: 10,
+            },
+        );
+        snapshot.validators.insert(
+            val3,
+            norn_common::consensus_types::ValidatorRecord {
+                validator_id: val3,
+                consensus_public_key: norn_common::types::ConsensusPublicKey(pk3_bytes),
+                vrf_public_key: norn_common::types::VrfPublicKey::default(),
+                voting_power: 10,
+            },
+        );
 
         snapshot.snapshot_hash = snapshot.compute_hash();
 
@@ -293,25 +349,29 @@ mod tests {
         assert_eq!(pool.add_vote(v1, &snapshot), AddVoteResult::Added);
         assert_eq!(pool.add_vote(v2, &snapshot), AddVoteResult::Added);
 
-        assert!(pool.create_commit_certificate(
-            norn_common::types::ProtocolVersion(2),
-            norn_common::types::ChainId::default(),
-            1,
-            1,
-            0,
-            bid,
-            &snapshot,
-        ).is_none());
+        assert!(pool
+            .create_commit_certificate(
+                norn_common::types::ProtocolVersion(2),
+                norn_common::types::ChainId::default(),
+                1,
+                1,
+                0,
+                bid,
+                &snapshot,
+            )
+            .is_none());
 
         assert_eq!(pool.add_vote(v3, &snapshot), AddVoteResult::Added);
-        assert!(pool.create_commit_certificate(
-            norn_common::types::ProtocolVersion(2),
-            norn_common::types::ChainId::default(),
-            1,
-            1,
-            0,
-            bid,
-            &snapshot,
-        ).is_some());
+        assert!(pool
+            .create_commit_certificate(
+                norn_common::types::ProtocolVersion(2),
+                norn_common::types::ChainId::default(),
+                1,
+                1,
+                0,
+                bid,
+                &snapshot,
+            )
+            .is_some());
     }
 }

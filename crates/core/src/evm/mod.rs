@@ -4,55 +4,60 @@
 //! Ethereum smart contracts and interact with the Ethereum ecosystem.
 
 // Module exports
-mod error;
-mod runtime; // Fixed with SyncStateManager bridging layer
-mod executor;
-mod code_storage;
-mod logging;
-mod receipt;
-mod precompiles;
-mod eip1559;
-mod access_list;
-mod gas;
-mod blockhash;
 mod abi;
+mod access_list;
 mod benchmarks;
+mod blockhash;
+mod code_storage;
+mod eip1559;
+mod error;
+mod executor;
+mod gas;
+mod logging;
+mod precompiles;
 mod real_contracts;
+mod receipt;
+mod runtime; // Fixed with SyncStateManager bridging layer
 mod solidity; // Solidity compiler integration and contract deployment
 
-pub use error::{EVMError, EVMResult};
-pub use runtime::NornDatabaseAdapter; // Fixed with SyncStateManager bridging layer
-pub use executor::{EVMExecutor, EVMExecutionResult, ExecutionLog};
-pub use code_storage::CodeStorage;
-pub use logging::{EventLog, LogManager};
-pub use receipt::{Receipt, ReceiptDB, ReceiptLog, Bloom};
-pub use precompiles::{
-    is_precompile, execute as execute_precompile, PrecompileResult,
-    ECRECOVER_ADDRESS, SHA256_ADDRESS, RIPEMD160_ADDRESS,
-    IDENTITY_ADDRESS, MODEXP_ADDRESS, ECADD_ADDRESS,
-    ECMUL_ADDRESS, ECPAIRING_ADDRESS, BLAKE2F_ADDRESS,
-};
-pub use eip1559::{EIP1559FeeCalculator, EIP1559Config};
+pub use abi::{ABIItem, ABIParam, ABIParamType, ABIType, ABIValue, HumanReadableABI, ABI};
 pub use access_list::{
-    AccessListTracker, EIP2930Utils, AccessType,
-    COLD_ACCOUNT_ACCESS_COST, COLD_SLOAD_COST,
+    AccessListTracker, AccessType, EIP2930Utils, ACCESS_LIST_ADDRESS_COST,
+    ACCESS_LIST_STORAGE_KEY_COST, COLD_ACCOUNT_ACCESS_COST, COLD_SLOAD_COST,
     WARM_ACCOUNT_ACCESS_COST, WARM_SLOAD_COST,
-    ACCESS_LIST_ADDRESS_COST, ACCESS_LIST_STORAGE_KEY_COST,
 };
-pub use gas::{GasCalculator, costs as gas_costs};
+pub use benchmarks::{BenchmarkResult, BenchmarkSuite};
 pub use blockhash::{BlockHistory, MAX_BLOCK_HASH_HISTORY};
-pub use abi::{
-    ABI, ABIParam, ABIValue, ABIType, ABIItem, ABIParamType,
-    HumanReadableABI,
-};
-pub use benchmarks::{BenchmarkSuite, BenchmarkResult};
-pub use solidity::{
-    SolidityCompiler, SolidityCompilerExt, SolcConfig, OptimizationSettings, EvmVersion,
-    CompiledContract, NornContractArtifact, CompileResult,
-    ContractDeployer, ContractBindings, CallResult,
+pub use code_storage::CodeStorage;
+pub use eip1559::{EIP1559Config, EIP1559FeeCalculator};
+pub use error::{EVMError, EVMResult};
+pub use executor::{EVMExecutionResult, EVMExecutor, ExecutionLog};
+pub use gas::{costs as gas_costs, GasCalculator};
+pub use logging::{EventLog, LogManager};
+pub use precompiles::{
+    execute as execute_precompile, is_precompile, PrecompileResult, BLAKE2F_ADDRESS, ECADD_ADDRESS,
+    ECMUL_ADDRESS, ECPAIRING_ADDRESS, ECRECOVER_ADDRESS, IDENTITY_ADDRESS, MODEXP_ADDRESS,
+    RIPEMD160_ADDRESS, SHA256_ADDRESS,
 };
 #[cfg(feature = "real_contracts_test")]
 pub use real_contracts::ContractTester;
+pub use receipt::{Bloom, Receipt, ReceiptDB, ReceiptLog};
+pub use runtime::NornDatabaseAdapter; // Fixed with SyncStateManager bridging layer
+pub use solidity::{
+    CallResult, CompileResult, CompiledContract, ContractBindings, ContractDeployer, EvmVersion,
+    NornContractArtifact, OptimizationSettings, SolcConfig, SolidityCompiler, SolidityCompilerExt,
+};
+
+/// A code-address mutation produced by revm. It is carried separately from
+/// account/storage writes because code storage has its own content-addressed
+/// index and must participate in the same deterministic commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EVMCodeChange {
+    pub address: norn_common::types::Address,
+    pub code_hash: norn_common::types::Hash,
+    pub code: Vec<u8>,
+    pub deleted: bool,
+}
 
 // Future modules (to be implemented):
 // mod precompiles;  // Precompiled contracts
@@ -109,6 +114,10 @@ pub struct EVMContext {
 
     /// Transaction gas price
     pub tx_gas_price: u64,
+
+    /// Optional transaction nonce. V2 execution binds this to the signed
+    /// transaction; legacy RPC/executor calls leave it unset.
+    pub tx_nonce: Option<u64>,
 }
 
 impl Default for EVMContext {
@@ -119,6 +128,7 @@ impl Default for EVMContext {
             block_coinbase: norn_common::types::Address::default(),
             block_gas_limit: 30_000_000,
             tx_gas_price: 1_000_000_000, // 1 Gwei
+            tx_nonce: None,
         }
     }
 }

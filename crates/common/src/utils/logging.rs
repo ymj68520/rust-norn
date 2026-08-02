@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tracing_subscriber::{
-    fmt,
-    EnvFilter,
-};
+use tracing_subscriber::{fmt, EnvFilter};
 
 /// Logging configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,14 +54,30 @@ impl Default for LoggingConfig {
 }
 
 // Default values
-fn default_log_level() -> String { "info".to_string() }
-fn default_file_logging() -> bool { true }
-fn default_log_dir() -> PathBuf { PathBuf::from("logs") }
-fn default_log_file() -> String { "norn.log".to_string() }
-fn default_console_logging() -> bool { true }
-fn default_log_format() -> String { "pretty".to_string() }
-fn default_include_timestamps() -> bool { true }
-fn default_include_target() -> bool { true }
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_file_logging() -> bool {
+    true
+}
+fn default_log_dir() -> PathBuf {
+    PathBuf::from("logs")
+}
+fn default_log_file() -> String {
+    "norn.log".to_string()
+}
+fn default_console_logging() -> bool {
+    true
+}
+fn default_log_format() -> String {
+    "pretty".to_string()
+}
+fn default_include_timestamps() -> bool {
+    true
+}
+fn default_include_target() -> bool {
+    true
+}
 
 /// Log format types
 #[derive(Debug, Clone, PartialEq)]
@@ -176,7 +189,7 @@ mod tests {
         let temp_dir = TempDir::new()?;
         let config = LoggingConfig {
             level: "debug".to_string(),
-            file_logging: false, // Disable file logging for test
+            file_logging: false,    // Disable file logging for test
             console_logging: false, // Disable console logging for test
             format: "json".to_string(),
             ..Default::default()

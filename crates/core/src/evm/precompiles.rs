@@ -5,23 +5,41 @@
 
 use crate::evm::EVMError;
 use norn_common::types::Address;
-use sha2::{Sha256, Digest as Sha2Digest};
 use num_bigint::BigUint;
 use num_traits::Zero;
+use sha2::{Digest as Sha2Digest, Sha256};
 
 // Use revm's precompile module for alt_bn128 operations
 use revm_precompile::Precompile;
 
 /// Precompile contract addresses
-pub const ECRECOVER_ADDRESS: Address = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
-pub const SHA256_ADDRESS: Address = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
-pub const RIPEMD160_ADDRESS: Address = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03]);
-pub const IDENTITY_ADDRESS: Address = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04]);
-pub const MODEXP_ADDRESS: Address = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05]);
-pub const ECADD_ADDRESS: Address = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x06]);
-pub const ECMUL_ADDRESS: Address = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x07]);
-pub const ECPAIRING_ADDRESS: Address = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08]);
-pub const BLAKE2F_ADDRESS: Address = Address([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09]);
+pub const ECRECOVER_ADDRESS: Address = Address([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+]);
+pub const SHA256_ADDRESS: Address = Address([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+]);
+pub const RIPEMD160_ADDRESS: Address = Address([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x03,
+]);
+pub const IDENTITY_ADDRESS: Address = Address([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x04,
+]);
+pub const MODEXP_ADDRESS: Address = Address([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x05,
+]);
+pub const ECADD_ADDRESS: Address = Address([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x06,
+]);
+pub const ECMUL_ADDRESS: Address = Address([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x07,
+]);
+pub const ECPAIRING_ADDRESS: Address = Address([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x08,
+]);
+pub const BLAKE2F_ADDRESS: Address = Address([
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09,
+]);
 
 /// Result of precompile execution
 #[derive(Debug, Clone)]
@@ -103,9 +121,7 @@ fn ecrecover(input: &[u8], gas_limit: u64) -> Result<PrecompileResult, EVMError>
     let s_bytes = &input[96..128];
 
     // Parse v (Ethereum uses 27 or 28, need to validate)
-    let v_ethereum = u64::from_be_bytes(
-        v_bytes[24..32].try_into().unwrap_or([0u8; 8])
-    );
+    let v_ethereum = u64::from_be_bytes(v_bytes[24..32].try_into().unwrap_or([0u8; 8]));
 
     // Validate v is 27 or 28
     if v_ethereum != 27 && v_ethereum != 28 {
@@ -178,10 +194,7 @@ fn ripemd160_hash(input: &[u8], gas_limit: u64) -> Result<PrecompileResult, EVME
     let mut output = vec![0u8; 32];
     output[(32 - hash.len())..].copy_from_slice(&hash);
 
-    Ok(PrecompileResult {
-        output,
-        gas_used,
-    })
+    Ok(PrecompileResult { output, gas_used })
 }
 
 /// Identity function (0x04)
@@ -227,7 +240,9 @@ fn modexp(input: &[u8], gas_limit: u64) -> Result<PrecompileResult, EVMError> {
 
     let expected_len = 96 + base_len + exp_len + mod_len;
     if input.len() < expected_len {
-        return Err(EVMError::Execution("modexp: Input length mismatch".to_string()));
+        return Err(EVMError::Execution(
+            "modexp: Input length mismatch".to_string(),
+        ));
     }
 
     // Extract data
@@ -268,10 +283,7 @@ fn modexp(input: &[u8], gas_limit: u64) -> Result<PrecompileResult, EVMError> {
         output.copy_from_slice(&result_bytes[result_bytes.len() - mod_len..]);
     }
 
-    Ok(PrecompileResult {
-        output,
-        gas_used,
-    })
+    Ok(PrecompileResult { output, gas_used })
 }
 
 /// Read a u64 from a U256 (32 bytes, big-endian)
@@ -398,7 +410,7 @@ fn ecpairing(input: &[u8], gas_limit: u64) -> Result<PrecompileResult, EVMError>
     // Each pairing is 192 bytes
     if input.len() % 192 != 0 {
         return Err(EVMError::Execution(
-            "ecpairing: Invalid input length".to_string()
+            "ecpairing: Invalid input length".to_string(),
         ));
     }
 
@@ -443,9 +455,7 @@ fn blake2f(input: &[u8], gas_limit: u64) -> Result<PrecompileResult, EVMError> {
     }
 
     // Round count (first 4 bytes, little-endian)
-    let rounds = u32::from_le_bytes([
-        input[0], input[1], input[2], input[3]
-    ]);
+    let rounds = u32::from_le_bytes([input[0], input[1], input[2], input[3]]);
     let gas_used = GAS_COST_BASE + rounds as u64;
 
     if gas_limit < gas_used {
@@ -480,10 +490,7 @@ fn blake2f(input: &[u8], gas_limit: u64) -> Result<PrecompileResult, EVMError> {
         output[i * 8..(i + 1) * 8].copy_from_slice(&result[i].to_le_bytes());
     }
 
-    Ok(PrecompileResult {
-        output,
-        gas_used,
-    })
+    Ok(PrecompileResult { output, gas_used })
 }
 
 /// BLAKE2b compression function implementation
@@ -601,7 +608,9 @@ mod tests {
 
         assert_eq!(result.output.len(), 32);
         // Verify against known SHA-256 hash
-        let expected = hex::decode("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9").unwrap();
+        let expected =
+            hex::decode("b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9")
+                .unwrap();
         assert_eq!(result.output, expected);
     }
 

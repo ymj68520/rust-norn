@@ -5,11 +5,11 @@
 
 use crate::evm::executor::EVMExecutor;
 use crate::evm::EVMConfig;
-use crate::state::account::{AccountStateManager, AccountStateConfig, AccountState, AccountType};
+use crate::state::account::{AccountState, AccountStateConfig, AccountStateManager, AccountType};
 use norn_common::types::{Address, Hash};
+use num_bigint::BigUint;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use num_bigint::BigUint;
 
 /// Performance benchmark result
 #[derive(Debug, Clone)]
@@ -95,14 +95,15 @@ impl BenchmarkSuite {
         let sender = Address([1u8; 20]);
         let receiver = Address([2u8; 20]);
 
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async {
-                self.state_manager.update_balance(
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            self.state_manager
+                .update_balance(
                     &sender,
-                    BigUint::from(NUM_TRANSFERS) * BigUint::from(1_000_000_000_000_000_000u128)
-                ).await.unwrap();
-            });
+                    BigUint::from(NUM_TRANSFERS) * BigUint::from(1_000_000_000_000_000_000u128),
+                )
+                .await
+                .unwrap();
+        });
 
         let start = Instant::now();
         let mut total_gas = 0u64;
@@ -111,14 +112,16 @@ impl BenchmarkSuite {
 
         for i in 0..NUM_TRANSFERS {
             let result = rt.block_on(async {
-                self.executor.execute_with_revm(
-                    sender,
-                    Some(receiver),
-                    1_000_000_000_000_000_000u128, // 1 ETH
-                    Vec::new(),
-                    100_000,
-                    &Default::default(),
-                ).await
+                self.executor
+                    .execute_with_revm(
+                        sender,
+                        Some(receiver),
+                        1_000_000_000_000_000_000u128, // 1 ETH
+                        Vec::new(),
+                        100_000,
+                        &Default::default(),
+                    )
+                    .await
             });
 
             if let Ok(exec_result) = result {
@@ -153,28 +156,26 @@ impl BenchmarkSuite {
         let contract_code = vec![
             0x60, 0x00, // PUSH1 0
             0x60, 0x00, // PUSH1 0
-            0x54,       // SLOAD
+            0x54, // SLOAD
             0x60, 0x01, // PUSH1 1
-            0x01,       // ADD
+            0x01, // ADD
             0x60, 0x00, // PUSH1 0
-            0x55,       // SSTORE
+            0x55, // SSTORE
             0x60, 0x00, // PUSH1 0
-            0x52,       // MSTORE
+            0x52, // MSTORE
             0x60, 0x20, // PUSH1 32
             0x60, 0x00, // PUSH1 0
-            0xF3,       // RETURN
+            0xF3, // RETURN
         ];
 
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         let contract_address = rt.block_on(async {
-            let (addr, _) = self.executor.create_contract(
-                creator,
-                0,
-                contract_code,
-                0,
-                1_000_000,
-            ).await.unwrap();
+            let (addr, _) = self
+                .executor
+                .create_contract(creator, 0, contract_code, 0, 1_000_000)
+                .await
+                .unwrap();
             addr
         });
 
@@ -183,14 +184,16 @@ impl BenchmarkSuite {
 
         for _ in 0..NUM_CALLS {
             let result = rt.block_on(async {
-                self.executor.execute_with_revm(
-                    creator,
-                    Some(contract_address),
-                    0,
-                    Vec::new(),
-                    200_000,
-                    &Default::default(),
-                ).await
+                self.executor
+                    .execute_with_revm(
+                        creator,
+                        Some(contract_address),
+                        0,
+                        Vec::new(),
+                        200_000,
+                        &Default::default(),
+                    )
+                    .await
             });
 
             if let Ok(exec_result) = result {
@@ -229,28 +232,26 @@ impl BenchmarkSuite {
             contract_code.extend_from_slice(&[
                 0x60, 0x01, // PUSH1 1
                 0x60, 0x00, // PUSH1 0
-                0x55,       // SSTORE
+                0x55, // SSTORE
             ]);
         }
 
         contract_code.extend_from_slice(&[
             0x60, 0x00, // PUSH1 0
-            0x52,       // MSTORE
+            0x52, // MSTORE
             0x60, 0x20, // PUSH1 32
             0x60, 0x00, // PUSH1 0
-            0xF3,       // RETURN
+            0xF3, // RETURN
         ]);
 
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         let contract_address = rt.block_on(async {
-            let (addr, _) = self.executor.create_contract(
-                creator,
-                0,
-                contract_code,
-                0,
-                5_000_000,
-            ).await.unwrap();
+            let (addr, _) = self
+                .executor
+                .create_contract(creator, 0, contract_code, 0, 5_000_000)
+                .await
+                .unwrap();
             addr
         });
 
@@ -259,14 +260,16 @@ impl BenchmarkSuite {
 
         for _ in 0..NUM_OPS {
             let result = rt.block_on(async {
-                self.executor.execute_with_revm(
-                    creator,
-                    Some(contract_address),
-                    0,
-                    Vec::new(),
-                    1_000_000,
-                    &Default::default(),
-                ).await
+                self.executor
+                    .execute_with_revm(
+                        creator,
+                        Some(contract_address),
+                        0,
+                        Vec::new(),
+                        1_000_000,
+                        &Default::default(),
+                    )
+                    .await
             });
 
             if let Ok(exec_result) = result {
@@ -310,13 +313,11 @@ impl BenchmarkSuite {
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         let contract_address = rt.block_on(async {
-            let (addr, _) = self.executor.create_contract(
-                creator,
-                0,
-                erc20_code,
-                0,
-                10_000_000,
-            ).await.unwrap();
+            let (addr, _) = self
+                .executor
+                .create_contract(creator, 0, erc20_code, 0, 10_000_000)
+                .await
+                .unwrap();
             addr
         });
 
@@ -329,14 +330,16 @@ impl BenchmarkSuite {
 
         for _ in 0..NUM_CALLS {
             let result = rt.block_on(async {
-                self.executor.execute_with_revm(
-                    creator,
-                    Some(contract_address),
-                    0,
-                    call_data.clone(),
-                    500_000,
-                    &Default::default(),
-                ).await
+                self.executor
+                    .execute_with_revm(
+                        creator,
+                        Some(contract_address),
+                        0,
+                        call_data.clone(),
+                        500_000,
+                        &Default::default(),
+                    )
+                    .await
             });
 
             if let Ok(exec_result) = result {
@@ -376,10 +379,10 @@ impl BenchmarkSuite {
 
             let final_addr = addr.clone();
             rt.block_on(async {
-                self.state_manager.update_balance(
-                    &final_addr,
-                    BigUint::from(1_000_000_000_000_000_000u128)
-                ).await.unwrap();
+                self.state_manager
+                    .update_balance(&final_addr, BigUint::from(1_000_000_000_000_000_000u128))
+                    .await
+                    .unwrap();
             });
         }
 
@@ -392,14 +395,16 @@ impl BenchmarkSuite {
             let receiver = addresses[(i + 1) % BATCH_SIZE];
 
             let result = rt.block_on(async {
-                self.executor.execute_with_revm(
-                    sender,
-                    Some(receiver),
-                    1_000_000_000u128, // 1000 gwei
-                    Vec::new(),
-                    100_000,
-                    &Default::default(),
-                ).await
+                self.executor
+                    .execute_with_revm(
+                        sender,
+                        Some(receiver),
+                        1_000_000_000u128, // 1000 gwei
+                        Vec::new(),
+                        100_000,
+                        &Default::default(),
+                    )
+                    .await
             });
 
             if let Ok(exec_result) = result {
@@ -481,7 +486,10 @@ mod tests {
 
         // Verify reasonable throughput
         for result in &results {
-            assert!(result.ops_per_second > 0.0, "Should have positive throughput");
+            assert!(
+                result.ops_per_second > 0.0,
+                "Should have positive throughput"
+            );
             assert!(result.total_gas_used > 0, "Should consume gas");
         }
     }

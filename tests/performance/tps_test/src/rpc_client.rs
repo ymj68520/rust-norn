@@ -180,9 +180,6 @@ impl From<ProtoTransaction> for Transaction {
                 state: hex::decode(&proto.state).unwrap_or_default(),
                 data: hex::decode(&proto.data).unwrap_or_default(),
                 expire: proto.expire as i64,
-                height: proto.height as i64,
-                index: proto.index as i64,
-                block_hash,
                 timestamp: proto.timestamp as i64,
                 public,
                 signature: hex::decode(&proto.signature).unwrap_or_default(),
@@ -215,9 +212,9 @@ impl From<Transaction> for ProtoTransaction {
             timestamp: tx.body.timestamp as u64,
             public: hex::encode(tx.body.public.0),
             signature: hex::encode(&tx.body.signature),
-            height: tx.body.height as u64,
-            block_hash: hex::encode(tx.body.block_hash.0),
-            index: tx.body.index as u64,
+            height: 0,
+            block_hash: hex::encode(Hash::default().0),
+            index: 0,
         }
     }
 }

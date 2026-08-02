@@ -1,18 +1,19 @@
-use libp2p::{
-    gossipsub,
-    identity::Keypair,
-    kad::{store::MemoryStore, Behaviour as KadBehaviour, Config as KadConfig},
-    identify,
-    mdns,
-    PeerId,
-    StreamProtocol,
-};
-use std::time::Duration;
 use crate::behaviour::NornBehaviour;
 use crate::config::NetworkConfig;
+use libp2p::{
+    gossipsub, identify,
+    identity::Keypair,
+    kad::{store::MemoryStore, Behaviour as KadBehaviour, Config as KadConfig},
+    mdns, PeerId, StreamProtocol,
+};
 use std::hash::Hash;
+use std::time::Duration;
 
-pub fn build_behaviour(keypair: &Keypair, peer_id: &PeerId, config: &NetworkConfig) -> NornBehaviour {
+pub fn build_behaviour(
+    keypair: &Keypair,
+    peer_id: &PeerId,
+    config: &NetworkConfig,
+) -> NornBehaviour {
     // Gossipsub configuration
     let message_id_fn = |message: &gossipsub::Message| {
         let mut s = std::collections::hash_map::DefaultHasher::new();
@@ -31,7 +32,8 @@ pub fn build_behaviour(keypair: &Keypair, peer_id: &PeerId, config: &NetworkConf
     let gossipsub = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Signed(keypair.clone()),
         gossipsub_config,
-    ).expect("Correct configuration");
+    )
+    .expect("Correct configuration");
 
     // Kademlia configuration
     let store = MemoryStore::new(peer_id.clone());

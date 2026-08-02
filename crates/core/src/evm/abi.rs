@@ -7,7 +7,7 @@
 
 use crate::evm::{EVMError, EVMResult};
 use norn_common::types::Address;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// ABI encoding/decoder
@@ -51,10 +51,7 @@ impl ABI {
     ///
     /// # Returns
     /// Decoded parameters
-    pub fn decode_function_return(
-        data: &[u8],
-        types: &[ABIType],
-    ) -> EVMResult<Vec<ABIParam>> {
+    pub fn decode_function_return(data: &[u8], types: &[ABIType]) -> EVMResult<Vec<ABIParam>> {
         if data.is_empty() {
             return Ok(Vec::new());
         }
@@ -122,7 +119,8 @@ impl ABI {
         // Skip first topic (event signature)
         let mut indexed_params = Vec::new();
         for (i, ty) in indexed_types.iter().enumerate() {
-            let topic = topics.get(i + 1)
+            let topic = topics
+                .get(i + 1)
                 .ok_or_else(|| EVMError::Execution(format!("Missing topic at index {}", i)))?;
             indexed_params.push(Self::decode_topic(topic, ty)?);
         }
@@ -149,33 +147,15 @@ impl ABI {
     /// Encode a single parameter
     fn encode_param(param: &ABIParam) -> EVMResult<Vec<u8>> {
         match &param.value {
-            ABIValue::Uint(uint_value, size) => {
-                Self::encode_uint(*uint_value, *size)
-            }
-            ABIValue::Int(int_value, size) => {
-                Self::encode_int(*int_value, *size)
-            }
-            ABIValue::Address(address) => {
-                Ok(Self::encode_address(address))
-            }
-            ABIValue::Bool(b) => {
-                Ok(Self::encode_bool(*b))
-            }
-            ABIValue::Bytes(bytes) => {
-                Self::encode_bytes(bytes)
-            }
-            ABIValue::String(s) => {
-                Self::encode_string(s)
-            }
-            ABIValue::Array(params) => {
-                Self::encode_array(params)
-            }
-            ABIValue::FixedArray(params) => {
-                Self::encode_fixed_array(params)
-            }
-            ABIValue::Tuple(fields) => {
-                Self::encode_tuple(fields)
-            }
+            ABIValue::Uint(uint_value, size) => Self::encode_uint(*uint_value, *size),
+            ABIValue::Int(int_value, size) => Self::encode_int(*int_value, *size),
+            ABIValue::Address(address) => Ok(Self::encode_address(address)),
+            ABIValue::Bool(b) => Ok(Self::encode_bool(*b)),
+            ABIValue::Bytes(bytes) => Self::encode_bytes(bytes),
+            ABIValue::String(s) => Self::encode_string(s),
+            ABIValue::Array(params) => Self::encode_array(params),
+            ABIValue::FixedArray(params) => Self::encode_fixed_array(params),
+            ABIValue::Tuple(fields) => Self::encode_tuple(fields),
         }
     }
 
@@ -206,9 +186,7 @@ impl ABI {
                 let (s, new_offset) = Self::decode_string(data, offset)?;
                 Ok((ABIParam::new(ABIValue::String(s)), new_offset))
             }
-            _ => {
-                Err(EVMError::Execution(format!("Unsupported type: {:?}", ty)))
-            }
+            _ => Err(EVMError::Execution(format!("Unsupported type: {:?}", ty))),
         }
     }
 
@@ -268,15 +246,18 @@ impl ABI {
     fn decode_uint(data: &[u8], offset: usize, size: u16) -> EVMResult<u64> {
         let end = offset + 32;
         if end > data.len() {
-            return Err(EVMError::Execution("Insufficient data for uint".to_string()));
+            return Err(EVMError::Execution(
+                "Insufficient data for uint".to_string(),
+            ));
         }
 
         let bytes = (size / 8) as usize;
         let start = 32 - bytes.min(8);
         let slice = &data[offset + start..offset + 32];
         let value = u64::from_be_bytes(
-            slice[..8].try_into()
-                .map_err(|_| EVMError::Execution("Invalid uint encoding".to_string()))?
+            slice[..8]
+                .try_into()
+                .map_err(|_| EVMError::Execution("Invalid uint encoding".to_string()))?,
         );
         Ok(value)
     }
@@ -305,8 +286,9 @@ impl ABI {
 
         let slice = &data[offset..end];
         let value = i64::from_be_bytes(
-            slice[24..32].try_into()
-                .map_err(|_| EVMError::Execution("Invalid int encoding".to_string()))?
+            slice[24..32]
+                .try_into()
+                .map_err(|_| EVMError::Execution("Invalid int encoding".to_string()))?,
         );
         Ok(value)
     }
@@ -322,7 +304,9 @@ impl ABI {
     fn decode_address(data: &[u8], offset: usize) -> EVMResult<Address> {
         let end = offset + 32;
         if end > data.len() {
-            return Err(EVMError::Execution("Insufficient data for address".to_string()));
+            return Err(EVMError::Execution(
+                "Insufficient data for address".to_string(),
+            ));
         }
 
         let mut addr_bytes = [0u8; 20];
@@ -341,7 +325,9 @@ impl ABI {
     fn decode_bool(data: &[u8], offset: usize) -> EVMResult<bool> {
         let end = offset + 32;
         if end > data.len() {
-            return Err(EVMError::Execution("Insufficient data for bool".to_string()));
+            return Err(EVMError::Execution(
+                "Insufficient data for bool".to_string(),
+            ));
         }
 
         Ok(data[end - 1] != 0)
@@ -369,7 +355,9 @@ impl ABI {
         // Read bytes
         let end = start + len;
         if end > data.len() {
-            return Err(EVMError::Execution("Insufficient data for bytes".to_string()));
+            return Err(EVMError::Execution(
+                "Insufficient data for bytes".to_string(),
+            ));
         }
 
         let bytes = data[start..end].to_vec();
@@ -406,9 +394,15 @@ impl ABI {
     }
 
     /// Decode an array
-    fn decode_array(_data: &[u8], _offset: usize, _ty: &ABIType) -> EVMResult<(Vec<ABIParam>, usize)> {
+    fn decode_array(
+        _data: &[u8],
+        _offset: usize,
+        _ty: &ABIType,
+    ) -> EVMResult<(Vec<ABIParam>, usize)> {
         // TODO: Implement array decoding
-        Err(EVMError::Execution("Array decoding not yet implemented".to_string()))
+        Err(EVMError::Execution(
+            "Array decoding not yet implemented".to_string(),
+        ))
     }
 
     /// Encode a fixed-size array
@@ -449,7 +443,10 @@ impl ABI {
 
     /// Check if a parameter type is dynamic
     fn is_dynamic_type(param: &ABIParam) -> bool {
-        matches!(&param.value, ABIValue::Bytes(_) | ABIValue::String(_) | ABIValue::Array(_))
+        matches!(
+            &param.value,
+            ABIValue::Bytes(_) | ABIValue::String(_) | ABIValue::Array(_)
+        )
     }
 
     /// Compute Keccak256 hash
@@ -476,10 +473,7 @@ pub struct ABIParam {
 impl ABIParam {
     /// Create a new ABI parameter
     pub fn new(value: ABIValue) -> Self {
-        Self {
-            name: None,
-            value,
-        }
+        Self { name: None, value }
     }
 
     /// Create a named ABI parameter
@@ -605,7 +599,8 @@ impl HumanReadableABI {
     /// Parse a function declaration
     fn parse_function(s: &str) -> EVMResult<ABIItem> {
         // Remove "function " prefix
-        let s = s.strip_prefix("function ")
+        let s = s
+            .strip_prefix("function ")
             .ok_or_else(|| EVMError::Execution("Missing function prefix".to_string()))?;
 
         // Split at '('
@@ -621,14 +616,17 @@ impl HumanReadableABI {
         let inputs = if params_str.is_empty() {
             Vec::new()
         } else {
-            params_str.split(',')
+            params_str
+                .split(',')
                 .map(|p| Self::parse_param(p.trim()))
                 .collect::<EVMResult<Vec<_>>>()?
         };
 
         // Parse return type (if present)
         let outputs = if s.contains("returns") {
-            let returns_str = s.split("returns").nth(1)
+            let returns_str = s
+                .split("returns")
+                .nth(1)
                 .ok_or_else(|| EVMError::Execution("Invalid returns syntax".to_string()))?
                 .trim()
                 .trim_start_matches('(')
@@ -637,7 +635,8 @@ impl HumanReadableABI {
             if returns_str.is_empty() {
                 Vec::new()
             } else {
-                returns_str.split(',')
+                returns_str
+                    .split(',')
                     .map(|p| Self::parse_param(p.trim()))
                     .collect::<EVMResult<Vec<_>>>()?
             }
@@ -654,7 +653,8 @@ impl HumanReadableABI {
 
     /// Parse an event declaration
     fn parse_event(s: &str) -> EVMResult<ABIItem> {
-        let s = s.strip_prefix("event ")
+        let s = s
+            .strip_prefix("event ")
             .ok_or_else(|| EVMError::Execution("Missing event prefix".to_string()))?;
 
         let parts: Vec<&str> = s.split('(').collect();
@@ -668,30 +668,28 @@ impl HumanReadableABI {
         let inputs = if params_str.is_empty() {
             Vec::new()
         } else {
-            params_str.split(',')
+            params_str
+                .split(',')
                 .map(|p| Self::parse_event_param(p.trim()))
                 .collect::<EVMResult<Vec<_>>>()?
         };
 
-        Ok(ABIItem::Event {
-            name,
-            inputs,
-        })
+        Ok(ABIItem::Event { name, inputs })
     }
 
     /// Parse a constructor declaration
     fn parse_constructor(s: &str) -> EVMResult<ABIItem> {
-        let s = s.strip_prefix("constructor")
+        let s = s
+            .strip_prefix("constructor")
             .ok_or_else(|| EVMError::Execution("Missing constructor prefix".to_string()))?;
 
-        let params_str = s.trim()
-            .trim_start_matches('(')
-            .trim_end_matches(')');
+        let params_str = s.trim().trim_start_matches('(').trim_end_matches(')');
 
         let inputs = if params_str.is_empty() {
             Vec::new()
         } else {
-            params_str.split(',')
+            params_str
+                .split(',')
                 .map(|p| Self::parse_param(p.trim()))
                 .collect::<EVMResult<Vec<_>>>()?
         };
@@ -701,7 +699,8 @@ impl HumanReadableABI {
 
     /// Parse an error declaration
     fn parse_error(s: &str) -> EVMResult<ABIItem> {
-        let s = s.strip_prefix("error ")
+        let s = s
+            .strip_prefix("error ")
             .ok_or_else(|| EVMError::Execution("Missing error prefix".to_string()))?;
 
         let parts: Vec<&str> = s.split('(').collect();
@@ -715,15 +714,13 @@ impl HumanReadableABI {
         let inputs = if params_str.is_empty() {
             Vec::new()
         } else {
-            params_str.split(',')
+            params_str
+                .split(',')
                 .map(|p| Self::parse_param(p.trim()))
                 .collect::<EVMResult<Vec<_>>>()?
         };
 
-        Ok(ABIItem::Error {
-            name,
-            inputs,
-        })
+        Ok(ABIItem::Error { name, inputs })
     }
 
     /// Parse fallback/receive function
@@ -733,7 +730,9 @@ impl HumanReadableABI {
         } else if s.contains("receive") {
             Ok(ABIItem::Receive)
         } else {
-            Err(EVMError::Execution("Invalid fallback/receive syntax".to_string()))
+            Err(EVMError::Execution(
+                "Invalid fallback/receive syntax".to_string(),
+            ))
         }
     }
 
@@ -788,11 +787,7 @@ impl HumanReadableABI {
 
         let ty = Self::parse_type(ty_str)?;
 
-        Ok(ABIParamType {
-            name,
-            ty,
-            indexed,
-        })
+        Ok(ABIParamType { name, ty, indexed })
     }
 
     /// Parse a type string
@@ -804,7 +799,8 @@ impl HumanReadableABI {
             if s == "uint" {
                 return Ok(ABIType::Uint(256));
             }
-            let size: u16 = size_str.parse()
+            let size: u16 = size_str
+                .parse()
                 .map_err(|_| EVMError::Execution(format!("Invalid uint size: {}", s)))?;
             if size % 8 != 0 || size == 0 || size > 256 {
                 return Err(EVMError::Execution(format!("Invalid uint size: {}", size)));
@@ -817,7 +813,8 @@ impl HumanReadableABI {
             if s == "int" {
                 return Ok(ABIType::Int(256));
             }
-            let size: u16 = size_str.parse()
+            let size: u16 = size_str
+                .parse()
                 .map_err(|_| EVMError::Execution(format!("Invalid int size: {}", s)))?;
             if size % 8 != 0 || size == 0 || size > 256 {
                 return Err(EVMError::Execution(format!("Invalid int size: {}", size)));
@@ -841,7 +838,8 @@ impl HumanReadableABI {
         }
 
         if let Some(size_str) = s.strip_prefix("bytes") {
-            let size: u8 = size_str.parse()
+            let size: u8 = size_str
+                .parse()
                 .map_err(|_| EVMError::Execution(format!("Invalid bytes size: {}", s)))?;
             if size == 0 || size > 32 {
                 return Err(EVMError::Execution(format!("Invalid bytes size: {}", size)));
@@ -881,9 +879,7 @@ pub enum ABIItem {
     },
 
     /// Constructor
-    Constructor {
-        inputs: Vec<ABIParamType>,
-    },
+    Constructor { inputs: Vec<ABIParamType> },
 
     /// Error
     Error {
@@ -954,19 +950,32 @@ mod tests {
 
         let encoded = ABI::encode_function_call(
             "transfer(address,uint256)",
-            &[ABIParam::new(ABIValue::Address(to)), amount]
-        ).unwrap();
+            &[ABIParam::new(ABIValue::Address(to)), amount],
+        )
+        .unwrap();
 
         assert!(encoded.len() >= 4); // At least selector
     }
 
     #[test]
     fn test_parse_simple_type() {
-        assert_eq!(HumanReadableABI::parse_type("uint256").unwrap(), ABIType::Uint(256));
-        assert_eq!(HumanReadableABI::parse_type("address").unwrap(), ABIType::Address);
+        assert_eq!(
+            HumanReadableABI::parse_type("uint256").unwrap(),
+            ABIType::Uint(256)
+        );
+        assert_eq!(
+            HumanReadableABI::parse_type("address").unwrap(),
+            ABIType::Address
+        );
         assert_eq!(HumanReadableABI::parse_type("bool").unwrap(), ABIType::Bool);
-        assert_eq!(HumanReadableABI::parse_type("bytes").unwrap(), ABIType::Bytes);
-        assert_eq!(HumanReadableABI::parse_type("string").unwrap(), ABIType::String);
+        assert_eq!(
+            HumanReadableABI::parse_type("bytes").unwrap(),
+            ABIType::Bytes
+        );
+        assert_eq!(
+            HumanReadableABI::parse_type("string").unwrap(),
+            ABIType::String
+        );
     }
 
     #[test]
@@ -975,7 +984,11 @@ mod tests {
         let item = HumanReadableABI::parse_item(func).unwrap();
 
         match item {
-            ABIItem::Function { name, inputs, outputs } => {
+            ABIItem::Function {
+                name,
+                inputs,
+                outputs,
+            } => {
                 assert_eq!(name, "transfer");
                 assert_eq!(inputs.len(), 2);
                 assert_eq!(outputs.len(), 1);
@@ -1014,7 +1027,8 @@ mod tests {
                 ABIParam::new(ABIValue::Address(to)),
             ],
             &[value],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(topics.len(), 3); // signature + 2 indexed
         assert!(!data.is_empty());
@@ -1026,4 +1040,3 @@ mod tests {
         assert_eq!(hash.len(), 32);
     }
 }
-

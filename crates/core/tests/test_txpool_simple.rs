@@ -1,7 +1,7 @@
 //! Simple test to debug the hanging issue
 
+use norn_common::types::{Address, Hash, Transaction};
 use norn_core::txpool_enhanced::EnhancedTxPool;
-use norn_common::types::{Transaction, Address, Hash};
 use std::sync::Arc;
 
 #[tokio::test]

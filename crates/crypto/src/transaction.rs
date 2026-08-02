@@ -1,10 +1,13 @@
-use norn_common::types::{Transaction, TransactionBody, Address, Hash, PublicKey, TransactionType};
-use norn_common::types::PUBLIC_KEY_LENGTH;
-use crate::ecdsa::{KeyPair, verify};
-use sha2::{Sha256, Digest};
+use crate::ecdsa::{verify, KeyPair};
 use anyhow::Result;
-use thiserror::Error;
+use norn_common::types::{
+    Address, Hash, PublicKey, Transaction, TransactionBody, TransactionType, TransactionV2,
+    TransactionV2Error, PUBLIC_KEY_LENGTH,
+};
 use p256::ecdsa::VerifyingKey;
+use p256::ecdsa::{signature::Verifier, Signature};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum TxError {
@@ -16,6 +19,62 @@ pub enum TxError {
     InvalidNonce,
     #[error("Insufficient gas")]
     InsufficientGas,
+}
+
+/// Sign the protocol-v2 transaction preimage and derive its ID.
+///
+/// This function intentionally signs before calculating the ID. The ID is
+/// derived from the immutable transaction fields plus the final signature,
+/// never from a block hash or inclusion position.
+pub fn sign_transaction_v2(
+    keypair: &KeyPair,
+    tx: &mut TransactionV2,
+) -> Result<(), TransactionV2Error> {
+    let verifying_key = keypair.public_key();
+    let encoded = verifying_key.to_encoded_point(true);
+    if encoded.as_bytes().len() != PUBLIC_KEY_LENGTH {
+        return Err(TransactionV2Error::InvalidPublicKey);
+    }
+    tx.public_key = PublicKey(
+        encoded
+            .as_bytes()
+            .try_into()
+            .map_err(|_| TransactionV2Error::InvalidPublicKey)?,
+    );
+    let signature = Signature::from_slice(&keypair.sign(&tx.signing_bytes()?))
+        .map_err(|_| TransactionV2Error::InvalidSignature)?;
+    let normalized = signature.normalize_s().unwrap_or(signature);
+    tx.signature = normalized.to_bytes().into();
+    tx.transaction_id = tx.calculate_id()?;
+    Ok(())
+}
+
+/// Validate a signed protocol-v2 transaction, including its ID, key binding,
+/// and canonical low-S ECDSA signature.
+pub fn verify_transaction_v2(tx: &TransactionV2) -> Result<(), TxError> {
+    tx.validate().map_err(|_| TxError::InvalidFormat)?;
+    let verifying_key =
+        VerifyingKey::from_sec1_bytes(&tx.public_key.0).map_err(|_| TxError::InvalidFormat)?;
+    let derived_sender = public_key_to_address(&verifying_key);
+    if derived_sender != tx.sender {
+        return Err(TxError::VerificationFailed);
+    }
+    let signature =
+        Signature::from_slice(&tx.signature).map_err(|_| TxError::VerificationFailed)?;
+    if signature.normalize_s().is_some() {
+        return Err(TxError::VerificationFailed);
+    }
+    let valid = verifying_key
+        .verify(
+            &tx.signing_bytes().map_err(|_| TxError::InvalidFormat)?,
+            &signature,
+        )
+        .is_ok();
+    if valid {
+        Ok(())
+    } else {
+        Err(TxError::VerificationFailed)
+    }
 }
 
 pub struct TransactionSigner {
@@ -76,9 +135,6 @@ impl TransactionSigner {
             state: state.clone(),
             data: data.clone(),
             expire,
-            height: 0,
-            index: 0,
-            block_hash: Hash::default(),
             timestamp,
             public: PublicKey::default(),
             signature: Vec::new(),
@@ -151,7 +207,10 @@ pub fn verify_transaction(tx: &Transaction) -> Result<(), TxError> {
 fn hash_transaction_body(body: &TransactionBody) -> Hash {
     let mut hasher = Sha256::new();
 
-    // Include all fields except hash and signature
+    // Legacy adapter hash with protocol-v2 semantics: inclusion metadata is
+    // intentionally excluded. Height, index, and block hash are derived by
+    // the containing block and must never affect the transaction ID.
+    hasher.update(b"NORN_TRANSACTION_V2_ADAPTER");
     hasher.update(body.address.0);
     hasher.update(body.receiver.0);
     hasher.update(body.gas.to_le_bytes());
@@ -161,11 +220,33 @@ fn hash_transaction_body(body: &TransactionBody) -> Hash {
     hasher.update(&body.state);
     hasher.update(&body.data);
     hasher.update(body.expire.to_le_bytes());
-    hasher.update(body.height.to_le_bytes());
-    hasher.update(body.index.to_le_bytes());
-    hasher.update(body.block_hash.0);
     hasher.update(body.timestamp.to_le_bytes());
     hasher.update(body.public.0);
+    hasher.update([match body.tx_type {
+        TransactionType::Native => 0,
+        TransactionType::EVM => 1,
+    }]);
+    hasher.update(body.chain_id.unwrap_or_default().to_be_bytes());
+    hasher.update(body.value.as_deref().unwrap_or("0").as_bytes());
+    hasher.update(body.max_fee_per_gas.unwrap_or_default().to_be_bytes());
+    hasher.update(
+        body.max_priority_fee_per_gas
+            .unwrap_or_default()
+            .to_be_bytes(),
+    );
+    hasher.update(body.gas_price.unwrap_or_default().to_be_bytes());
+    if let Some(access_list) = &body.access_list {
+        hasher.update((access_list.len() as u64).to_be_bytes());
+        for item in access_list {
+            hasher.update(item.address.0);
+            hasher.update((item.storage_keys.len() as u64).to_be_bytes());
+            for key in &item.storage_keys {
+                hasher.update(key.0);
+            }
+        }
+    } else {
+        hasher.update(0u64.to_be_bytes());
+    }
 
     let result = hasher.finalize();
     let mut hash = Hash::default();
@@ -213,15 +294,17 @@ mod tests {
         let mut signer = TransactionSigner::new(keypair);
 
         let receiver = Address::default();
-        let tx = signer.create_transaction(
-            receiver,
-            b"test_event".to_vec(),
-            b"test_opt".to_vec(),
-            b"test_state".to_vec(),
-            b"test_data".to_vec(),
-            1000,
-            chrono::Utc::now().timestamp() + 3600,
-        ).unwrap();
+        let tx = signer
+            .create_transaction(
+                receiver,
+                b"test_event".to_vec(),
+                b"test_opt".to_vec(),
+                b"test_state".to_vec(),
+                b"test_data".to_vec(),
+                1000,
+                chrono::Utc::now().timestamp() + 3600,
+            )
+            .unwrap();
 
         assert!(verify_transaction(&tx).is_ok());
     }
@@ -232,19 +315,52 @@ mod tests {
         let mut signer = TransactionSigner::new(keypair);
 
         let receiver = Address::default();
-        let mut tx = signer.create_transaction(
-            receiver,
-            b"test_event".to_vec(),
-            b"test_opt".to_vec(),
-            b"test_state".to_vec(),
-            b"test_data".to_vec(),
-            1000,
-            chrono::Utc::now().timestamp() + 3600,
-        ).unwrap();
+        let mut tx = signer
+            .create_transaction(
+                receiver,
+                b"test_event".to_vec(),
+                b"test_opt".to_vec(),
+                b"test_state".to_vec(),
+                b"test_data".to_vec(),
+                1000,
+                chrono::Utc::now().timestamp() + 3600,
+            )
+            .unwrap();
 
         // Modify the signature to make it invalid
         tx.body.signature[0] ^= 0xFF;
 
         assert!(verify_transaction(&tx).is_err());
+    }
+
+    #[test]
+    fn test_transaction_v2_signs_and_verifies_without_inclusion_metadata() {
+        let keypair = KeyPair::random();
+        let mut tx = TransactionV2 {
+            protocol_version: norn_common::types::ProtocolVersion(2),
+            chain_id: norn_common::types::ChainId(Hash([1; 32])),
+            nonce: 0,
+            sender: public_key_to_address(&keypair.public_key()),
+            receiver: Some(Address([3; 20])),
+            value: 7,
+            gas_limit: 21_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 1,
+            data: vec![1, 2, 3],
+            event: vec![],
+            opt: vec![],
+            state: vec![],
+            expire: None,
+            timestamp: 10,
+            tx_type: norn_common::types::TransactionType::Native,
+            access_list: vec![],
+            public_key: PublicKey::default(),
+            signature: [0; 64],
+            transaction_id: norn_common::types::TransactionId::default(),
+        };
+
+        sign_transaction_v2(&keypair, &mut tx).unwrap();
+        verify_transaction_v2(&tx).unwrap();
+        assert_ne!(tx.id(), Hash::default());
     }
 }

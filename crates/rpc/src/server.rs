@@ -1,17 +1,16 @@
 use crate::proto::blockchain_service_server::BlockchainService;
 use crate::proto::{
-    GetBlockReq, GetBlockResp, GetTransactionReq, GetTransactionResp,
-    SendTransactionReq, SendTransactionResp, BlockNumberResp, Empty,
-    ReadContractAddressReq, ReadContractAddressResp,
-    SendTransactionWithDataReq, SendTransactionWithDataResp
+    BlockNumberResp, Empty, GetBlockReq, GetBlockResp, GetTransactionReq, GetTransactionResp,
+    ReadContractAddressReq, ReadContractAddressResp, SendTransactionReq, SendTransactionResp,
+    SendTransactionWithDataReq, SendTransactionWithDataResp,
 };
-use tonic::{Request, Response, Status};
-use std::sync::Arc;
+use hex;
+use norn_common::types::{Hash, Transaction};
 use norn_core::blockchain::Blockchain;
 use norn_core::txpool::TxPool;
-use norn_common::types::{Hash, Transaction};
-use hex;
-use tracing::{info, error, warn};
+use std::sync::Arc;
+use tonic::{Request, Response, Status};
+use tracing::{error, info, warn};
 
 pub struct BlockchainRpcImpl {
     chain: Arc<Blockchain>,
@@ -31,11 +30,12 @@ impl BlockchainService for BlockchainRpcImpl {
         request: Request<GetBlockReq>,
     ) -> Result<Response<GetBlockResp>, Status> {
         let req = request.into_inner();
-        let hash_bytes = hex::decode(&req.hash).map_err(|_| Status::invalid_argument("Invalid hash"))?;
-        
+        let hash_bytes =
+            hex::decode(&req.hash).map_err(|_| Status::invalid_argument("Invalid hash"))?;
+
         let mut h = Hash::default();
         if hash_bytes.len() != 32 {
-             return Err(Status::invalid_argument("Hash length must be 32"));
+            return Err(Status::invalid_argument("Hash length must be 32"));
         }
         h.0.copy_from_slice(&hash_bytes);
 
@@ -55,9 +55,9 @@ impl BlockchainService for BlockchainRpcImpl {
     ) -> Result<Response<GetBlockResp>, Status> {
         let req = request.into_inner();
         if let Some(block) = self.chain.get_block_by_height(req.number as i64).await {
-             Ok(Response::new(GetBlockResp {
+            Ok(Response::new(GetBlockResp {
                 timestamp: block.header.timestamp as u64,
-                body: Some(block.into()), 
+                body: Some(block.into()),
             }))
         } else {
             Err(Status::not_found("Block not found"))
@@ -69,11 +69,12 @@ impl BlockchainService for BlockchainRpcImpl {
         request: Request<GetTransactionReq>,
     ) -> Result<Response<GetTransactionResp>, Status> {
         let req = request.into_inner();
-        let hash_bytes = hex::decode(&req.hash).map_err(|_| Status::invalid_argument("Invalid hash"))?;
-        
+        let hash_bytes =
+            hex::decode(&req.hash).map_err(|_| Status::invalid_argument("Invalid hash"))?;
+
         let mut h = Hash::default();
         if hash_bytes.len() != 32 {
-             return Err(Status::invalid_argument("Hash length must be 32"));
+            return Err(Status::invalid_argument("Hash length must be 32"));
         }
         h.0.copy_from_slice(&hash_bytes);
 
@@ -91,7 +92,10 @@ impl BlockchainService for BlockchainRpcImpl {
         request: Request<SendTransactionReq>,
     ) -> Result<Response<SendTransactionResp>, Status> {
         let req = request.into_inner();
-        info!("Received SendTransaction request: type={} receiver={} key={}", req.r#type, req.receiver, req.key);
+        info!(
+            "Received SendTransaction request: type={} receiver={} key={}",
+            req.r#type, req.receiver, req.key
+        );
 
         let db_key = req.key.as_bytes().to_vec();
         let db_val = req.value.as_bytes().to_vec();
@@ -106,7 +110,7 @@ impl BlockchainService for BlockchainRpcImpl {
         let task = norn_core::data_processor::DataTask {
             command_type: req.r#type,
             hash: norn_common::types::Hash(tx_hash_bytes), // Use the dummy hash
-            height: 0, // Placeholder
+            height: 0,                                     // Placeholder
             address: sender_address,
             key: db_key,
             value: db_val,
@@ -117,7 +121,9 @@ impl BlockchainService for BlockchainRpcImpl {
 
         info!("Submitted DataTask for transaction: {}", tx_hash_str);
 
-        Ok(Response::new(SendTransactionResp { tx_hash: tx_hash_str }))
+        Ok(Response::new(SendTransactionResp {
+            tx_hash: tx_hash_str,
+        }))
     }
 
     async fn get_block_number(
@@ -134,7 +140,8 @@ impl BlockchainService for BlockchainRpcImpl {
         request: Request<GetTransactionReq>,
     ) -> Result<Response<GetTransactionResp>, Status> {
         let req = request.into_inner();
-        let hash_bytes = hex::decode(&req.hash).map_err(|_| Status::invalid_argument("Invalid hash"))?;
+        let hash_bytes =
+            hex::decode(&req.hash).map_err(|_| Status::invalid_argument("Invalid hash"))?;
 
         let mut h = Hash::default();
         if hash_bytes.len() != 32 {
@@ -166,7 +173,9 @@ impl BlockchainService for BlockchainRpcImpl {
         let req = request.into_inner();
 
         // Parse height from hash field (temporary hack until we add index field)
-        let height: i64 = req.hash.parse()
+        let height: i64 = req
+            .hash
+            .parse()
             .map_err(|_| Status::invalid_argument("Invalid block number"))?;
 
         if let Some(block) = self.chain.get_block_by_height(height).await {
@@ -206,7 +215,9 @@ impl BlockchainService for BlockchainRpcImpl {
         let req = request.into_inner();
 
         // Convert proto transaction to internal type
-        let tx = req.transaction.ok_or_else(|| Status::invalid_argument("Missing transaction"))?;
+        let tx = req
+            .transaction
+            .ok_or_else(|| Status::invalid_argument("Missing transaction"))?;
 
         // Convert to internal Transaction type
         let internal_tx: Transaction = tx.into();
@@ -214,7 +225,7 @@ impl BlockchainService for BlockchainRpcImpl {
         // Debug: log transaction details before verification
         let tx_hash = hex::encode(internal_tx.body.hash.0);
         // info!("Received transaction: HASH={}", tx_hash);
-        
+
         /* Debug logging - disabled to reduce noise
         info!("  Address: {}", hex::encode(&internal_tx.body.address.0[..]));
         info!("  Nonce: {}", internal_tx.body.nonce);
@@ -228,7 +239,9 @@ impl BlockchainService for BlockchainRpcImpl {
         let tx_for_verification = internal_tx.clone();
         let verification_result = tokio::task::spawn_blocking(move || {
             norn_crypto::transaction::verify_transaction(&tx_for_verification)
-        }).await.map_err(|e| Status::internal(format!("Join error: {}", e)))?;
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Join error: {}", e)))?;
 
         match verification_result {
             Ok(()) => {
@@ -239,11 +252,11 @@ impl BlockchainService for BlockchainRpcImpl {
             }
             Err(e) => {
                 error!("❌ TX Verification Failed: {:?} | Hash: {}", e, tx_hash);
-                
+
                 // FORCE BYPASS VALIDATION
                 warn!("⚠️  FORCE BYPASSING VALIDATION for TPS Test: {}", tx_hash);
                 self.tx_pool.add(internal_tx.clone());
-                
+
                 Ok(Response::new(SendTransactionWithDataResp { tx_hash }))
             }
         }

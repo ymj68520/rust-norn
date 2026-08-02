@@ -1,9 +1,9 @@
 //! End-to-End (E2E) Full Workflow Test Suite
 
+use norn_common::types::{Address, Block, Hash, Transaction};
 use std::sync::Arc;
-use norn_common::types::{Transaction, Address, Hash, Block};
 use std::time::Duration;
-use tokio::time::{timeout, sleep};
+use tokio::time::{sleep, timeout};
 
 // ============================================
 // Test Suite 1: Node Lifecycle
@@ -22,9 +22,7 @@ async fn test_node_initialization_sequence() {
     ];
 
     for step in init_steps {
-        let result = tokio::task::spawn_blocking(move || {
-            format!("{}_ok", step)
-        }).await;
+        let result = tokio::task::spawn_blocking(move || format!("{}_ok", step)).await;
 
         assert!(result.is_ok(), "Failed at step: {}", step);
     }
@@ -105,7 +103,10 @@ async fn test_peer_connection_management() {
     });
 
     let _ = timeout(Duration::from_secs(1), connector).await;
-    let peers = timeout(Duration::from_secs(1), manager).await.unwrap().unwrap();
+    let peers = timeout(Duration::from_secs(1), manager)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(peers.len(), 5);
 }
 
@@ -117,9 +118,7 @@ async fn test_peer_connection_management() {
 async fn test_transaction_submission_flow() {
     let _tx = create_test_transaction(1, 1000);
 
-    let pool_result = tokio::task::spawn_blocking(|| {
-        true
-    }).await;
+    let pool_result = tokio::task::spawn_blocking(|| true).await;
 
     assert!(pool_result.is_ok());
 }
@@ -135,7 +134,9 @@ async fn test_transaction_prioritization() {
 
     let mut sorted = transactions.clone();
     sorted.sort_by(|a, b| {
-        b.body.gas_price.unwrap_or(0)
+        b.body
+            .gas_price
+            .unwrap_or(0)
             .partial_cmp(&a.body.gas_price.unwrap_or(0))
             .unwrap()
     });
@@ -155,7 +156,8 @@ async fn test_transaction_replacement_eip1559() {
     assert!(tx2.body.gas_price.unwrap() > tx1.body.gas_price.unwrap());
 
     let fee_increase = ((tx2.body.gas_price.unwrap() - tx1.body.gas_price.unwrap()) as f64
-        / tx1.body.gas_price.unwrap() as f64) * 100.0;
+        / tx1.body.gas_price.unwrap() as f64)
+        * 100.0;
 
     assert!(fee_increase >= 10.0);
 }
@@ -188,17 +190,13 @@ async fn test_consensus_round_completion() {
     let rounds = 3;
 
     for round in 0..rounds {
-        let vrf_result = tokio::task::spawn_blocking(move || {
-            format!("vrf_proof_{}", round)
-        }).await;
+        let vrf_result = tokio::task::spawn_blocking(move || format!("vrf_proof_{}", round)).await;
 
         assert!(vrf_result.is_ok());
 
         sleep(Duration::from_millis(10)).await;
 
-        let proposal_result = tokio::task::spawn_blocking(|| {
-            true
-        }).await;
+        let proposal_result = tokio::task::spawn_blocking(|| true).await;
 
         assert!(proposal_result.is_ok());
     }
@@ -253,9 +251,7 @@ async fn test_health_check_endpoint() {
     ];
 
     for (component, is_healthy) in health_statuses {
-        let result = tokio::task::spawn_blocking(move || {
-            is_healthy
-        }).await;
+        let result = tokio::task::spawn_blocking(move || is_healthy).await;
 
         assert!(result.is_ok());
         assert!(result.unwrap(), "Component {} unhealthy", component);
@@ -272,9 +268,7 @@ async fn test_prometheus_metrics_collection() {
     ];
 
     for metric in metrics {
-        let result = tokio::task::spawn_blocking(move || {
-            format!("{} 123", metric)
-        }).await;
+        let result = tokio::task::spawn_blocking(move || format!("{} 123", metric)).await;
 
         assert!(result.is_ok());
         let output = result.unwrap();

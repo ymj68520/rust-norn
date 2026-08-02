@@ -4,14 +4,14 @@
 //! allowing queries of historical account states and storage values.
 
 use crate::state::{AccountState, AccountType};
-use norn_common::types::{Address, Hash};
 use norn_common::error::{NornError, Result};
-use serde::{Serialize, Deserialize};
+use norn_common::types::{Address, Hash};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// State change record
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -42,17 +42,13 @@ pub enum StateChangeType {
     AccountCreated,
 
     /// Account updated
-    AccountUpdated {
-        fields_changed: Vec<String>,
-    },
+    AccountUpdated { fields_changed: Vec<String> },
 
     /// Account deleted
     AccountDeleted,
 
     /// Storage modified
-    StorageModified {
-        key: Vec<u8>,
-    },
+    StorageModified { key: Vec<u8> },
 }
 
 /// Snapshot of the entire state at a specific block
@@ -105,7 +101,8 @@ impl StateHistory {
         debug!("Recording state change at block {}", change.block_number);
 
         let mut changes = self.changes.write().await;
-        changes.entry(change.block_number)
+        changes
+            .entry(change.block_number)
             .or_insert_with(Vec::new)
             .push(change);
 
@@ -224,7 +221,10 @@ impl StateHistory {
         key: &[u8],
         block_number: u64,
     ) -> Result<Option<Vec<u8>>> {
-        debug!("Querying storage at block {} for key {:?}", block_number, key);
+        debug!(
+            "Querying storage at block {} for key {:?}",
+            block_number, key
+        );
 
         // Get account state first
         if let Some(account) = self.get_account_at_block(address, block_number).await? {
@@ -239,9 +239,7 @@ impl StateHistory {
     /// Get all changes in a block
     pub async fn get_changes_at_block(&self, block_number: u64) -> Result<Vec<StateChangeRecord>> {
         let changes = self.changes.read().await;
-        Ok(changes.get(&block_number)
-            .cloned()
-            .unwrap_or_default())
+        Ok(changes.get(&block_number).cloned().unwrap_or_default())
     }
 
     /// Get current block number
@@ -294,9 +292,7 @@ impl StateHistory {
         debug!("Pruning changes at block {}", block_number);
 
         let mut changes = self.changes.write().await;
-        let removed = changes.remove(&block_number)
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let removed = changes.remove(&block_number).map(|v| v.len()).unwrap_or(0);
 
         if removed > 0 {
             debug!("Pruned {} change(s) at block {}", removed, block_number);
@@ -376,24 +372,25 @@ mod tests {
         let address = Address([1u8; 20]);
         let mut accounts = HashMap::new();
 
-        accounts.insert(address, AccountState {
+        accounts.insert(
             address,
-            balance: BigUint::from(1000u64),
-            nonce: 0,
-            code_hash: None,
-            storage_root: Hash::default(),
-            account_type: AccountType::Normal,
-            created_at: 0,
-            updated_at: 0,
-            deleted: false,
-        });
+            AccountState {
+                address,
+                balance: BigUint::from(1000u64),
+                nonce: 0,
+                code_hash: None,
+                storage_root: Hash::default(),
+                account_type: AccountType::Normal,
+                created_at: 0,
+                updated_at: 0,
+                deleted: false,
+            },
+        );
 
-        let snapshot = history.create_snapshot(
-            100,
-            Hash([2u8; 32]),
-            accounts,
-            Hash([3u8; 32]),
-        ).await.unwrap();
+        let snapshot = history
+            .create_snapshot(100, Hash([2u8; 32]), accounts, Hash([3u8; 32]))
+            .await
+            .unwrap();
 
         assert_eq!(snapshot.block_number, 100);
         assert_eq!(snapshot.accounts.len(), 1);
@@ -408,24 +405,25 @@ mod tests {
 
         // Create snapshot at block 100
         let mut accounts = HashMap::new();
-        accounts.insert(address, AccountState {
+        accounts.insert(
             address,
-            balance: BigUint::from(1000u64),
-            nonce: 0,
-            code_hash: None,
-            storage_root: Hash::default(),
-            account_type: AccountType::Normal,
-            created_at: 0,
-            updated_at: 0,
-            deleted: false,
-        });
+            AccountState {
+                address,
+                balance: BigUint::from(1000u64),
+                nonce: 0,
+                code_hash: None,
+                storage_root: Hash::default(),
+                account_type: AccountType::Normal,
+                created_at: 0,
+                updated_at: 0,
+                deleted: false,
+            },
+        );
 
-        history.create_snapshot(
-            100,
-            Hash([1u8; 32]),
-            accounts,
-            Hash([2u8; 32]),
-        ).await.unwrap();
+        history
+            .create_snapshot(100, Hash([1u8; 32]), accounts, Hash([2u8; 32]))
+            .await
+            .unwrap();
 
         // Query account at block 100
         let account = history.get_account_at_block(&address, 100).await.unwrap();

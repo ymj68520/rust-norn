@@ -32,10 +32,10 @@ impl Default for EIP1559Config {
             // Ethereum mainnet-like values (scaled down for testing)
             initial_base_fee: 1_000_000_000, // 1 Gwei
             gas_target: 15_000_000,          // 15 million
-            max_gas_limit: 30_000_000,        // 30 million
-            base_fee_change_denominator: 8,   // 12.5% change per block
-            elasticity_multiplier: 2,         // Can use up to 2x target
-            min_base_fee: 1_000_000_000,      // 1 Gwei minimum
+            max_gas_limit: 30_000_000,       // 30 million
+            base_fee_change_denominator: 8,  // 12.5% change per block
+            elasticity_multiplier: 2,        // Can use up to 2x target
+            min_base_fee: 1_000_000_000,     // 1 Gwei minimum
         }
     }
 }
@@ -309,7 +309,7 @@ mod tests {
     fn test_calculate_effective_gas_price_eip1559() {
         let calculator = EIP1559FeeCalculator::default_config();
         let base_fee = 1_000_000_000; // 1 Gwei
-        let max_fee = 3_000_000_000;   // 3 Gwei
+        let max_fee = 3_000_000_000; // 3 Gwei
         let priority_fee = 2_000_000_000; // 2 Gwei
 
         let effective = calculator.calculate_effective_gas_price(
@@ -328,7 +328,7 @@ mod tests {
     fn test_calculate_effective_gas_price_priority_capped() {
         let calculator = EIP1559FeeCalculator::default_config();
         let base_fee = 2_000_000_000; // 2 Gwei
-        let max_fee = 3_000_000_000;   // 3 Gwei
+        let max_fee = 3_000_000_000; // 3 Gwei
         let priority_fee = 2_000_000_000; // 2 Gwei
 
         let effective = calculator.calculate_effective_gas_price(
@@ -385,12 +385,8 @@ mod tests {
         let base_fee = 2_000_000_000;
 
         // max_fee < base_fee
-        let result = calculator.validate_fee_params(
-            base_fee,
-            Some(1_000_000_000),
-            Some(500_000_000),
-            None,
-        );
+        let result =
+            calculator.validate_fee_params(base_fee, Some(1_000_000_000), Some(500_000_000), None);
         assert!(result.is_err());
     }
 

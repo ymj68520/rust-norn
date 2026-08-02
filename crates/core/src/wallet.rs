@@ -1,5 +1,5 @@
 //! Wallet Module
-//! 
+//!
 //! Provides wallet and account management functionality.
 
 use std::collections::HashMap;
@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use norn_common::types::{Address, Hash, Transaction, TransactionBody, PublicKey};
 use norn_common::error::Result;
+use norn_common::types::{Address, Hash, PublicKey, Transaction, TransactionBody};
 use norn_crypto::vrf::VRFKeyPair;
 
 /// Wallet configuration
@@ -71,7 +71,7 @@ impl Wallet {
         let accounts = self.accounts.read().await;
         if accounts.len() >= self.config.max_accounts {
             return Err(norn_common::error::NornError::Internal(
-                "Maximum accounts reached".to_string()
+                "Maximum accounts reached".to_string(),
             ));
         }
         drop(accounts);
@@ -79,10 +79,10 @@ impl Wallet {
         // Generate new key pair
         let key_pair = VRFKeyPair::generate();
         let pub_key_bytes = key_pair.public_key_bytes();
-        
+
         // Derive address from public key (first 20 bytes of hash)
         let address = self.derive_address(&pub_key_bytes);
-        
+
         // Create account
         let account = WalletAccount {
             address,
@@ -101,18 +101,22 @@ impl Wallet {
             *default = Some(address);
         }
 
-        info!("Created new account: {} ({})", name, hex::encode(&address.0));
+        info!(
+            "Created new account: {} ({})",
+            name,
+            hex::encode(&address.0)
+        );
         Ok(address)
     }
 
     /// Derive address from public key bytes
     fn derive_address(&self, pub_key: &[u8]) -> Address {
-        use sha2::{Sha256, Digest};
-        
+        use sha2::{Digest, Sha256};
+
         let mut hasher = Sha256::new();
         hasher.update(pub_key);
         let hash = hasher.finalize();
-        
+
         let mut address = Address::default();
         address.0.copy_from_slice(&hash[..20]);
         address
@@ -143,7 +147,7 @@ impl Wallet {
         let accounts = self.accounts.read().await;
         if !accounts.contains_key(&address) {
             return Err(norn_common::error::NornError::Internal(
-                "Account not found".to_string()
+                "Account not found".to_string(),
             ));
         }
         drop(accounts);
@@ -161,7 +165,7 @@ impl Wallet {
             Ok(())
         } else {
             Err(norn_common::error::NornError::Internal(
-                "Account not found".to_string()
+                "Account not found".to_string(),
             ))
         }
     }
@@ -175,16 +179,20 @@ impl Wallet {
             Ok(())
         } else {
             Err(norn_common::error::NornError::Internal(
-                "Account not found".to_string()
+                "Account not found".to_string(),
             ))
         }
     }
 
     /// Sign transaction with account's key
-    pub async fn sign_transaction(&self, from: &Address, tx_body: &TransactionBody) -> Result<Vec<u8>> {
+    pub async fn sign_transaction(
+        &self,
+        from: &Address,
+        tx_body: &TransactionBody,
+    ) -> Result<Vec<u8>> {
         if !self.config.enable_signing {
             return Err(norn_common::error::NornError::Internal(
-                "Signing disabled".to_string()
+                "Signing disabled".to_string(),
             ));
         }
 
@@ -195,7 +203,7 @@ impl Wallet {
 
         if account.is_locked {
             return Err(norn_common::error::NornError::Internal(
-                "Account is locked".to_string()
+                "Account is locked".to_string(),
             ));
         }
         drop(accounts);
@@ -207,7 +215,7 @@ impl Wallet {
         })?;
 
         // Create signature (simplified - in production use proper signing)
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(&tx_body.hash.0);
         let signature = hasher.finalize().to_vec();
@@ -221,7 +229,7 @@ impl Wallet {
         let mut accounts = self.accounts.write().await;
         if accounts.remove(address).is_none() {
             return Err(norn_common::error::NornError::Internal(
-                "Account not found".to_string()
+                "Account not found".to_string(),
             ));
         }
         drop(accounts);
@@ -253,10 +261,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_account() {
         let wallet = Wallet::new();
-        
+
         let address = wallet.create_account("Test Account").await.unwrap();
         assert!(!address.0.iter().all(|&b| b == 0));
-        
+
         let account = wallet.get_account(&address).await;
         assert!(account.is_some());
         assert_eq!(account.unwrap().name, "Test Account");
@@ -265,10 +273,10 @@ mod tests {
     #[tokio::test]
     async fn test_list_accounts() {
         let wallet = Wallet::new();
-        
+
         wallet.create_account("Account 1").await.unwrap();
         wallet.create_account("Account 2").await.unwrap();
-        
+
         let accounts = wallet.list_accounts().await;
         assert_eq!(accounts.len(), 2);
     }
@@ -276,13 +284,13 @@ mod tests {
     #[tokio::test]
     async fn test_default_account() {
         let wallet = Wallet::new();
-        
+
         let addr1 = wallet.create_account("First").await.unwrap();
         let addr2 = wallet.create_account("Second").await.unwrap();
-        
+
         // First account should be default
         assert_eq!(wallet.get_default_account().await, Some(addr1));
-        
+
         // Change default
         wallet.set_default_account(addr2).await.unwrap();
         assert_eq!(wallet.get_default_account().await, Some(addr2));
@@ -291,13 +299,13 @@ mod tests {
     #[tokio::test]
     async fn test_lock_unlock() {
         let wallet = Wallet::new();
-        
+
         let address = wallet.create_account("Test").await.unwrap();
-        
+
         wallet.lock_account(&address).await.unwrap();
         let account = wallet.get_account(&address).await.unwrap();
         assert!(account.is_locked);
-        
+
         wallet.unlock_account(&address).await.unwrap();
         let account = wallet.get_account(&address).await.unwrap();
         assert!(!account.is_locked);

@@ -1,5 +1,5 @@
 //! Event Subscription Module
-//! 
+//!
 //! Provides block and transaction event subscriptions for clients.
 
 use std::collections::HashMap;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
 
-use norn_common::types::{Block, Transaction, Hash, Address};
+use norn_common::types::{Address, Block, Hash, Transaction};
 
 /// Event types that can be subscribed to
 #[derive(Debug, Clone)]
@@ -23,10 +23,7 @@ pub enum BlockchainEvent {
         block_height: i64,
     },
     /// Block finalized (irreversible)
-    BlockFinalized {
-        block_hash: Hash,
-        block_height: i64,
-    },
+    BlockFinalized { block_hash: Hash, block_height: i64 },
     /// Chain reorganization detected
     ChainReorg {
         old_height: i64,
@@ -221,12 +218,12 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_unsubscribe() {
         let publisher = EventPublisher::new(100);
-        
+
         let filter = SubscriptionFilter::default();
         let subscriber = publisher.subscribe(filter).await;
-        
+
         assert_eq!(publisher.subscription_count().await, 1);
-        
+
         publisher.unsubscribe(subscriber.id()).await;
         assert_eq!(publisher.subscription_count().await, 0);
     }
@@ -234,14 +231,14 @@ mod tests {
     #[tokio::test]
     async fn test_publish_receive() {
         let publisher = EventPublisher::new(100);
-        
+
         let filter = SubscriptionFilter::default();
         let mut subscriber = publisher.subscribe(filter).await;
-        
+
         // Publish event
         let block = Block::default();
         publisher.publish_new_block(block.clone());
-        
+
         // Receive event
         let event = subscriber.recv().await;
         assert!(matches!(event, Some(BlockchainEvent::NewBlock(_))));

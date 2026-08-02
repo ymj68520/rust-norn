@@ -1,25 +1,23 @@
 //! 4-Node BFT Integration Test Suite
 //! Validates 4-node real BFT consensus, VRF selection, quorum aggregation, CommitCertificate verification, and single-tree persistence.
 
-use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::Signer;
+use k256::ecdsa::SigningKey;
 use rand::thread_rng;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-use norn_common::consensus_types::{
-    Proposal, StakeSnapshot, ValidatorRecord, VoteStep,
-};
+use norn_common::consensus_types::{Proposal, StakeSnapshot, ValidatorRecord, VoteStep};
+use norn_common::traits::DBInterface;
 use norn_common::types::{
-    Block, BlockHeader, BlockId, ChainId, ConsensusPublicKey, Hash, ProtocolVersion,
-    ValidatorId, VrfPublicKey,
+    Block, BlockHeader, BlockId, ChainId, ConsensusPublicKey, Hash, ProtocolVersion, ValidatorId,
+    VrfPublicKey,
 };
-use norn_crypto::vrf::{VRFCalculator, VRFKeyPair, VrfContext};
 use norn_core::consensus::povf::PoVFEngine;
 use norn_core::consensus::safety_store::{ConsensusSigner, PersistentSafetyStore};
 use norn_core::consensus::types::{ConsensusConfig, ElectionMath};
+use norn_crypto::vrf::{VRFCalculator, VRFKeyPair, VrfContext};
 use norn_storage::sled::SledDB;
-use norn_common::traits::DBInterface;
 
 struct EcdsaSigner {
     validator_id: ValidatorId,
@@ -58,14 +56,22 @@ async fn test_four_node_bft_consensus_and_finality() {
         let validator_id = ValidatorId(val_id_bytes);
 
         let ecdsa_key = SigningKey::random(&mut thread_rng());
-        let ecdsa_pub_bytes: [u8; 33] = ecdsa_key.verifying_key().to_sec1_bytes().as_ref().try_into().unwrap();
+        let ecdsa_pub_bytes: [u8; 33] = ecdsa_key
+            .verifying_key()
+            .to_sec1_bytes()
+            .as_ref()
+            .try_into()
+            .unwrap();
         let consensus_pub_key = ConsensusPublicKey(ecdsa_pub_bytes);
 
         let vrf_keypair = VRFKeyPair::generate();
         let vrf_pub_bytes = vrf_keypair.public_key_bytes();
         let vrf_public_key = VrfPublicKey(vrf_pub_bytes);
 
-        signers.push(EcdsaSigner { validator_id, key: ecdsa_key });
+        signers.push(EcdsaSigner {
+            validator_id,
+            key: ecdsa_key,
+        });
         vrf_keys.push(vrf_keypair);
         validator_records.push(ValidatorRecord {
             validator_id,
@@ -76,16 +82,26 @@ async fn test_four_node_bft_consensus_and_finality() {
     }
 
     // 2. Form initial StakeSnapshot (30/40 voting power > 2/3 required for BFT quorum)
-    let snapshot = StakeSnapshot::from_genesis(1, validator_records.clone()).expect("Valid snapshot");
+    let snapshot =
+        StakeSnapshot::from_genesis(1, validator_records.clone()).expect("Valid snapshot");
     assert_eq!(snapshot.validators.len(), 4);
 
     // 3. Determine deterministic proposer for height 1 round 0
     let parent_randomness = Hash([0x42; 32]);
     let expected_proposer = ElectionMath::select_deterministic_proposer(
-        &chain_id, 1, 1, 0, &parent_randomness, &snapshot,
-    ).expect("Proposer selected");
+        &chain_id,
+        1,
+        1,
+        0,
+        &parent_randomness,
+        &snapshot,
+    )
+    .expect("Proposer selected");
 
-    let proposer_index = signers.iter().position(|s| s.validator_id == expected_proposer).expect("Proposer found");
+    let proposer_index = signers
+        .iter()
+        .position(|s| s.validator_id == expected_proposer)
+        .expect("Proposer found");
     let proposer_signer = &signers[proposer_index];
     let proposer_vrf_key = &vrf_keys[proposer_index];
 
@@ -110,7 +126,10 @@ async fn test_four_node_bft_consensus_and_finality() {
         consensus_data_hash: Hash::default(),
     };
 
-    let mut block = Block { header, transactions: vec![] };
+    let mut block = Block {
+        header,
+        transactions: vec![],
+    };
     block.header.block_hash = block.header.calculate_hash().expect("Calculate block hash");
     let block_id = BlockId(block.header.block_hash);
 
@@ -125,7 +144,8 @@ async fn test_four_node_bft_consensus_and_finality() {
         validator_id: expected_proposer,
     };
 
-    let vrf_output = VRFCalculator::calculate_with_context(proposer_vrf_key, &vrf_context).expect("VRF output");
+    let vrf_output =
+        VRFCalculator::calculate_with_context(proposer_vrf_key, &vrf_context).expect("VRF output");
 
     let mut proposal = Proposal {
         protocol_version: protocol_version.clone(),
@@ -145,7 +165,9 @@ async fn test_four_node_bft_consensus_and_finality() {
     };
 
     let proposal_bytes = proposal.canonical_bytes();
-    proposal.signature = proposer_signer.sign_proposal(&proposal_bytes).expect("Sign proposal");
+    proposal.signature = proposer_signer
+        .sign_proposal(&proposal_bytes)
+        .expect("Sign proposal");
 
     // 5. Instantiate 4 PoVF Engines with isolated single-tree Sled DBs
     let mut engines = Vec::new();
@@ -169,11 +191,15 @@ async fn test_four_node_bft_consensus_and_finality() {
             timeout_precommit_ms: 2000,
             target_numerator: 1,
             target_denominator: 3,
+            max_certificate_members: 4,
+            max_future_height: 2,
+            max_future_round: 2,
         };
 
-        let engine = PoVFEngine::new(
+        let engine = PoVFEngine::new_with_parent_randomness(
             consensus_config,
             snapshot.clone(),
+            parent_randomness,
             safety_store,
             Some(signers[i].validator_id),
         );
@@ -186,7 +212,8 @@ async fn test_four_node_bft_consensus_and_finality() {
     let mut prevotes = Vec::new();
     for i in 0..4 {
         let (engine, _) = &engines[i];
-        let vote_opt = engine.handle_proposal(proposal.clone(), block.clone(), &signers[i])
+        let vote_opt = engine
+            .handle_proposal(proposal.clone(), block.clone(), &signers[i])
             .await
             .expect("Handle proposal");
         let vote = vote_opt.expect("Cast prevote");
@@ -202,7 +229,8 @@ async fn test_four_node_bft_consensus_and_finality() {
     for i in 0..4 {
         let (engine, _) = &engines[i];
         for prevote in &prevotes {
-            let (vote_opt, cert_opt) = engine.handle_vote(prevote.clone(), &signers[i])
+            let (vote_opt, cert_opt) = engine
+                .handle_vote(prevote.clone(), &signers[i])
                 .await
                 .expect("Handle prevote");
 
@@ -226,7 +254,8 @@ async fn test_four_node_bft_consensus_and_finality() {
     for i in 0..4 {
         let (engine, _) = &engines[i];
         for precommit in &precommits {
-            let (_, cert_opt) = engine.handle_vote(precommit.clone(), &signers[i])
+            let (_, cert_opt) = engine
+                .handle_vote(precommit.clone(), &signers[i])
                 .await
                 .expect("Handle precommit");
 
@@ -241,11 +270,16 @@ async fn test_four_node_bft_consensus_and_finality() {
 
     // 9. Verify CommitCertificate & single-tree Sled persistence
     for (engine, sled_db) in &engines {
-        engine.verify_commit_certificate(&block, &commit_cert, &snapshot).expect("Verify CommitCertificate");
+        engine
+            .verify_commit_certificate(&block, &commit_cert, &snapshot)
+            .expect("Verify CommitCertificate");
 
         let key = format!("block/{}", hex::encode(block.header.block_hash.0)).into_bytes();
         let val = bincode::serialize(&block).unwrap();
-        sled_db.insert(&key, &val).await.expect("Atomic insert block");
+        sled_db
+            .insert(&key, &val)
+            .await
+            .expect("Atomic insert block");
 
         let fetched = sled_db.get(&key).await.unwrap().expect("Fetched block");
         let fetched_block: Block = bincode::deserialize(&fetched).unwrap();

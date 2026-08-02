@@ -3,10 +3,12 @@
 //! This module defines a unified trait for account state management,
 //! allowing different implementations to be used interchangeably.
 
-use crate::state::account::{AccountState, AccountType, AccountStateManager as FullAccountStateManager};
-use norn_common::types::{Address, Hash};
-use norn_common::error::Result;
+use crate::state::account::{
+    AccountState, AccountStateManager as FullAccountStateManager, AccountType,
+};
 use async_trait::async_trait;
+use norn_common::error::Result;
+use norn_common::types::{Address, Hash};
 use num_bigint::BigUint;
 use std::sync::Arc;
 
@@ -80,7 +82,9 @@ impl AccountStateManagerTrait for AccountStateManager {
 
     async fn get_balance(&self, address: &Address) -> Result<BigUint> {
         let account = self.get_account(address).await?;
-        Ok(account.map(|a| a.balance).unwrap_or_else(|| BigUint::from(0u32)))
+        Ok(account
+            .map(|a| a.balance)
+            .unwrap_or_else(|| BigUint::from(0u32)))
     }
 
     async fn update_balance(&self, address: &Address, new_balance: BigUint) -> Result<()> {

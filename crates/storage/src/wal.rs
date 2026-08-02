@@ -5,34 +5,26 @@
 //! before being applied to the main database.
 
 use norn_common::error::{NornError, Result};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write, Seek, SeekFrom, BufWriter, BufReader};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info, warn, error};
 use std::time::{SystemTime, UNIX_EPOCH};
-use sha2::{Sha256, Digest};
+use tracing::{debug, error, info, warn};
 
 /// WAL entry type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WALEntry {
     /// Account creation
-    CreateAccount {
-        address: [u8; 20],
-        data: Vec<u8>,
-    },
+    CreateAccount { address: [u8; 20], data: Vec<u8> },
 
     /// Account update
-    UpdateAccount {
-        address: [u8; 20],
-        data: Vec<u8>,
-    },
+    UpdateAccount { address: [u8; 20], data: Vec<u8> },
 
     /// Account deletion
-    DeleteAccount {
-        address: [u8; 20],
-    },
+    DeleteAccount { address: [u8; 20] },
 
     /// Storage write
     WriteStorage {
@@ -42,10 +34,7 @@ pub enum WALEntry {
     },
 
     /// Storage deletion
-    DeleteStorage {
-        address: [u8; 20],
-        key: Vec<u8>,
-    },
+    DeleteStorage { address: [u8; 20], key: Vec<u8> },
 
     /// Checkpoint marker
     Checkpoint {
@@ -54,19 +43,13 @@ pub enum WALEntry {
     },
 
     /// Transaction begin
-    TransactionBegin {
-        id: u64,
-    },
+    TransactionBegin { id: u64 },
 
     /// Transaction commit
-    TransactionCommit {
-        id: u64,
-    },
+    TransactionCommit { id: u64 },
 
     /// Transaction rollback
-    TransactionRollback {
-        id: u64,
-    },
+    TransactionRollback { id: u64 },
 }
 
 /// WAL entry with metadata
@@ -201,7 +184,10 @@ impl WAL {
             // Recover existing WAL
             let max_file = *existing_files.iter().max().unwrap();
             let sequence = Self::recover_sequence(&wal_dir, max_file)?;
-            info!("Recovering WAL at {:?}, file={}, sequence={}", wal_dir, max_file, sequence);
+            info!(
+                "Recovering WAL at {:?}, file={}, sequence={}",
+                wal_dir, max_file, sequence
+            );
             (max_file, sequence)
         };
 
@@ -234,7 +220,9 @@ impl WAL {
     pub fn write(&self, entry: WALEntry) -> Result<u64> {
         // Get next sequence number
         let sequence = {
-            let mut seq = self.sequence.lock()
+            let mut seq = self
+                .sequence
+                .lock()
                 .map_err(|e| NornError::Internal(format!("WAL lock error: {}", e)))?;
             *seq += 1;
             let seq = *seq;
@@ -246,7 +234,9 @@ impl WAL {
 
         // Verify checksum before writing
         if !entry_with_meta.verify_checksum() {
-            return Err(NornError::Internal("WAL checksum verification failed".to_string()));
+            return Err(NornError::Internal(
+                "WAL checksum verification failed".to_string(),
+            ));
         }
 
         // Serialize entry
@@ -257,7 +247,9 @@ impl WAL {
         let len = data.len() as u32;
 
         {
-            let mut file = self.current_file.lock()
+            let mut file = self
+                .current_file
+                .lock()
                 .map_err(|e| NornError::Internal(format!("WAL lock error: {}", e)))?;
 
             file.write_all(&len.to_le_bytes())
@@ -271,12 +263,16 @@ impl WAL {
             if self.config.sync_on_write {
                 file.flush()
                     .map_err(|e| NornError::Internal(format!("Failed to flush WAL: {}", e)))?;
-                file.get_ref().sync_all()
-                    .map_err(|e| NornError::Internal(format!("Failed to sync_all WAL file: {}", e)))?;
+                file.get_ref().sync_all().map_err(|e| {
+                    NornError::Internal(format!("Failed to sync_all WAL file: {}", e))
+                })?;
             }
         }
 
-        debug!("WAL write: sequence={}, type={:?}", sequence, entry_with_meta.entry);
+        debug!(
+            "WAL write: sequence={}, type={:?}",
+            sequence, entry_with_meta.entry
+        );
 
         // Check if we need to rotate file
         if self.should_rotate()? {
@@ -285,7 +281,9 @@ impl WAL {
 
         // Update checkpoint counter
         {
-            let mut counter = self.entries_since_checkpoint.lock()
+            let mut counter = self
+                .entries_since_checkpoint
+                .lock()
                 .map_err(|e| NornError::Internal(format!("WAL lock error: {}", e)))?;
             *counter += 1;
         }
@@ -322,7 +320,9 @@ impl WAL {
 
         // Reset checkpoint counter
         {
-            let mut counter = self.entries_since_checkpoint.lock()
+            let mut counter = self
+                .entries_since_checkpoint
+                .lock()
                 .map_err(|e| NornError::Internal(format!("WAL lock error: {}", e)))?;
             *counter = 0;
         }
@@ -332,13 +332,16 @@ impl WAL {
 
     /// Sync the WAL to disk
     pub fn sync(&self) -> Result<()> {
-        let mut file = self.current_file.lock()
+        let mut file = self
+            .current_file
+            .lock()
             .map_err(|e| NornError::Internal(format!("WAL lock error: {}", e)))?;
 
         file.flush()
             .map_err(|e| NornError::Internal(format!("Failed to sync WAL: {}", e)))?;
 
-        file.get_ref().sync_all()
+        file.get_ref()
+            .sync_all()
             .map_err(|e| NornError::Internal(format!("Failed to sync WAL file: {}", e)))?;
 
         Ok(())
@@ -371,7 +374,9 @@ impl WAL {
 
     /// Check if file rotation is needed
     fn should_rotate(&self) -> Result<bool> {
-        let current_path = self.current_path.lock()
+        let current_path = self
+            .current_path
+            .lock()
             .map_err(|e| NornError::Internal(format!("WAL lock error: {}", e)))?;
         let metadata = std::fs::metadata(&*current_path)
             .map_err(|e| NornError::Internal(format!("Failed to get WAL file metadata: {}", e)))?;
@@ -388,13 +393,17 @@ impl WAL {
 
         // Increment file number
         {
-            let mut file_number = self.file_number.lock()
+            let mut file_number = self
+                .file_number
+                .lock()
                 .map_err(|e| NornError::Internal(format!("WAL lock error: {}", e)))?;
             *file_number += 1;
         }
 
         // Create new file
-        let new_file_number = *self.file_number.lock()
+        let new_file_number = *self
+            .file_number
+            .lock()
             .map_err(|e| NornError::Internal(format!("WAL lock error: {}", e)))?;
         let new_path = self.wal_dir.join(format!("wal-{}.log", new_file_number));
 
@@ -406,13 +415,17 @@ impl WAL {
 
         // Replace current file and path
         {
-            let mut file_guard = self.current_file.lock()
+            let mut file_guard = self
+                .current_file
+                .lock()
                 .map_err(|e| NornError::Internal(format!("WAL lock error: {}", e)))?;
             *file_guard = BufWriter::new(new_file);
         }
 
         {
-            let mut current_path = self.current_path.lock()
+            let mut current_path = self
+                .current_path
+                .lock()
                 .map_err(|e| NornError::Internal(format!("WAL lock error: {}", e)))?;
             *current_path = new_path;
         }
@@ -430,13 +443,13 @@ impl WAL {
         for entry in std::fs::read_dir(wal_dir)
             .map_err(|e| NornError::Internal(format!("Failed to read WAL directory: {}", e)))?
         {
-            let entry = entry.map_err(|e| NornError::Internal(format!("Failed to read directory entry: {}", e)))?;
+            let entry = entry.map_err(|e| {
+                NornError::Internal(format!("Failed to read directory entry: {}", e))
+            })?;
             let path = entry.path();
 
             if path.extension().and_then(|s| s.to_str()) == Some("log") {
-                let file_stem = path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
+                let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
 
                 if file_stem.starts_with("wal-") {
                     if let Ok(num) = file_stem[4..].parse::<u64>() {
@@ -465,8 +478,9 @@ impl WAL {
 
     /// Read entries from a single WAL file
     fn read_file(path: &Path) -> Result<Vec<WALEntry>> {
-        let file = File::open(path)
-            .map_err(|e| NornError::Internal(format!("Failed to open WAL file {:?}: {}", path, e)))?;
+        let file = File::open(path).map_err(|e| {
+            NornError::Internal(format!("Failed to open WAL file {:?}: {}", path, e))
+        })?;
 
         let mut reader = BufReader::new(file);
         let mut entries = Vec::new();
@@ -478,28 +492,39 @@ impl WAL {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
                     break; // End of file
                 }
-                return Err(NornError::Internal(format!("Failed to read WAL entry length: {}", e)));
+                return Err(NornError::Internal(format!(
+                    "Failed to read WAL entry length: {}",
+                    e
+                )));
             }
 
             let len = u32::from_le_bytes(len_bytes) as usize;
 
             // Sanity check
             if len > 10_000_000 {
-                return Err(NornError::Internal(format!("WAL entry too large: {} bytes", len)));
+                return Err(NornError::Internal(format!(
+                    "WAL entry too large: {} bytes",
+                    len
+                )));
             }
 
             // Read entry data
             let mut data = vec![0u8; len];
-            reader.read_exact(&mut data)
-                .map_err(|e| NornError::Internal(format!("Failed to read WAL entry data: {}", e)))?;
+            reader.read_exact(&mut data).map_err(|e| {
+                NornError::Internal(format!("Failed to read WAL entry data: {}", e))
+            })?;
 
             // Deserialize entry with metadata
-            let entry_with_meta: WALEntryWithMeta = bincode::deserialize(&data)
-                .map_err(|e| NornError::Internal(format!("Failed to deserialize WAL entry: {}", e)))?;
+            let entry_with_meta: WALEntryWithMeta = bincode::deserialize(&data).map_err(|e| {
+                NornError::Internal(format!("Failed to deserialize WAL entry: {}", e))
+            })?;
 
             // Verify checksum
             if !entry_with_meta.verify_checksum() {
-                warn!("WAL entry checksum mismatch at sequence {}", entry_with_meta.sequence);
+                warn!(
+                    "WAL entry checksum mismatch at sequence {}",
+                    entry_with_meta.sequence
+                );
                 continue;
             }
 

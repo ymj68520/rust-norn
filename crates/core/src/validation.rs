@@ -1,16 +1,16 @@
-use anyhow::{Result, anyhow};
-use norn_common::types::{Block, Hash, GeneralParams, Address};
+use crate::state::AccountStateManager;
+use anyhow::{anyhow, Result};
+use chrono::Utc;
+use curve25519_dalek::{ristretto::RistrettoPoint, scalar::Scalar};
+use norn_common::chain_context::ChainContext;
+use norn_common::genesis::GenesisConfig;
+use norn_common::types::TransactionV2;
+use norn_common::types::{Address, Block, GeneralParams, Hash};
 use norn_crypto::transaction::verify_transaction;
 use norn_crypto::vdf::VDFCalculator;
-use rs_merkle::{MerkleTree, algorithms::Sha256 as MerkleSha256};
-use sha2::{Sha256, Digest};
-use chrono::Utc;
+use rs_merkle::{algorithms::Sha256 as MerkleSha256, MerkleTree};
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
-use curve25519_dalek::{
-    ristretto::RistrettoPoint,
-    scalar::Scalar,
-};
-use crate::state::AccountStateManager;
 
 /// Block validation errors
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +51,12 @@ pub struct ValidationConfig {
     pub max_tx_per_block: usize,
     /// Maximum block size in bytes
     pub max_block_size: usize,
+    /// Maximum serialized transaction size in bytes
+    pub max_transaction_size: usize,
+    /// Maximum gas allowed by one transaction
+    pub max_transaction_gas: i64,
+    /// Maximum writes allowed in one deterministic execution overlay
+    pub max_overlay_writes: usize,
     /// Whether to verify VDF proofs
     pub verify_vdf: bool,
     /// Whether to verify VRF proofs
@@ -68,13 +74,35 @@ impl Default for ValidationConfig {
             max_gas_limit: 10_000_000,
             max_tx_per_block: 10_000,
             max_block_size: 10 * 1024 * 1024, // 10MB
-            verify_vdf: verify_crypto,  // Skip in test mode for speed
-            verify_vrf: verify_crypto,  // Skip in test mode for speed
+            max_transaction_size: 256 * 1024,
+            max_transaction_gas: 10_000_000,
+            max_overlay_writes: 100_000,
+            verify_vdf: verify_crypto, // Skip in test mode for speed
+            verify_vrf: verify_crypto, // Skip in test mode for speed
         }
     }
 }
 
 impl ValidationConfig {
+    pub fn from_genesis(genesis: &GenesisConfig) -> Result<Self> {
+        genesis.resource_limits.validate()?;
+        Ok(Self {
+            max_gas_limit: i64::try_from(genesis.resource_limits.max_block_gas)
+                .map_err(|_| anyhow!("Genesis block gas limit exceeds i64"))?,
+            max_tx_per_block: usize::try_from(genesis.resource_limits.max_transactions_per_block)
+                .map_err(|_| anyhow!("Genesis transaction count exceeds usize"))?,
+            max_block_size: usize::try_from(genesis.resource_limits.max_block_bytes)
+                .map_err(|_| anyhow!("Genesis block size exceeds usize"))?,
+            max_transaction_size: usize::try_from(genesis.resource_limits.max_transaction_bytes)
+                .map_err(|_| anyhow!("Genesis transaction size exceeds usize"))?,
+            max_transaction_gas: i64::try_from(genesis.resource_limits.max_transaction_gas)
+                .map_err(|_| anyhow!("Genesis transaction gas exceeds i64"))?,
+            max_overlay_writes: usize::try_from(genesis.resource_limits.max_overlay_writes)
+                .map_err(|_| anyhow!("Genesis overlay write limit exceeds usize"))?,
+            ..Default::default()
+        })
+    }
+
     /// Create config for testing (lenient validation)
     pub fn test_config() -> Self {
         Self {
@@ -127,7 +155,10 @@ pub async fn validate_block(
     // 6. Validate block size
     validate_block_size(block, config)?;
 
-    debug!("Block validation successful for height {}", block.header.height);
+    debug!(
+        "Block validation successful for height {}",
+        block.header.height
+    );
     Ok(())
 }
 
@@ -201,6 +232,21 @@ async fn validate_transactions(
     let mut total_gas = 0i64;
 
     for (index, tx) in block.transactions.iter().enumerate() {
+        let serialized_size = bincode::serialize(tx)
+            .map_err(|e| {
+                anyhow!(ValidationError::InvalidTransaction {
+                    index,
+                    reason: format!("transaction serialization failed: {}", e),
+                })
+            })?
+            .len();
+        if serialized_size > config.max_transaction_size {
+            return Err(anyhow!(ValidationError::InvalidTransaction {
+                index,
+                reason: "Transaction exceeds Genesis byte limit".to_string(),
+            }));
+        }
+
         // Verify transaction structure and signature
         if let Err(e) = verify_transaction(tx) {
             return Err(anyhow!(ValidationError::InvalidTransaction {
@@ -210,11 +256,19 @@ async fn validate_transactions(
         }
 
         // Check gas
-        total_gas += tx.body.gas;
+        total_gas = total_gas
+            .checked_add(tx.body.gas)
+            .ok_or_else(|| anyhow!(ValidationError::GasLimitExceeded))?;
         if tx.body.gas <= 0 {
             return Err(anyhow!(ValidationError::InvalidTransaction {
                 index,
                 reason: "Non-positive gas".to_string(),
+            }));
+        }
+        if tx.body.gas > config.max_transaction_gas {
+            return Err(anyhow!(ValidationError::InvalidTransaction {
+                index,
+                reason: "Transaction gas exceeds Genesis limit".to_string(),
             }));
         }
 
@@ -243,21 +297,9 @@ async fn validate_transactions(
             }));
         }
 
-        // Verify block height and transaction index match
-        if tx.body.height != block.header.height || tx.body.index != index as i64 {
-            return Err(anyhow!(ValidationError::InvalidTransaction {
-                index,
-                reason: "Height/index mismatch".to_string(),
-            }));
-        }
-
-        // Verify block hash
-        if tx.body.block_hash != block.header.block_hash {
-            return Err(anyhow!(ValidationError::InvalidTransaction {
-                index,
-                reason: "Block hash mismatch".to_string(),
-            }));
-        }
+        // Transaction IDs are independent of block inclusion. Height and
+        // transaction index are derived from this block for receipts and are
+        // never accepted as transaction-authored consensus fields.
 
         // Validate transaction value if present
         if let Some(ref value_str) = tx.body.value {
@@ -272,12 +314,17 @@ async fn validate_transactions(
             // Check sender has sufficient balance (if state manager available)
             if let Some(state_mgr) = state_manager {
                 let sender_balance = state_mgr.get_balance(&tx.body.address).await?;
-                let value_u256: num_bigint::BigUint = value_str.parse().unwrap_or_else(|_| num_bigint::BigUint::from(0u32));
+                let value_u256: num_bigint::BigUint = value_str
+                    .parse()
+                    .unwrap_or_else(|_| num_bigint::BigUint::from(0u32));
 
                 if sender_balance < value_u256 {
                     return Err(anyhow!(ValidationError::InvalidTransaction {
                         index,
-                        reason: format!("Insufficient balance: have {}, need {}", sender_balance, value_str),
+                        reason: format!(
+                            "Insufficient balance: have {}, need {}",
+                            sender_balance, value_str
+                        ),
                     }));
                 }
             }
@@ -311,7 +358,10 @@ async fn validate_transactions(
             if tx.body.nonce < current_nonce {
                 return Err(anyhow!(ValidationError::InvalidTransaction {
                     index,
-                    reason: format!("Nonce too low: current {}, got {}", current_nonce, tx.body.nonce),
+                    reason: format!(
+                        "Nonce too low: current {}, got {}",
+                        current_nonce, tx.body.nonce
+                    ),
                 }));
             }
             // Note: We allow nonce to be higher than current for future transactions,
@@ -330,8 +380,8 @@ async fn validate_transactions(
 /// Check if transaction is a contract creation (no receiver or data but no receiver)
 fn is_contract_creation(tx: &norn_common::types::Transaction) -> bool {
     // Contract creation if receiver is zero address OR data is non-empty with zero receiver
-    tx.body.receiver == Address::default() ||
-    (tx.body.receiver == Address([0u8; 20]) && !tx.body.data.is_empty())
+    tx.body.receiver == Address::default()
+        || (tx.body.receiver == Address([0u8; 20]) && !tx.body.data.is_empty())
 }
 
 /// Validate merkle root of transactions
@@ -532,12 +582,16 @@ mod tests {
         let block2 = create_test_block(1, genesis_hash, base_time + 2);
 
         // Should validate with correct previous
-        assert!(validate_block(&block2, Some(&genesis), &config, None).await.is_ok());
+        assert!(validate_block(&block2, Some(&genesis), &config, None)
+            .await
+            .is_ok());
 
         // Should fail with wrong previous hash
         let block2_wrong = create_test_block(1, Hash::default(), base_time + 3);
         // block2_wrong has wrong prev_block_hash so it should fail
-        assert!(validate_block(&block2_wrong, Some(&genesis), &config, None).await.is_err());
+        assert!(validate_block(&block2_wrong, Some(&genesis), &config, None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -552,7 +606,11 @@ mod tests {
 
         // Empty block should validate even with state manager
         let genesis = create_test_block(0, Hash::default(), Utc::now().timestamp());
-        assert!(validate_block(&genesis, None, &config, Some(&state_manager)).await.is_ok());
+        assert!(
+            validate_block(&genesis, None, &config, Some(&state_manager))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -568,4 +626,29 @@ mod tests {
         let genesis = create_test_block(0, Hash::default(), Utc::now().timestamp());
         assert!(validate_block(&genesis, None, &config, None).await.is_ok());
     }
+}
+
+/// Validate a standalone protocol-v2 transaction before it enters a pool or
+/// an execution overlay. This path never accepts legacy inclusion metadata.
+pub fn validate_transaction_v2(
+    tx: &TransactionV2,
+    context: &ChainContext,
+    config: &ValidationConfig,
+) -> Result<()> {
+    if tx.protocol_version != context.protocol_version || tx.chain_id != context.chain_id {
+        return Err(anyhow!("TransactionV2 chain context mismatch"));
+    }
+    let size = bincode::serialize(tx)?.len();
+    if size > config.max_transaction_size {
+        return Err(anyhow!("TransactionV2 exceeds Genesis byte limit"));
+    }
+    if tx.gas_limit > config.max_transaction_gas as u64 {
+        return Err(anyhow!("TransactionV2 exceeds Genesis gas limit"));
+    }
+    if tx.data.len() > TransactionV2::MAX_FIELD_BYTES {
+        return Err(anyhow!("TransactionV2 data exceeds canonical field limit"));
+    }
+    tx.validate().map_err(|e| anyhow!(e))?;
+    norn_crypto::transaction::verify_transaction_v2(tx)
+        .map_err(|e| anyhow!("TransactionV2 signature validation failed: {}", e))
 }

@@ -9,7 +9,7 @@ use governor::{
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
-use k256::ecdsa::{SigningKey, signature::Signer, Signature};
+use k256::ecdsa::{signature::Signer, Signature, SigningKey};
 use norn_common::types::Address;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -33,7 +33,11 @@ impl BlockchainRpcClient {
         }
     }
 
-    async fn call(&self, method: &str, params: serde_json::Value) -> FaucetResult<serde_json::Value> {
+    async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> FaucetResult<serde_json::Value> {
         let payload = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -65,9 +69,12 @@ impl BlockchainRpcClient {
     }
 
     pub async fn get_balance(&self, address: &Address) -> FaucetResult<String> {
-        self.call("eth_getBalance", serde_json::json!([format!("0x{}", hex::encode(address.0)), "latest"]))
-            .await
-            .map(|v| v.as_str().unwrap_or("0x0").to_string())
+        self.call(
+            "eth_getBalance",
+            serde_json::json!([format!("0x{}", hex::encode(address.0)), "latest"]),
+        )
+        .await
+        .map(|v| v.as_str().unwrap_or("0x0").to_string())
     }
 
     pub async fn get_transaction_count(&self, address: &Address) -> FaucetResult<u64> {
@@ -119,9 +126,12 @@ impl FaucetService {
     /// Create new faucet service
     pub fn new(config: FaucetConfig, database: FaucetDatabase) -> FaucetResult<Self> {
         // Decode private key
-        let private_key_hex = config.private_key.strip_prefix("0x").unwrap_or(&config.private_key);
-        let private_key_bytes =
-            hex::decode(private_key_hex).map_err(|e| FaucetError::InvalidAddress(format!("Invalid private key: {}", e)))?;
+        let private_key_hex = config
+            .private_key
+            .strip_prefix("0x")
+            .unwrap_or(&config.private_key);
+        let private_key_bytes = hex::decode(private_key_hex)
+            .map_err(|e| FaucetError::InvalidAddress(format!("Invalid private key: {}", e)))?;
 
         // Convert to fixed-size array
         let mut key_array = [0u8; 32];
@@ -144,7 +154,12 @@ impl FaucetService {
         let rpc_client = Arc::new(BlockchainRpcClient::new(config.rpc_url.clone()));
 
         // Create global rate limiter
-        let quota = Quota::per_minute(NonZeroU32::new(config.max_requests_per_window * 60 / config.rate_limit_window_secs as u32).unwrap_or(NonZeroU32::new(10).unwrap()));
+        let quota = Quota::per_minute(
+            NonZeroU32::new(
+                config.max_requests_per_window * 60 / config.rate_limit_window_secs as u32,
+            )
+            .unwrap_or(NonZeroU32::new(10).unwrap()),
+        );
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
 
         // Create IP-specific rate limiter cache
@@ -168,7 +183,11 @@ impl FaucetService {
         ip_addr: IpAddr,
         user_agent: String,
     ) -> FaucetResult<DispenseResponse> {
-        info!("Dispense request for address: 0x{}, IP: {}", hex::encode(address.0), ip_addr);
+        info!(
+            "Dispense request for address: 0x{}, IP: {}",
+            hex::encode(address.0),
+            ip_addr
+        );
 
         // 1. Validate address
         self.validate_address(&address)?;
@@ -215,10 +234,14 @@ impl FaucetService {
     /// Validate address format
     fn validate_address(&self, address: &Address) -> FaucetResult<()> {
         if address.0 == [0u8; 20] {
-            return Err(FaucetError::InvalidAddress("Zero address not allowed".to_string()));
+            return Err(FaucetError::InvalidAddress(
+                "Zero address not allowed".to_string(),
+            ));
         }
         if address.0 == self.faucet_address.0 {
-            return Err(FaucetError::InvalidAddress("Cannot send to faucet address".to_string()));
+            return Err(FaucetError::InvalidAddress(
+                "Cannot send to faucet address".to_string(),
+            ));
         }
         Ok(())
     }
@@ -235,15 +258,18 @@ impl FaucetService {
         let ip_limiter = self
             .ip_rate_limiters
             .try_get_with(ip_key.clone(), async {
-                let quota = Quota::per_hour(NonZeroU32::new(self.config.max_requests_per_window).unwrap_or(NonZeroU32::new(3).unwrap()));
+                let quota = Quota::per_hour(
+                    NonZeroU32::new(self.config.max_requests_per_window)
+                        .unwrap_or(NonZeroU32::new(3).unwrap()),
+                );
                 Ok::<_, FaucetError>(Arc::new(RateLimiter::direct(quota)))
             })
             .await
             .map_err(|e| FaucetError::InternalError(e.to_string()))?;
 
-        ip_limiter.check().map_err(|_| {
-            FaucetError::RateLimitExceeded(self.config.rate_limit_window_secs)
-        })?;
+        ip_limiter
+            .check()
+            .map_err(|_| FaucetError::RateLimitExceeded(self.config.rate_limit_window_secs))?;
 
         debug!("Rate limits passed for IP: {}", ip_addr);
         Ok(())
@@ -254,11 +280,7 @@ impl FaucetService {
         let balance_hex = self.rpc_client.get_balance(&self.faucet_address).await?;
         let balance = u128::from_str_radix(balance_hex.trim_start_matches("0x"), 16).unwrap_or(0);
 
-        let min_balance = self
-            .config
-            .min_balance
-            .parse::<u128>()
-            .unwrap_or(u128::MAX);
+        let min_balance = self.config.min_balance.parse::<u128>().unwrap_or(u128::MAX);
 
         if balance < min_balance {
             warn!("Faucet balance low: {} wei", balance);
@@ -294,9 +316,7 @@ impl FaucetService {
     /// Check max amount per address
     fn check_max_amount_per_address(&self, address: &Address) -> FaucetResult<()> {
         let addr_str = format!("0x{}", hex::encode(address.0));
-        let total = self
-            .database
-            .get_total_amount_for_address(&addr_str)?;
+        let total = self.database.get_total_amount_for_address(&addr_str)?;
 
         let max_amount = self
             .config
@@ -378,7 +398,12 @@ impl FaucetService {
         // Calculate v (recovery ID)
         // For k256, check if s is "low" (less than curve order / 2)
         // This is a simplified check - in production use proper s-value normalization
-        let s_is_low = signature.s().to_bytes().last().map(|&b| b % 2 == 0).unwrap_or(false);
+        let s_is_low = signature
+            .s()
+            .to_bytes()
+            .last()
+            .map(|&b| b % 2 == 0)
+            .unwrap_or(false);
         let v = if chain_id > 0 {
             (chain_id * 2 + 35) as u8 + (s_is_low as u8)
         } else {
@@ -402,10 +427,7 @@ impl FaucetService {
         let tx_hex = format!("0x{}", hex::encode(&tx_bytes));
 
         // Send transaction
-        let tx_hash = self
-            .rpc_client
-            .send_raw_transaction(&tx_hex)
-            .await?;
+        let tx_hash = self.rpc_client.send_raw_transaction(&tx_hex).await?;
 
         info!("Transaction sent: {}", tx_hash);
         Ok(tx_hash)
@@ -413,10 +435,7 @@ impl FaucetService {
 
     /// Get faucet status
     pub async fn get_status(&self) -> FaucetResult<FaucetStatus> {
-        let balance_hex = self
-            .rpc_client
-            .get_balance(&self.faucet_address)
-            .await?;
+        let balance_hex = self.rpc_client.get_balance(&self.faucet_address).await?;
         let balance = u128::from_str_radix(balance_hex.trim_start_matches("0x"), 16).unwrap_or(0);
 
         let stats = self.database.get_statistics()?;

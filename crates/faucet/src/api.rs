@@ -1,7 +1,7 @@
 //! HTTP API for faucet service
 
-use super::service::{DispenseResponse, FaucetService, FaucetStatus};
 use super::error::FaucetResult;
+use super::service::{DispenseResponse, FaucetService, FaucetStatus};
 use axum::{
     extract::{ConnectInfo, State},
     http::HeaderMap,
@@ -42,7 +42,10 @@ pub async fn dispense_handler(
     headers: HeaderMap,
     Json(request): Json<DispenseRequest>,
 ) -> impl IntoResponse {
-    info!("Dispense request from {}: address={}", addr, request.address);
+    info!(
+        "Dispense request from {}: address={}",
+        addr, request.address
+    );
 
     // Parse address
     let address_bytes = if request.address.starts_with("0x") {

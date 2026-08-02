@@ -29,8 +29,6 @@ pub struct Blockchain {
     pub buffer: BlockBuffer,
     pub data_processor: Arc<DataProcessor>,
 
-
-
     // Internal
     pop_rx: tokio::sync::Mutex<mpsc::Receiver<Block>>,
 }
@@ -41,6 +39,20 @@ impl Blockchain {
     /// used by real nodes; legacy helpers remain available for old tests and
     /// non-node callers until the later storage migration phase.
     pub async fn try_new_with_genesis(
+        db: Arc<dyn DBInterface>,
+        genesis: Block,
+        genesis_identity: Hash,
+    ) -> anyhow::Result<Arc<Self>> {
+        Self::initialize_with_genesis(db, genesis, genesis_identity).await
+    }
+
+    /// Strictly initialize or load a chain from a configured Genesis.
+    ///
+    /// A fresh database is considered initialized only after the Genesis
+    /// block, height-zero index, latest pointer, and chain identity have all
+    /// been persisted successfully. No finalizer task is started before that
+    /// point, so a storage error cannot result in a usable-looking node.
+    pub async fn initialize_with_genesis(
         db: Arc<dyn DBInterface>,
         genesis: Block,
         genesis_identity: Hash,
@@ -61,9 +73,8 @@ impl Blockchain {
             }
         }
 
-        let genesis_key = norn_common::utils::db_keys::block_hash_to_db_key(
-            &genesis.header.block_hash,
-        );
+        let genesis_key =
+            norn_common::utils::db_keys::block_hash_to_db_key(&genesis.header.block_hash);
         let stored_genesis = db.get(&genesis_key).await?;
         let has_stored_genesis = stored_genesis.is_some();
         if let Some(bytes) = stored_genesis {
@@ -96,18 +107,22 @@ impl Blockchain {
             }
         }
 
-        let has_existing_chain = stored_identity.is_some()
-            || has_stored_genesis
-            || has_stored_height
-            || has_latest;
-        if has_existing_chain && (!has_stored_genesis || !has_stored_height) {
-            anyhow::bail!("database has chain data but no verifiable Genesis record");
+        let has_existing_chain =
+            stored_identity.is_some() || has_stored_genesis || has_stored_height || has_latest;
+        if has_existing_chain
+            && !(stored_identity.is_some() && has_stored_genesis && has_stored_height && has_latest)
+        {
+            anyhow::bail!("database has incomplete chain initialization");
         }
 
-        let chain = Self::new_with_genesis(db.clone(), genesis).await;
-        if stored_identity.is_none() {
+        let (chain, loaded_from_db) = Self::build_with_genesis(db.clone(), genesis.clone()).await?;
+        if !loaded_from_db {
+            chain.save_block(&genesis).await?;
+            chain.save_latest_index(&genesis.header.block_hash).await?;
             db.insert(identity_key, &genesis_identity.0).await?;
         }
+
+        Self::spawn_finalize_loop(&chain);
         Ok(chain)
     }
 
@@ -121,6 +136,30 @@ impl Blockchain {
     /// Create blockchain with existing blockchain data
     /// Loads existing chain or initializes with given genesis
     pub async fn new_with_genesis(db: Arc<dyn DBInterface>, genesis: Block) -> Arc<Self> {
+        let (chain, loaded_from_db) = Self::build_with_genesis(db, genesis.clone())
+            .await
+            .unwrap_or_else(|e| panic!("failed to construct blockchain: {}", e));
+
+        // This legacy API cannot return a Result. It is retained for old
+        // callers, but it now fails closed instead of returning a partially
+        // initialized chain after a persistence error.
+        if !loaded_from_db {
+            if let Err(e) = chain.save_block(&genesis).await {
+                panic!("failed to persist Genesis block: {}", e);
+            }
+            if let Err(e) = chain.save_latest_index(&genesis.header.block_hash).await {
+                panic!("failed to persist latest Genesis index: {}", e);
+            }
+        }
+
+        Self::spawn_finalize_loop(&chain);
+        chain
+    }
+
+    async fn build_with_genesis(
+        db: Arc<dyn DBInterface>,
+        genesis: Block,
+    ) -> anyhow::Result<(Arc<Self>, bool)> {
         let (pop_tx, pop_rx) = mpsc::channel(128);
         let dp = DataProcessor::new(db.clone());
 
@@ -129,20 +168,19 @@ impl Blockchain {
 
         // Try load latest from DB
         let latest_key = b"latest";
-        if let Ok(Some(hash_bytes)) = db.get(latest_key).await {
-            if hash_bytes.len() == 32 {
-                let mut hash = Hash::default();
-                hash.0.copy_from_slice(&hash_bytes);
-
-                if let Ok(block_bytes) = db.get(&norn_common::utils::db_keys::block_hash_to_db_key(&hash)).await {
-                    if let Some(b_bytes) = block_bytes {
-                        if let Ok(loaded) = norn_common::utils::codec::deserialize::<Block>(&b_bytes) {
-                            latest_block = loaded;
-                            loaded_from_db = true;
-                        }
-                    }
-                }
+        if let Some(hash_bytes) = db.get(latest_key).await? {
+            if hash_bytes.len() != 32 {
+                anyhow::bail!("database latest pointer has an invalid length");
             }
+
+            let hash = Hash::from_slice(&hash_bytes);
+            let block_key = norn_common::utils::db_keys::block_hash_to_db_key(&hash);
+            let block_bytes = db.get(&block_key).await?.ok_or_else(|| {
+                anyhow::anyhow!("database latest pointer references a missing block")
+            })?;
+            latest_block = norn_common::utils::codec::deserialize::<Block>(&block_bytes)
+                .map_err(|e| anyhow::anyhow!("failed to decode latest block: {}", e))?;
+            loaded_from_db = true;
         }
 
         // If not loaded from DB, this is a new chain
@@ -178,26 +216,23 @@ impl Blockchain {
             pop_rx: tokio::sync::Mutex::new(pop_rx),
         });
 
-        // If fresh chain, save genesis
-        if !loaded_from_db {
-            info!("Initializing new blockchain with genesis block");
-            if let Err(e) = chain.save_block(&genesis).await {
-                error!("Failed to save genesis block: {}", e);
-            } else {
-                if let Err(e) = chain.save_latest_index(&genesis.header.block_hash).await {
-                    error!("Failed to save latest index: {}", e);
-                }
-            }
+        if loaded_from_db {
+            info!(
+                "Loaded existing blockchain, latest height: {}",
+                latest_block.header.height
+            );
         } else {
-            info!("Loaded existing blockchain, latest height: {}", latest_block.header.height);
+            info!("Prepared new blockchain with Genesis; persistence is pending");
         }
 
+        Ok((chain, loaded_from_db))
+    }
+
+    fn spawn_finalize_loop(chain: &Arc<Self>) {
         let c = chain.clone();
         tokio::spawn(async move {
             c.finalize_loop().await;
         });
-
-        chain
     }
 
     /// Legacy method for backward compatibility
@@ -214,17 +249,29 @@ impl Blockchain {
 
     /// Commit block to chain: save to DB, update in-memory state, and update latest index
     pub async fn commit_block(&self, block: &Block) -> anyhow::Result<()> {
-        self.save_block(block).await?;
-
+        let mut latest = self.latest_block.write().await;
+        if block.header.height == latest.header.height
+            && block.header.block_hash != latest.header.block_hash
         {
-            let mut latest = self.latest_block.write().await;
-            // Only update if height is greater (simple fork choice)
-            // Or if we trust the caller (like BlockProducer)
-            if block.header.height > latest.header.height {
-                *latest = block.clone();
-                drop(latest); // Unlock
-                self.save_latest_index(&block.header.block_hash).await?;
-            }
+            anyhow::bail!(
+                "refusing to commit a different block at finalized height {}",
+                block.header.height
+            );
+        }
+
+        let advance_tip = block.header.height > latest.header.height;
+        let (mut keys, mut values) = self.block_persistence_batch(block)?;
+        if advance_tip {
+            keys.push(b"latest".to_vec());
+            values.push(block.header.block_hash.0.to_vec());
+        }
+
+        // Block, transactions, height index and (when advancing) latest
+        // pointer are one atomic operation. In-memory state changes only
+        // after apply_batch + flush have succeeded.
+        self.db.batch_insert(&keys, &values).await?;
+        if advance_tip {
+            *latest = block.clone();
         }
         Ok(())
     }
@@ -253,7 +300,7 @@ impl Blockchain {
         let db_key = norn_common::utils::db_keys::block_hash_to_db_key(hash);
         if let Ok(Some(bytes)) = self.db.get(&db_key).await {
             // Deserialize (Karmem or JSON depending on impl. We used JSON/Hex in common/utils/codec for now?)
-            // Go used Karmem. Rust `common::types::Block` derives Serialize/Deserialize (JSON default).  
+            // Go used Karmem. Rust `common::types::Block` derives Serialize/Deserialize (JSON default).
             // We should use a consistent codec.
             // Let's assume JSON for now or use `norn_common::utils::codec::deserialize`.
             if let Ok(block) = norn_common::utils::codec::deserialize::<Block>(&bytes) {
@@ -273,17 +320,17 @@ impl Blockchain {
         // 2. Check DB for Height->Hash mapping
         let key = norn_common::utils::db_keys::block_height_to_db_key(height);
         if let Ok(Some(hash_bytes)) = self.db.get(&key).await {
-             // Go stores Hash bytes directly? Or string?
-             // Go `BlockHeight2DBKey` returns key. Value is Hash?
-             // Let's assume value is Hash bytes.
-             // But wait, we need to know what `SaveBlock` writes.
-             // If we write Hash bytes (32), we can parse.
-             if hash_bytes.len() == 32 {
-                 let mut h = Hash::default();
-                 h.0.copy_from_slice(&hash_bytes);
-                 self.block_height_map.insert(height, h).await;
-                 return self.get_block_by_hash(&h).await;
-             }
+            // Go stores Hash bytes directly? Or string?
+            // Go `BlockHeight2DBKey` returns key. Value is Hash?
+            // Let's assume value is Hash bytes.
+            // But wait, we need to know what `SaveBlock` writes.
+            // If we write Hash bytes (32), we can parse.
+            if hash_bytes.len() == 32 {
+                let mut h = Hash::default();
+                h.0.copy_from_slice(&hash_bytes);
+                self.block_height_map.insert(height, h).await;
+                return self.get_block_by_hash(&h).await;
+            }
         }
         None
     }
@@ -308,7 +355,15 @@ impl Blockchain {
     // --- Persistence ---
 
     pub async fn save_block(&self, block: &Block) -> anyhow::Result<()> {
-        // Batch write: Block, Transactions, Indices
+        let (keys, values) = self.block_persistence_batch(block)?;
+        self.db.batch_insert(&keys, &values).await?;
+        Ok(())
+    }
+
+    fn block_persistence_batch(
+        &self,
+        block: &Block,
+    ) -> anyhow::Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
         let mut keys = Vec::new();
         let mut values = Vec::new();
 
@@ -321,7 +376,7 @@ impl Blockchain {
         values.push(block_data);
 
         // 2. Save Height -> Hash mapping
-        let height_key = norn_common::utils::db_keys::block_height_to_db_key(block.header.height);        
+        let height_key = norn_common::utils::db_keys::block_height_to_db_key(block.header.height);
         keys.push(height_key);
         values.push(block_hash.0.to_vec()); // Store raw 32 bytes hash
 
@@ -341,9 +396,7 @@ impl Blockchain {
             // We'll leave that for integration.
         }
 
-        self.db.batch_insert(&keys, &values).await?;
-
-        Ok(())
+        Ok((keys, values))
     }
 }
 
@@ -374,20 +427,26 @@ fn extract_genesis_params(_block: &Block) -> norn_common::types::GenesisParams {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use norn_common::types::Block;
-    use async_trait::async_trait;
     use anyhow::Result;
+    use async_trait::async_trait;
+    use norn_common::types::Block;
     use std::collections::HashMap;
     use std::sync::Mutex;
     // use norn_common::utils::codec;
 
     struct MockDB {
         store: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+        fail_batch_insert: Mutex<bool>,
+        fail_insert_key: Mutex<Option<Vec<u8>>>,
     }
 
     impl MockDB {
         fn new() -> Self {
-            Self { store: Mutex::new(HashMap::new()) }
+            Self {
+                store: Mutex::new(HashMap::new()),
+                fail_batch_insert: Mutex::new(false),
+                fail_insert_key: Mutex::new(None),
+            }
         }
     }
 
@@ -398,6 +457,9 @@ mod tests {
             Ok(store.get(key).cloned())
         }
         async fn insert(&self, key: &[u8], value: &[u8]) -> Result<()> {
+            if self.fail_insert_key.lock().unwrap().as_deref() == Some(key) {
+                return Err(anyhow::anyhow!("injected insert failure"));
+            }
             let mut store = self.store.lock().unwrap();
             store.insert(key.to_vec(), value.to_vec());
             Ok(())
@@ -408,6 +470,9 @@ mod tests {
             Ok(())
         }
         async fn batch_insert(&self, keys: &[Vec<u8>], values: &[Vec<u8>]) -> Result<()> {
+            if *self.fail_batch_insert.lock().unwrap() {
+                return Err(anyhow::anyhow!("injected batch insert failure"));
+            }
             let mut store = self.store.lock().unwrap();
             for (k, v) in keys.iter().zip(values.iter()) {
                 store.insert(k.clone(), v.clone());
@@ -427,12 +492,12 @@ mod tests {
     async fn test_blockchain_init() {
         let db = Arc::new(MockDB::new());
         let genesis = norn_common::genesis::get_genesis_block();
-        
+
         let chain = Blockchain::new_with_fixed_genesis(db.clone()).await;
-        
+
         let latest = chain.latest_block.read().await;
         assert_eq!(latest.header.block_hash, genesis.header.block_hash);
-        
+
         // Verify DB has genesis
         let key = norn_common::utils::db_keys::block_hash_to_db_key(&genesis.header.block_hash);
         let stored = db.get(&key).await.unwrap();
@@ -444,20 +509,23 @@ mod tests {
         let db = Arc::new(MockDB::new());
         let genesis = Block::default();
         let chain = Blockchain::new_with_fixed_genesis(db).await;
-        
+
         let mut b1 = Block::default();
         b1.header.height = 1;
         b1.header.block_hash.0[0] = 1;
-        
+
         chain.save_block(&b1).await.unwrap();
-        
+
         let retrieved = chain.get_block_by_hash(&b1.header.block_hash).await;
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().header.height, 1);
-        
+
         let retrieved_height = chain.get_block_by_height(1).await;
         assert!(retrieved_height.is_some());
-        assert_eq!(retrieved_height.unwrap().header.block_hash, b1.header.block_hash);
+        assert_eq!(
+            retrieved_height.unwrap().header.block_hash,
+            b1.header.block_hash
+        );
     }
 
     #[tokio::test]
@@ -484,6 +552,52 @@ mod tests {
             .unwrap();
         assert!(
             Blockchain::try_new_with_genesis(mismatched_db, genesis, identity)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_genesis_initialization_propagates_every_persistence_failure() {
+        let genesis_config = norn_common::genesis::GenesisConfig::from_fixed_genesis();
+        let genesis = genesis_config.genesis_block.clone();
+        let identity = genesis_config.genesis_hash();
+
+        let batch_failure = Arc::new(MockDB::new());
+        *batch_failure.fail_batch_insert.lock().unwrap() = true;
+        assert!(Blockchain::initialize_with_genesis(
+            batch_failure.clone(),
+            genesis.clone(),
+            identity,
+        )
+        .await
+        .is_err());
+        assert!(batch_failure
+            .get(norn_common::genesis::GENESIS_IDENTITY_KEY)
+            .await
+            .unwrap()
+            .is_none());
+
+        let latest_failure = Arc::new(MockDB::new());
+        *latest_failure.fail_insert_key.lock().unwrap() = Some(b"latest".to_vec());
+        assert!(Blockchain::initialize_with_genesis(
+            latest_failure.clone(),
+            genesis.clone(),
+            identity,
+        )
+        .await
+        .is_err());
+        assert!(latest_failure
+            .get(norn_common::genesis::GENESIS_IDENTITY_KEY)
+            .await
+            .unwrap()
+            .is_none());
+
+        let identity_failure = Arc::new(MockDB::new());
+        *identity_failure.fail_insert_key.lock().unwrap() =
+            Some(norn_common::genesis::GENESIS_IDENTITY_KEY.to_vec());
+        assert!(
+            Blockchain::initialize_with_genesis(identity_failure, genesis, identity)
                 .await
                 .is_err()
         );

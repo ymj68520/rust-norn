@@ -1,5 +1,5 @@
 use crate::error::{NornError, Result};
-use tracing::{error, warn, debug, instrument};
+use tracing::{debug, error, instrument, warn};
 
 /// Error handling utilities for the norn blockchain
 pub struct ErrorHandler;
@@ -129,26 +129,36 @@ where
     Fut: std::future::Future<Output = Result<T>>,
 {
     let mut attempts = 0;
-    
+
     loop {
         attempts += 1;
         match operation().await {
             Ok(result) => {
                 if attempts > 1 {
-                    debug!("Operation '{}' succeeded after {} attempts", operation_name, attempts);
+                    debug!(
+                        "Operation '{}' succeeded after {} attempts",
+                        operation_name, attempts
+                    );
                 }
                 return Ok(result);
             }
             Err(error) => {
                 if attempts >= max_retries || !ErrorHandler::should_retry(&error) {
-                    error!("Operation '{}' failed after {} attempts: {}", operation_name, attempts, error);
+                    error!(
+                        "Operation '{}' failed after {} attempts: {}",
+                        operation_name, attempts, error
+                    );
                     return Err(error);
                 }
-                
-                warn!("Operation '{}' failed (attempt {}): {}, retrying...", operation_name, attempts, error);
-                
+
+                warn!(
+                    "Operation '{}' failed (attempt {}): {}, retrying...",
+                    operation_name, attempts, error
+                );
+
                 // Exponential backoff
-                let delay = std::time::Duration::from_millis(100 * (2_u64.pow(attempts as u32 - 1)));
+                let delay =
+                    std::time::Duration::from_millis(100 * (2_u64.pow(attempts as u32 - 1)));
                 tokio::time::sleep(delay).await;
             }
         }
@@ -162,10 +172,13 @@ mod tests {
 
     #[test]
     fn test_error_recovery() {
-        let recoverable_error = NornError::Network(NetworkError::ConnectionFailed("test".to_string()));
+        let recoverable_error =
+            NornError::Network(NetworkError::ConnectionFailed("test".to_string()));
         assert!(ErrorHandler::is_recoverable(&recoverable_error));
 
-        let non_recoverable_error = NornError::Crypto(crate::error::CryptoError::InvalidSignature("test".to_string()));
+        let non_recoverable_error = NornError::Crypto(crate::error::CryptoError::InvalidSignature(
+            "test".to_string(),
+        ));
         assert!(!ErrorHandler::is_recoverable(&non_recoverable_error));
     }
 
@@ -174,7 +187,9 @@ mod tests {
         let retryable_error = NornError::Network(NetworkError::Timeout("test".to_string()));
         assert!(ErrorHandler::should_retry(&retryable_error));
 
-        let non_retryable_error = NornError::Validation(crate::error::ValidationError::InvalidBlock("test".to_string()));
+        let non_retryable_error = NornError::Validation(
+            crate::error::ValidationError::InvalidBlock("test".to_string()),
+        );
         assert!(!ErrorHandler::should_retry(&non_retryable_error));
     }
 
@@ -186,7 +201,9 @@ mod tests {
                 call_count += 1;
                 async move {
                     if call_count < 3 {
-                        Err(NornError::Network(NetworkError::Timeout("test".to_string())))
+                        Err(NornError::Network(NetworkError::Timeout(
+                            "test".to_string(),
+                        )))
                     } else {
                         Ok("success")
                     }

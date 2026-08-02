@@ -5,8 +5,8 @@
 
 use axum::{
     extract::{
-        State,
         ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
     },
     response::IntoResponse,
     Router,
@@ -15,12 +15,12 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use norn_common::types::{Address, Block, Hash, Transaction};
 use norn_core::blockchain::Blockchain;
-use norn_common::types::{Transaction, Block, Hash, Address};
 
 /// Log filter for eth_subscribe logs
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -460,7 +460,7 @@ impl WebSocketServer {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/ws", axum::routing::get(ws_handler))
-            .route("/", axum::routing::get(ws_handler))  // Also serve on root
+            .route("/", axum::routing::get(ws_handler)) // Also serve on root
             .with_state((
                 self.broadcaster.clone(),
                 self.blockchain.clone(),
@@ -489,9 +489,7 @@ async fn ws_handler(
         Arc<ConnectionManager>,
     )>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| {
-        handle_socket(socket, broadcaster, blockchain, connection_manager)
-    })
+    ws.on_upgrade(move |socket| handle_socket(socket, broadcaster, blockchain, connection_manager))
 }
 
 /// Handle a WebSocket connection
@@ -506,10 +504,12 @@ async fn handle_socket(
     let conn_id = Uuid::new_v4().to_string();
 
     // Get peer address if available
-    let peer_addr = "unknown".to_string();  // Axum doesn't expose peer addr easily
+    let peer_addr = "unknown".to_string(); // Axum doesn't expose peer addr easily
 
     // Register connection
-    connection_manager.register(conn_id.clone(), peer_addr).await;
+    connection_manager
+        .register(conn_id.clone(), peer_addr)
+        .await;
 
     // Send welcome message
     let welcome = serde_json::json!({
@@ -561,7 +561,8 @@ async fn handle_socket(
                         &mut subscription_counter,
                         &conn_id,
                         &connection_manager,
-                    ).await;
+                    )
+                    .await;
                 } else {
                     let error = WsMessage::error(-32700, "Parse error".to_string());
                     send_json(&sender_for_main_loop, error).await;
@@ -569,7 +570,11 @@ async fn handle_socket(
             }
             Ok(Message::Ping(data)) => {
                 // Respond with pong
-                let _ = sender_for_main_loop.lock().await.send(Message::Pong(data)).await;
+                let _ = sender_for_main_loop
+                    .lock()
+                    .await
+                    .send(Message::Pong(data))
+                    .await;
             }
             Ok(Message::Pong(_)) => {
                 // Ignore pong responses
@@ -614,7 +619,9 @@ async fn handle_client_message(
                         let subscription_id = format!("0x{:x}", subscription_counter);
 
                         subscriptions.insert(subscription_id.clone(), sub_type.clone());
-                        connection_manager.add_subscription(conn_id, sub_type.clone()).await;
+                        connection_manager
+                            .add_subscription(conn_id, sub_type.clone())
+                            .await;
 
                         // Send subscription confirmation
                         let _response = WsMessage::subscription(subscription_id.clone());
@@ -635,7 +642,9 @@ async fn handle_client_message(
 
                         // Start forwarding events for this subscription
                         let filter = if sub_type == SubscriptionType::Logs {
-                            params.get(1).and_then(|f| serde_json::from_value::<LogFilter>(f.clone()).ok())
+                            params
+                                .get(1)
+                                .and_then(|f| serde_json::from_value::<LogFilter>(f.clone()).ok())
                         } else {
                             None
                         };
@@ -648,9 +657,17 @@ async fn handle_client_message(
                             filter,
                         );
 
-                        info!("Connection {} subscribed to {} as {}", conn_id, sub_type.as_str(), subscription_id);
+                        info!(
+                            "Connection {} subscribed to {} as {}",
+                            conn_id,
+                            sub_type.as_str(),
+                            subscription_id
+                        );
                     } else {
-                        let error = WsMessage::error(-32602, format!("Unknown subscription type: {}", subscription_type));
+                        let error = WsMessage::error(
+                            -32602,
+                            format!("Unknown subscription type: {}", subscription_type),
+                        );
                         let _ = event_tx.send(error);
                     }
                 }
@@ -663,7 +680,9 @@ async fn handle_client_message(
             if let Some(params) = req.get("params").and_then(|p| p.as_array()) {
                 if let Some(sub_id) = params.first().and_then(|s| s.as_str()) {
                     if subscriptions.remove(sub_id).is_some() {
-                        connection_manager.remove_subscription(conn_id, sub_id).await;
+                        connection_manager
+                            .remove_subscription(conn_id, sub_id)
+                            .await;
 
                         let response = serde_json::json!({
                             "jsonrpc": "2.0",
@@ -672,7 +691,8 @@ async fn handle_client_message(
                         });
                         info!("Connection {} unsubscribed from {}", conn_id, sub_id);
                     } else {
-                        let error = WsMessage::error(-32000, format!("Subscription not found: {}", sub_id));
+                        let error =
+                            WsMessage::error(-32000, format!("Subscription not found: {}", sub_id));
                         let _ = event_tx.send(error);
                     }
                 }
@@ -782,7 +802,10 @@ fn start_event_forwarding(
 }
 
 /// Send JSON message through the sender
-async fn send_json(sender: &Arc<Mutex<futures::stream::SplitSink<WebSocket, Message>>>, msg: WsMessage) {
+async fn send_json(
+    sender: &Arc<Mutex<futures::stream::SplitSink<WebSocket, Message>>>,
+    msg: WsMessage,
+) {
     let mut s = sender.lock().await;
     if let Ok(text) = serde_json::to_string(&msg) {
         let _ = s.send(Message::Text(text)).await;
@@ -902,10 +925,7 @@ mod tests {
 
         broadcaster.publish_log(log.clone());
 
-        let notification = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            rx.recv()
-        ).await;
+        let notification = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await;
 
         assert!(notification.is_ok());
         assert!(notification.unwrap().is_ok());
@@ -920,8 +940,14 @@ mod tests {
 
     #[test]
     fn test_subscription_type_from_str() {
-        assert_eq!(SubscriptionType::from_str("newHeads"), Some(SubscriptionType::NewHeads));
-        assert_eq!(SubscriptionType::from_str("newPendingTransactions"), Some(SubscriptionType::NewPendingTransactions));
+        assert_eq!(
+            SubscriptionType::from_str("newHeads"),
+            Some(SubscriptionType::NewHeads)
+        );
+        assert_eq!(
+            SubscriptionType::from_str("newPendingTransactions"),
+            Some(SubscriptionType::NewPendingTransactions)
+        );
         assert_eq!(SubscriptionType::from_str("invalid"), None);
     }
 
@@ -936,11 +962,15 @@ mod tests {
     #[tokio::test]
     async fn test_connection_manager() {
         let manager = ConnectionManager::new();
-        manager.register("conn1".to_string(), "127.0.0.1:8080".to_string()).await;
+        manager
+            .register("conn1".to_string(), "127.0.0.1:8080".to_string())
+            .await;
 
         assert_eq!(manager.get_connection_count().await, 1);
 
-        manager.add_subscription("conn1", SubscriptionType::NewHeads).await;
+        manager
+            .add_subscription("conn1", SubscriptionType::NewHeads)
+            .await;
         manager.unregister("conn1").await;
 
         assert_eq!(manager.get_connection_count().await, 0);

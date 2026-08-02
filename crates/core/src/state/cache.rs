@@ -16,19 +16,19 @@
 //! Uses `std::sync::RwLock` for synchronous read/write access to cached state.
 //! Background tasks periodically sync dirty state back to the async state manager.
 
-use norn_common::types::{Address, Hash};
-use norn_common::error::{NornError, Result};
-use super::account::AccountStateManager;
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock as StdRwLock, RwLockWriteGuard};
-use std::time::{Duration, Instant};
-use std::pin::Pin;
-use tracing::{debug, warn, error};
+use super::account::{AccountState, AccountStateManager, AccountType};
+use futures::Future;
 use moka::sync::Cache as MokaCache;
 use moka::sync::CacheBuilder;
+use norn_common::error::{NornError, Result};
+use norn_common::types::{Address, Hash};
 use num_bigint::BigUint;
 use revm::primitives::B256;
-use futures::Future;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock as StdRwLock, RwLockWriteGuard};
+use std::time::{Duration, Instant};
+use tracing::{debug, error, warn};
 
 /// Cached account state
 #[derive(Debug, Clone)]
@@ -98,8 +98,8 @@ impl Default for SyncCacheConfig {
         Self {
             max_cached_accounts: 10_000,
             max_cached_storage_per_account: 1_000,
-            cache_ttl_secs: 300,        // 5 minutes
-            sync_interval_secs: 1,      // Sync every second
+            cache_ttl_secs: 300,   // 5 minutes
+            sync_interval_secs: 1, // Sync every second
             enable_moka_cache: true,
             moka_cache_capacity: 100_000,
         }
@@ -141,8 +141,8 @@ impl SyncStateManager {
             Ok(handle) => (handle, None),
             Err(_) => {
                 // Create a new runtime and keep it alive
-                let runtime = tokio::runtime::Runtime::new()
-                    .expect("Failed to create tokio runtime");
+                let runtime =
+                    tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
                 let handle = runtime.handle().clone();
                 (handle, Some(runtime))
             }
@@ -153,7 +153,7 @@ impl SyncStateManager {
                 MokaCache::builder()
                     .max_capacity(config.moka_cache_capacity as u64)
                     .time_to_live(Duration::from_secs(config.cache_ttl_secs))
-                    .build()
+                    .build(),
             )
         } else {
             None
@@ -179,16 +179,16 @@ impl SyncStateManager {
     fn block_on_async<R, F>(&self, f: F) -> Result<R>
     where
         R: Send + 'static,
-        F: FnOnce(Arc<AccountStateManager>) -> Pin<Box<dyn Future<Output = Result<R>> + Send>> + Send + 'static,
+        F: FnOnce(Arc<AccountStateManager>) -> Pin<Box<dyn Future<Output = Result<R>> + Send>>
+            + Send
+            + 'static,
     {
         let async_manager = Arc::clone(&self.async_manager);
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
                 tokio::task::block_in_place(|| {
-                    handle.block_on(async move {
-                        f(async_manager).await
-                    })
+                    handle.block_on(async move { f(async_manager).await })
                 })
             } else {
                 std::thread::scope(|s| {
@@ -197,16 +197,15 @@ impl SyncStateManager {
                             .enable_all()
                             .build()
                             .unwrap();
-                        rt.block_on(async move {
-                            f(async_manager).await
-                        })
-                    }).join().unwrap()
+                        rt.block_on(async move { f(async_manager).await })
+                    })
+                    .join()
+                    .unwrap()
                 })
             }
         } else {
-            self.runtime_handle.block_on(async move {
-                f(async_manager).await
-            })
+            self.runtime_handle
+                .block_on(async move { f(async_manager).await })
         }
     }
 
@@ -224,11 +223,10 @@ impl SyncStateManager {
 
                 // Sync dirty accounts
                 let dirty_accounts = {
-                    let cache = account_cache.read()
-                        .unwrap_or_else(|e| {
-                            error!("Failed to acquire account cache read lock: {}", e);
-                            std::panic::panic_any("Poisoned lock");
-                        });
+                    let cache = account_cache.read().unwrap_or_else(|e| {
+                        error!("Failed to acquire account cache read lock: {}", e);
+                        std::panic::panic_any("Poisoned lock");
+                    });
 
                     let mut dirty = HashMap::new();
                     for (addr, account) in cache.iter() {
@@ -241,11 +239,10 @@ impl SyncStateManager {
 
                 // Sync dirty storage
                 let dirty_storage = {
-                    let cache = storage_cache.read()
-                        .unwrap_or_else(|e| {
-                            error!("Failed to acquire storage cache read lock: {}", e);
-                            std::panic::panic_any("Poisoned lock");
-                        });
+                    let cache = storage_cache.read().unwrap_or_else(|e| {
+                        error!("Failed to acquire storage cache read lock: {}", e);
+                        std::panic::panic_any("Poisoned lock");
+                    });
 
                     let mut dirty = HashMap::new();
                     for (addr, storage) in cache.iter() {
@@ -262,15 +259,35 @@ impl SyncStateManager {
                     dirty
                 };
 
-                // Apply changes to async state manager
+                // Apply complete account changes to the async state manager.
                 for (addr, account) in dirty_accounts {
-                    // Update balance and nonce in async manager
-                    let balance_biguint: BigUint = account.balance.parse()
+                    let balance_biguint: BigUint = account
+                        .balance
+                        .parse()
                         .unwrap_or_else(|_| BigUint::from(0u64));
-                    if let Err(e) = async_manager.update_balance(&addr, balance_biguint).await {
-                        error!("Failed to sync balance for {:?}: {}", addr, e);
+                    let mut state = async_manager
+                        .get_account(&addr)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| AccountState {
+                            address: addr,
+                            balance: BigUint::from(0u64),
+                            nonce: 0,
+                            code_hash: None,
+                            storage_root: Hash::default(),
+                            account_type: AccountType::Normal,
+                            created_at: 0,
+                            updated_at: 0,
+                            deleted: false,
+                        });
+                    state.balance = balance_biguint;
+                    state.nonce = account.nonce;
+                    state.code_hash =
+                        (account.code_hash != B256::default()).then(|| Hash(account.code_hash.0));
+                    if let Err(e) = async_manager.set_account(&addr, state).await {
+                        error!("Failed to sync account state for {:?}: {}", addr, e);
                     }
-                    // Update nonce would require separate method - for now skip
                 }
 
                 for (addr, slots) in dirty_storage {
@@ -283,22 +300,20 @@ impl SyncStateManager {
 
                 // Mark synced entries as clean
                 {
-                    let mut cache = account_cache.write()
-                        .unwrap_or_else(|e| {
-                            error!("Failed to acquire account cache write lock: {}", e);
-                            std::panic::panic_any("Poisoned lock");
-                        });
+                    let mut cache = account_cache.write().unwrap_or_else(|e| {
+                        error!("Failed to acquire account cache write lock: {}", e);
+                        std::panic::panic_any("Poisoned lock");
+                    });
                     for account in cache.values_mut() {
                         account.dirty = false;
                     }
                 }
 
                 {
-                    let mut cache = storage_cache.write()
-                        .unwrap_or_else(|e| {
-                            error!("Failed to acquire storage cache write lock: {}", e);
-                            std::panic::panic_any("Poisoned lock");
-                        });
+                    let mut cache = storage_cache.write().unwrap_or_else(|e| {
+                        error!("Failed to acquire storage cache write lock: {}", e);
+                        std::panic::panic_any("Poisoned lock");
+                    });
                     for storage in cache.values_mut() {
                         for slot in storage.values_mut() {
                             slot.dirty = false;
@@ -315,7 +330,9 @@ impl SyncStateManager {
     pub fn get_balance(&self, address: &Address) -> Result<String> {
         // Try cache first
         {
-            let cache = self.account_cache.read()
+            let cache = self
+                .account_cache
+                .read()
                 .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
 
             if let Some(account) = cache.get(address) {
@@ -335,14 +352,18 @@ impl SyncStateManager {
         self.block_on_async(move |async_manager| {
             Box::pin(async move {
                 let account = async_manager.get_account(&addr).await?;
-                Ok(account.map(|a| a.balance.to_string()).unwrap_or_else(|| "0".to_string()))
+                Ok(account
+                    .map(|a| a.balance.to_string())
+                    .unwrap_or_else(|| "0".to_string()))
             })
         })
     }
 
     /// Set account balance (synchronous, marks as dirty)
     pub fn set_balance(&self, address: &Address, balance: String) -> Result<()> {
-        let mut cache = self.account_cache.write()
+        let mut cache = self
+            .account_cache
+            .write()
             .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
 
         let account = cache.entry(*address).or_insert_with(|| CachedAccount {
@@ -361,7 +382,10 @@ impl SyncStateManager {
             moka.insert(*address, account.clone());
         }
 
-        debug!("Set balance for {:?} to {} (cached, dirty)", address, account.balance);
+        debug!(
+            "Set balance for {:?} to {} (cached, dirty)",
+            address, account.balance
+        );
         Ok(())
     }
 
@@ -369,7 +393,9 @@ impl SyncStateManager {
     pub fn get_nonce(&self, address: &Address) -> Result<u64> {
         // Try cache first
         {
-            let cache = self.account_cache.read()
+            let cache = self
+                .account_cache
+                .read()
                 .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
 
             if let Some(account) = cache.get(address) {
@@ -387,15 +413,15 @@ impl SyncStateManager {
         // Fall back to async call
         let addr = *address;
         self.block_on_async(move |async_manager| {
-            Box::pin(async move {
-                async_manager.get_nonce(&addr).await
-            })
+            Box::pin(async move { async_manager.get_nonce(&addr).await })
         })
     }
 
     /// Set account nonce (synchronous, marks as dirty)
     pub fn set_nonce(&self, address: &Address, nonce: u64) -> Result<()> {
-        let mut cache = self.account_cache.write()
+        let mut cache = self
+            .account_cache
+            .write()
             .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
 
         let account = cache.entry(*address).or_insert_with(|| CachedAccount {
@@ -422,7 +448,9 @@ impl SyncStateManager {
     pub fn get_code_hash(&self, address: &Address) -> Result<B256> {
         // Try cache first
         {
-            let cache = self.account_cache.read()
+            let cache = self
+                .account_cache
+                .read()
                 .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
 
             if let Some(account) = cache.get(address) {
@@ -442,17 +470,37 @@ impl SyncStateManager {
         self.block_on_async(move |async_manager| {
             Box::pin(async move {
                 let account = async_manager.get_account(&addr).await?;
-                let hash = account.map(|a| a.code_hash.unwrap_or_default()).unwrap_or_default();
+                let hash = account
+                    .map(|a| a.code_hash.unwrap_or_default())
+                    .unwrap_or_default();
                 Ok(B256::from(hash.0))
             })
         })
+    }
+
+    /// Set code hash synchronously and mark the account dirty.
+    pub fn set_code_hash(&self, address: &Address, code_hash: B256) -> Result<()> {
+        let mut cache = self
+            .account_cache
+            .write()
+            .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
+        let account = cache.entry(*address).or_default();
+        account.code_hash = code_hash;
+        account.dirty = true;
+        account.last_access = Instant::now();
+        if let Some(moka) = &self.moka_account_cache {
+            moka.insert(*address, account.clone());
+        }
+        Ok(())
     }
 
     /// Get storage value (synchronous)
     pub fn get_storage(&self, address: &Address, key: &[u8]) -> Result<Option<Vec<u8>>> {
         // Try cache first
         {
-            let cache = self.storage_cache.read()
+            let cache = self
+                .storage_cache
+                .read()
                 .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
 
             if let Some(account_storage) = cache.get(address) {
@@ -466,15 +514,15 @@ impl SyncStateManager {
         let addr = *address;
         let key_vec = key.to_vec();
         self.block_on_async(move |async_manager| {
-            Box::pin(async move {
-                async_manager.get_storage(&addr, &key_vec).await
-            })
+            Box::pin(async move { async_manager.get_storage(&addr, &key_vec).await })
         })
     }
 
     /// Set storage value (synchronous, marks as dirty)
     pub fn set_storage(&self, address: &Address, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        let mut cache = self.storage_cache.write()
+        let mut cache = self
+            .storage_cache
+            .write()
             .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
 
         let account_storage = cache.entry(*address).or_insert_with(HashMap::new);
@@ -483,14 +531,18 @@ impl SyncStateManager {
         if !account_storage.contains_key(&key)
             && account_storage.len() >= self.config.max_cached_storage_per_account
         {
-            return Err(NornError::Internal("Storage cache limit reached".to_string()));
+            return Err(NornError::Internal(
+                "Storage cache limit reached".to_string(),
+            ));
         }
 
-        let slot = account_storage.entry(key.clone()).or_insert_with(|| CachedStorage {
-            value: value.clone(),
-            dirty: true,
-            last_access: Instant::now(),
-        });
+        let slot = account_storage
+            .entry(key.clone())
+            .or_insert_with(|| CachedStorage {
+                value: value.clone(),
+                dirty: true,
+                last_access: Instant::now(),
+            });
 
         slot.value = value;
         slot.dirty = true;
@@ -505,7 +557,9 @@ impl SyncStateManager {
         let account = self.async_manager.get_account(address).await?;
 
         if let Some(acc) = account {
-            let mut cache = self.account_cache.write()
+            let mut cache = self
+                .account_cache
+                .write()
                 .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
 
             let cached = CachedAccount {
@@ -535,85 +589,103 @@ impl SyncStateManager {
         self.block_on_async(move |async_manager| {
             Box::pin(async move {
                 // Flush accounts
-            let accounts_to_flush = {
-                let cache = account_cache.read()
-                    .unwrap_or_else(|e| {
+                let accounts_to_flush = {
+                    let cache = account_cache.read().unwrap_or_else(|e| {
                         error!("Failed to acquire account cache read lock: {}", e);
                         std::panic::panic_any("Poisoned lock");
                     });
 
-                let mut flush_list = HashMap::new();
-                for (addr, account) in cache.iter() {
-                    if account.dirty {
-                        flush_list.insert(*addr, account.clone());
+                    let mut flush_list = HashMap::new();
+                    for (addr, account) in cache.iter() {
+                        if account.dirty {
+                            flush_list.insert(*addr, account.clone());
+                        }
+                    }
+                    flush_list
+                };
+
+                for (addr, account) in accounts_to_flush {
+                    let balance_biguint: BigUint = account
+                        .balance
+                        .parse()
+                        .unwrap_or_else(|_| BigUint::from(0u64));
+                    let mut state = async_manager
+                        .get_account(&addr)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_else(|| AccountState {
+                            address: addr,
+                            balance: BigUint::from(0u64),
+                            nonce: 0,
+                            code_hash: None,
+                            storage_root: Hash::default(),
+                            account_type: AccountType::Normal,
+                            created_at: 0,
+                            updated_at: 0,
+                            deleted: false,
+                        });
+                    state.balance = balance_biguint;
+                    state.nonce = account.nonce;
+                    state.code_hash =
+                        (account.code_hash != B256::default()).then(|| Hash(account.code_hash.0));
+                    if let Err(e) = async_manager.set_account(&addr, state).await {
+                        error!("Failed to flush account state for {:?}: {}", addr, e);
                     }
                 }
-                flush_list
-            };
 
-            for (addr, account) in accounts_to_flush {
-                let balance_biguint: BigUint = account.balance.parse()
-                    .unwrap_or_else(|_| BigUint::from(0u64));
-                if let Err(e) = async_manager.update_balance(&addr, balance_biguint).await {
-                    error!("Failed to flush balance for {:?}: {}", addr, e);
-                }
-            }
-
-            // Flush storage
-            let storage_to_flush = {
-                let cache = storage_cache.read()
-                    .unwrap_or_else(|e| {
+                // Flush storage
+                let storage_to_flush = {
+                    let cache = storage_cache.read().unwrap_or_else(|e| {
                         error!("Failed to acquire storage cache read lock: {}", e);
                         std::panic::panic_any("Poisoned lock");
                     });
 
-                let mut flush_list = HashMap::new();
-                for (addr, storage) in cache.iter() {
-                    let mut dirty_slots = HashMap::new();
-                    for (key, slot) in storage.iter() {
-                        if slot.dirty {
-                            dirty_slots.insert(key.clone(), slot.value.clone());
+                    let mut flush_list = HashMap::new();
+                    for (addr, storage) in cache.iter() {
+                        let mut dirty_slots = HashMap::new();
+                        for (key, slot) in storage.iter() {
+                            if slot.dirty {
+                                dirty_slots.insert(key.clone(), slot.value.clone());
+                            }
+                        }
+                        if !dirty_slots.is_empty() {
+                            flush_list.insert(*addr, dirty_slots);
                         }
                     }
-                    if !dirty_slots.is_empty() {
-                        flush_list.insert(*addr, dirty_slots);
+                    flush_list
+                };
+
+                for (addr, slots) in storage_to_flush {
+                    for (key, value) in slots {
+                        if let Err(e) = async_manager.set_storage(&addr, key, value).await {
+                            error!("Failed to flush storage for {:?}: {}", addr, e);
+                        }
                     }
                 }
-                flush_list
-            };
 
-            for (addr, slots) in storage_to_flush {
-                for (key, value) in slots {
-                    if let Err(e) = async_manager.set_storage(&addr, key, value).await {
-                        error!("Failed to flush storage for {:?}: {}", addr, e);
-                    }
-                }
-            }
-
-            // Mark as clean
-            {
-                let mut cache = account_cache.write()
-                    .unwrap_or_else(|e| {
+                // Mark as clean
+                {
+                    let mut cache = account_cache.write().unwrap_or_else(|e| {
                         error!("Failed to acquire account cache write lock: {}", e);
                         std::panic::panic_any("Poisoned lock");
                     });
-                for account in cache.values_mut() {
-                    account.dirty = false;
+                    for account in cache.values_mut() {
+                        account.dirty = false;
+                    }
                 }
-            }
 
-            {
-                let mut cache = storage_cache.write()
-                    .unwrap_or_else(|e| {
+                {
+                    let mut cache = storage_cache.write().unwrap_or_else(|e| {
                         error!("Failed to acquire storage cache write lock: {}", e);
                         std::panic::panic_any("Poisoned lock");
                     });
-                for storage in cache.values_mut() {
-                    for slot in storage.values_mut() {
-                        slot.dirty = false;
+                    for storage in cache.values_mut() {
+                        for slot in storage.values_mut() {
+                            slot.dirty = false;
+                        }
                     }
                 }
-            }
 
                 debug!("Flush completed");
                 Ok(())
@@ -628,7 +700,9 @@ impl SyncStateManager {
     pub async fn flush_async(&self) -> Result<()> {
         // Flush accounts
         let accounts_to_flush = {
-            let cache = self.account_cache.read()
+            let cache = self
+                .account_cache
+                .read()
                 .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
 
             let mut flush_list = HashMap::new();
@@ -641,16 +715,39 @@ impl SyncStateManager {
         };
 
         for (addr, account) in accounts_to_flush {
-            let balance_biguint: BigUint = account.balance.parse()
+            let balance_biguint: BigUint = account
+                .balance
+                .parse()
                 .unwrap_or_else(|_| BigUint::from(0u64));
-            if let Err(e) = self.async_manager.update_balance(&addr, balance_biguint).await {
-                error!("Failed to flush balance for {:?}: {}", addr, e);
+            let mut state = self
+                .async_manager
+                .get_account(&addr)
+                .await?
+                .unwrap_or_else(|| AccountState {
+                    address: addr,
+                    balance: BigUint::from(0u64),
+                    nonce: 0,
+                    code_hash: None,
+                    storage_root: Hash::default(),
+                    account_type: AccountType::Normal,
+                    created_at: 0,
+                    updated_at: 0,
+                    deleted: false,
+                });
+            state.balance = balance_biguint;
+            state.nonce = account.nonce;
+            state.code_hash =
+                (account.code_hash != B256::default()).then(|| Hash(account.code_hash.0));
+            if let Err(e) = self.async_manager.set_account(&addr, state).await {
+                error!("Failed to flush account state for {:?}: {}", addr, e);
             }
         }
 
         // Flush storage
         let storage_to_flush = {
-            let cache = self.storage_cache.read()
+            let cache = self
+                .storage_cache
+                .read()
                 .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
 
             let mut flush_list = HashMap::new();
@@ -678,7 +775,9 @@ impl SyncStateManager {
 
         // Mark as clean
         {
-            let mut cache = self.account_cache.write()
+            let mut cache = self
+                .account_cache
+                .write()
                 .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
             for account in cache.values_mut() {
                 account.dirty = false;
@@ -686,7 +785,9 @@ impl SyncStateManager {
         }
 
         {
-            let mut cache = self.storage_cache.write()
+            let mut cache = self
+                .storage_cache
+                .write()
                 .map_err(|e| NornError::Internal(format!("Cache lock error: {}", e)))?;
             for storage in cache.values_mut() {
                 for slot in storage.values_mut() {
@@ -715,15 +816,20 @@ impl SyncStateManager {
 
     /// Get cache statistics
     pub fn get_cache_stats(&self) -> CacheStats {
-        let account_count = self.account_cache.read()
+        let account_count = self
+            .account_cache
+            .read()
             .map(|cache| cache.len())
             .unwrap_or(0);
 
-        let storage_count = self.storage_cache.read()
+        let storage_count = self
+            .storage_cache
+            .read()
             .map(|cache| cache.values().map(|m| m.len()).sum())
             .unwrap_or(0);
 
-        let moka_size = self.moka_account_cache
+        let moka_size = self
+            .moka_account_cache
             .as_ref()
             .map(|moka| moka.entry_count())
             .unwrap_or(0);
@@ -746,8 +852,8 @@ pub struct CacheStats {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::account::AccountStateConfig;
+    use super::*;
 
     #[tokio::test]
     async fn test_sync_cache_basic() {
@@ -760,7 +866,9 @@ mod tests {
         let address = Address([1u8; 20]);
 
         // Set balance
-        sync_manager.set_balance(&address, "1000".to_string()).unwrap();
+        sync_manager
+            .set_balance(&address, "1000".to_string())
+            .unwrap();
 
         // Get balance
         let balance = sync_manager.get_balance(&address).unwrap();
@@ -804,7 +912,9 @@ mod tests {
         let value = b"test_value";
 
         // Set storage
-        sync_manager.set_storage(&address, key.to_vec(), value.to_vec()).unwrap();
+        sync_manager
+            .set_storage(&address, key.to_vec(), value.to_vec())
+            .unwrap();
 
         // Get storage
         let retrieved = sync_manager.get_storage(&address, key).unwrap();
@@ -825,7 +935,9 @@ mod tests {
         let address = Address([4u8; 20]);
 
         // Set via sync manager
-        sync_manager.set_balance(&address, "5000".to_string()).unwrap();
+        sync_manager
+            .set_balance(&address, "5000".to_string())
+            .unwrap();
         sync_manager.set_nonce(&address, 10).unwrap();
 
         // Flush to async

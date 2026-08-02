@@ -7,11 +7,11 @@
 //! - Monitoring and metrics
 //! - Web interface
 
+pub mod api;
 pub mod config;
 pub mod database;
 pub mod error;
 pub mod service;
-pub mod api;
 
 pub use config::FaucetConfig;
 pub use database::{DistributionRecord, FaucetDatabase, FaucetStatistics};

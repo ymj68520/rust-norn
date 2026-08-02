@@ -2,11 +2,11 @@
 //!
 //! Handles blockchain reorganizations when a longer chain is discovered.
 
-use std::sync::Arc;
-use norn_core::blockchain::Blockchain;
-use norn_common::types::{Block, Hash};
-use tracing::{info, warn, debug, error};
 use anyhow::Result;
+use norn_common::types::{Block, Hash};
+use norn_core::blockchain::Blockchain;
+use std::sync::Arc;
+use tracing::{debug, error, info, warn};
 
 /// Reorganization result
 #[derive(Debug)]
@@ -47,14 +47,21 @@ impl ReorgHandler {
 
         // If the new block's height is not greater than our current height, no reorg needed
         if new_block.header.height <= current_tip.header.height {
-            debug!("New block height {} is not greater than current height {}, no reorg needed",
-                   new_block.header.height, current_tip.header.height);
+            debug!(
+                "New block height {} is not greater than current height {}, no reorg needed",
+                new_block.header.height, current_tip.header.height
+            );
             return false;
         }
 
         // Check if we can find the new block's parent in our chain
         // If we can't, this might be a completely different chain
-        if self.blockchain.get_block_by_hash(&new_block.header.prev_block_hash).await.is_none() {
+        if self
+            .blockchain
+            .get_block_by_hash(&new_block.header.prev_block_hash)
+            .await
+            .is_none()
+        {
             warn!("New block's parent not found in our chain, reorg may be needed");
             // We should check if the new chain is longer/better
             return true;
@@ -86,20 +93,26 @@ impl ReorgHandler {
 
         let old_tip = self.blockchain.latest_block.read().await.clone();
         let old_tip_hash = old_tip.header.block_hash;
-        let new_tip_hash = new_chain.last().map(|b| b.header.block_hash).unwrap_or_default();
+        let new_tip_hash = new_chain
+            .last()
+            .map(|b| b.header.block_hash)
+            .unwrap_or_default();
 
-        info!("Starting chain reorganization from {:?} to {:?}", old_tip_hash, new_tip_hash);
+        info!(
+            "Starting chain reorganization from {:?} to {:?}",
+            old_tip_hash, new_tip_hash
+        );
 
         // Find the fork point
         let fork_point = self.find_fork_point_internal(&old_tip, &new_chain).await;
 
         let fork_height = match fork_point {
-            Some(ref hash) => {
-                self.blockchain.get_block_by_hash(hash)
-                    .await
-                    .map(|b| b.header.height)
-                    .unwrap_or(0)
-            }
+            Some(ref hash) => self
+                .blockchain
+                .get_block_by_hash(hash)
+                .await
+                .map(|b| b.header.height)
+                .unwrap_or(0),
             None => {
                 error!("Could not find fork point, aborting reorg");
                 return Ok(ReorgResult {
@@ -158,8 +171,10 @@ impl ReorgHandler {
             applied_count += 1;
         }
 
-        info!("Chain reorganization completed: reverted {} blocks, applied {} blocks",
-              reverted_count, applied_count);
+        info!(
+            "Chain reorganization completed: reverted {} blocks, applied {} blocks",
+            reverted_count, applied_count
+        );
 
         Ok(ReorgResult {
             old_tip: old_tip_hash,
@@ -173,26 +188,41 @@ impl ReorgHandler {
     /// Find the common ancestor (fork point) between two chains
     ///
     /// This is the internal implementation that works with an actual chain
-    pub async fn find_fork_point_internal(&self, old_tip: &Block, new_chain: &[Block]) -> Option<Hash> {
-        debug!("Finding fork point between old chain (height {}) and new chain ({} blocks)",
-               old_tip.header.height, new_chain.len());
+    pub async fn find_fork_point_internal(
+        &self,
+        old_tip: &Block,
+        new_chain: &[Block],
+    ) -> Option<Hash> {
+        debug!(
+            "Finding fork point between old chain (height {}) and new chain ({} blocks)",
+            old_tip.header.height,
+            new_chain.len()
+        );
 
         // Start from the new chain's first block and work backwards
         // until we find a block that exists in our current chain
         for block in new_chain.iter().rev() {
             // Check if this block exists in our current chain
-            if let Some(existing) = self.blockchain.get_block_by_hash(&block.header.block_hash).await {
+            if let Some(existing) = self
+                .blockchain
+                .get_block_by_hash(&block.header.block_hash)
+                .await
+            {
                 // Found a common block
-                debug!("Found fork point at height {}: {:?}",
-                       existing.header.height, existing.header.block_hash);
+                debug!(
+                    "Found fork point at height {}: {:?}",
+                    existing.header.height, existing.header.block_hash
+                );
                 return Some(existing.header.block_hash);
             }
 
             // Check if the parent of this block exists in our chain
             let parent_hash = block.header.prev_block_hash;
             if let Some(parent) = self.blockchain.get_block_by_hash(&parent_hash).await {
-                debug!("Found fork point at height {}: {:?}",
-                       parent.header.height, parent.header.block_hash);
+                debug!(
+                    "Found fork point at height {}: {:?}",
+                    parent.header.height, parent.header.block_hash
+                );
                 return Some(parent.header.block_hash);
             }
         }
@@ -208,8 +238,10 @@ impl ReorgHandler {
             // Check if this block is an ancestor of any block in the new chain
             for block in new_chain {
                 if block.header.block_hash == current_hash {
-                    debug!("Found fork point by walking back from old tip: {:?} at height {}",
-                           current_hash, block.header.height);
+                    debug!(
+                        "Found fork point by walking back from old tip: {:?} at height {}",
+                        current_hash, block.header.height
+                    );
                     return Some(current_hash);
                 }
             }
@@ -227,7 +259,8 @@ impl ReorgHandler {
         // If we still haven't found a fork point, check if we share genesis
         if let Some(genesis) = self.blockchain.get_block_by_height(0).await {
             for block in new_chain {
-                if block.header.height == 0 && block.header.block_hash == genesis.header.block_hash {
+                if block.header.height == 0 && block.header.block_hash == genesis.header.block_hash
+                {
                     debug!("Fork point is genesis block");
                     return Some(genesis.header.block_hash);
                 }
@@ -255,10 +288,10 @@ impl ReorgHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use norn_common::traits::DBInterface;
+    use norn_common::types::{Address, Block, BlockHeader, Hash, Transaction, TransactionBody};
     use norn_core::blockchain::Blockchain;
     use norn_storage::SledDB;
-    use norn_common::types::{Block, BlockHeader, Hash, Transaction, TransactionBody, Address};
-    use norn_common::traits::DBInterface;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -314,7 +347,8 @@ mod tests {
 
             // Store in database
             let block_bytes = norn_common::utils::codec::serialize(&block).unwrap();
-            let db_key = norn_common::utils::db_keys::block_hash_to_db_key(&block.header.block_hash);
+            let db_key =
+                norn_common::utils::db_keys::block_hash_to_db_key(&block.header.block_hash);
             let _ = db.insert(&db_key, &block_bytes).await;
         }
 
@@ -327,7 +361,10 @@ mod tests {
         let handler = ReorgHandler::new(blockchain);
 
         // Handler should be created successfully
-        assert_eq!(handler.blockchain.latest_block.read().await.header.height, 3);
+        assert_eq!(
+            handler.blockchain.latest_block.read().await.header.height,
+            3
+        );
     }
 
     #[tokio::test]
@@ -395,12 +432,17 @@ mod tests {
         let tip_hash: Hash = current_tip.header.block_hash;
 
         // Get the parent block
-        let parent_block = handler.blockchain.get_block_by_hash(&current_tip.header.prev_block_hash).await;
+        let parent_block = handler
+            .blockchain
+            .get_block_by_hash(&current_tip.header.prev_block_hash)
+            .await;
         assert!(parent_block.is_some());
         let parent_block = parent_block.unwrap();
 
         // Find fork point between tip and its parent
-        let fork_point = handler.find_fork_point(&tip_hash, &parent_block.header.block_hash).await;
+        let fork_point = handler
+            .find_fork_point(&tip_hash, &parent_block.header.block_hash)
+            .await;
 
         assert!(fork_point.is_some());
         // Should find the parent block as the fork point
@@ -543,10 +585,9 @@ mod tests {
         }
 
         // Find fork point between current tip and competing chain
-        let fork_result: Option<Hash> = handler.find_fork_point_internal(
-            &current_tip,
-            &competing_chain
-        ).await;
+        let fork_result: Option<Hash> = handler
+            .find_fork_point_internal(&current_tip, &competing_chain)
+            .await;
 
         assert!(fork_result.is_some());
         assert_eq!(fork_result.unwrap(), fork_point_hash);

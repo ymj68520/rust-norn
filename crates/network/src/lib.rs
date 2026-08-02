@@ -1,13 +1,13 @@
 pub mod behaviour;
 pub mod behaviour_builder;
-pub mod transport;
-pub mod config;
-pub mod service;
-pub mod messages;
-pub mod event_loop;
-pub mod topics;
 pub mod compression;
+pub mod config;
+pub mod event_loop;
+pub mod messages;
+pub mod service;
+pub mod topics;
+pub mod transport;
 
-pub use service::{NetworkService, NetworkCommand, NetworkEvent};
+pub use compression::{CompressionAlgorithm, CompressionConfig, CompressionLevel, Compressor};
 pub use config::NetworkConfig;
-pub use compression::{Compressor, CompressionConfig, CompressionAlgorithm, CompressionLevel};
+pub use service::{NetworkCommand, NetworkEvent, NetworkService};

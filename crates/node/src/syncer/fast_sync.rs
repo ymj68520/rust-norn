@@ -12,11 +12,11 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{info, debug, warn, error};
+use tracing::{debug, error, info, warn};
 
+use norn_common::types::{Block, BlockHeader, Hash};
 use norn_core::blockchain::Blockchain;
 use norn_network::NetworkService;
-use norn_common::types::{Block, BlockHeader, Hash};
 
 use super::syncer::SyncState;
 
@@ -109,10 +109,7 @@ struct FastSyncState {
 
 impl FastSyncEngine {
     /// Create a new fast sync engine
-    pub fn new(
-        blockchain: Arc<Blockchain>,
-        network: Arc<NetworkService>,
-    ) -> Self {
+    pub fn new(blockchain: Arc<Blockchain>, network: Arc<NetworkService>) -> Self {
         Self::with_config(blockchain, network, FastSyncConfig::default())
     }
 
@@ -198,7 +195,10 @@ impl FastSyncEngine {
         // For now, we'll use the blockchain height plus a reasonable estimate
         let target_height = current_height + 10000; // Assume 10k blocks ahead
 
-        info!("Target height set to {} (current: {})", target_height, current_height);
+        info!(
+            "Target height set to {} (current: {})",
+            target_height, current_height
+        );
         Ok(target_height)
     }
 
@@ -219,10 +219,14 @@ impl FastSyncEngine {
         while current_height < target_height {
             let batch_size = std::cmp::min(
                 self.config.header_batch_size,
-                (target_height - current_height) as usize
+                (target_height - current_height) as usize,
             );
 
-            debug!("Requesting {} headers starting from height {}", batch_size, current_height + 1);
+            debug!(
+                "Requesting {} headers starting from height {}",
+                batch_size,
+                current_height + 1
+            );
 
             // Request headers from network
             let headers = self.request_headers(current_height + 1, batch_size).await?;
@@ -238,8 +242,10 @@ impl FastSyncEngine {
 
             // Update progress
             let progress = (current_height as f64 / target_height as f64) * 100.0;
-            info!("Header download progress: {:.1}% ({}/{})",
-                progress, current_height, target_height);
+            info!(
+                "Header download progress: {:.1}% ({}/{})",
+                progress, current_height, target_height
+            );
         }
 
         // Move to next phase
@@ -263,7 +269,10 @@ impl FastSyncEngine {
         start_height: i64,
         count: usize,
     ) -> Result<Vec<BlockHeader>, FastSyncError> {
-        debug!("Requesting {} headers starting from height {}", count, start_height);
+        debug!(
+            "Requesting {} headers starting from height {}",
+            count, start_height
+        );
 
         // In a real implementation, this would:
         // 1. Send a BlockRequestMessage to network peers
@@ -336,10 +345,7 @@ impl FastSyncEngine {
     }
 
     /// Request block bodies from network
-    async fn request_bodies(
-        &self,
-        headers: &[BlockHeader],
-    ) -> Result<Vec<Block>, FastSyncError> {
+    async fn request_bodies(&self, headers: &[BlockHeader]) -> Result<Vec<Block>, FastSyncError> {
         debug!("Requesting {} block bodies", headers.len());
 
         let mut blocks = Vec::new();

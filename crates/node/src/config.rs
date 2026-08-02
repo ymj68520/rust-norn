@@ -1,10 +1,10 @@
-use serde::Deserialize;
+use k256::ecdsa::VerifyingKey;
 use norn_common::consensus_types::StakeSnapshot;
 use norn_common::genesis::GenesisConfig;
+use norn_common::types::ValidatorId;
 use norn_core::config::CoreConfig;
 use norn_network::config::NetworkConfig;
-use k256::ecdsa::VerifyingKey;
-use norn_common::types::ValidatorId;
+use serde::Deserialize;
 use std::net::SocketAddr;
 
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -133,38 +133,29 @@ pub fn validate_validator_key_match(
     consensus_public_key: [u8; 33],
     vrf_public_key: [u8; 32],
 ) -> anyhow::Result<ValidatorId> {
-    let validator_id = ValidatorId(vrf_public_key);
-    let record = snapshot
+    // ValidatorId is an independent, stable identity. Match both rotating
+    // key records and return the ID declared by Genesis rather than deriving
+    // identity from one of the keys.
+    snapshot
         .validators
-        .get(&validator_id)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "validator key does not match any Genesis ValidatorId {}",
-                validator_id
-            )
-        })?;
-
-    if record.consensus_public_key.0 != consensus_public_key
-        || record.vrf_public_key.0 != vrf_public_key
-    {
-        return Err(anyhow::anyhow!(
-            "validator public keys do not match Genesis record {}",
-            validator_id
-        ));
-    }
-
-    Ok(validator_id)
+        .values()
+        .find(|record| {
+            record.consensus_public_key.0 == consensus_public_key
+                && record.vrf_public_key.0 == vrf_public_key
+        })
+        .map(|record| record.validator_id)
+        .ok_or_else(|| anyhow::anyhow!("validator public keys do not match any Genesis record"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k256::ecdsa::SigningKey;
     use norn_common::consensus_types::ValidatorRecord;
     use norn_common::genesis::GenesisConfig;
     use norn_common::types::{ConsensusPublicKey, VrfPublicKey};
     use norn_core::consensus::types::ElectionMath;
     use norn_crypto::vrf::VRFKeyPair;
-    use k256::ecdsa::SigningKey;
     use tempfile::tempdir;
 
     fn test_core_config() -> CoreConfig {
@@ -203,7 +194,7 @@ mod tests {
             .try_into()
             .unwrap();
         let vrf_bytes = vrf_key.public_key_bytes();
-        let validator_id = ValidatorId(vrf_bytes);
+        let validator_id = ValidatorId([0xA5; 32]);
 
         let snapshot = StakeSnapshot::from_genesis(
             1,
@@ -238,7 +229,8 @@ mod tests {
                 .unwrap();
             let vrf_bytes = vrf_key.public_key_bytes();
             records.push(ValidatorRecord {
-                validator_id: ValidatorId(vrf_bytes),
+                // ValidatorId is deliberately independent from the VRF key.
+                validator_id: ValidatorId([index + 10; 32]),
                 consensus_public_key: ConsensusPublicKey(consensus_bytes),
                 vrf_public_key: VrfPublicKey(vrf_bytes),
                 voting_power: u64::from(index),
@@ -281,11 +273,7 @@ mod tests {
                 assert_eq!(&loaded_snapshot, expected_snapshot);
                 assert_eq!(&sequence, expected_sequence);
             } else {
-                expected = Some((
-                    loaded.context().genesis_hash,
-                    loaded_snapshot,
-                    sequence,
-                ));
+                expected = Some((loaded.context().genesis_hash, loaded_snapshot, sequence));
             }
         }
     }
@@ -411,7 +399,8 @@ impl From<crate::config::LoggingConfig> for crate::logging::LoggingConfig {
             "pretty" | _ => LogFormat::Pretty,
         };
 
-        let outputs = config.outputs
+        let outputs = config
+            .outputs
             .into_iter()
             .map(|s| match s.as_str() {
                 "file" => LogOutput::File,
@@ -433,23 +422,57 @@ impl From<crate::config::LoggingConfig> for crate::logging::LoggingConfig {
 
 // Default functions
 
-fn default_txpool_enabled() -> bool { true }
-fn default_txpool_enhanced() -> bool { true }
-fn default_txpool_max_size() -> usize { 10000 }
-fn default_txpool_expiration() -> i64 { 3600 }
+fn default_txpool_enabled() -> bool {
+    true
+}
+fn default_txpool_enhanced() -> bool {
+    true
+}
+fn default_txpool_max_size() -> usize {
+    10000
+}
+fn default_txpool_expiration() -> i64 {
+    3600
+}
 
-fn default_sync_mode() -> String { "fast".to_string() }
-fn default_sync_header_batch() -> usize { 500 }
-fn default_sync_body_batch() -> usize { 100 }
-fn default_sync_checkpoint() -> u64 { 1000 }
+fn default_sync_mode() -> String {
+    "fast".to_string()
+}
+fn default_sync_header_batch() -> usize {
+    500
+}
+fn default_sync_body_batch() -> usize {
+    100
+}
+fn default_sync_checkpoint() -> u64 {
+    1000
+}
 
-fn default_monitoring_prometheus() -> bool { true }
-fn default_monitoring_prometheus_addr() -> String { "0.0.0.0:9090".to_string() }
-fn default_monitoring_health() -> bool { true }
-fn default_monitoring_health_addr() -> String { "0.0.0.0:8080".to_string() }
+fn default_monitoring_prometheus() -> bool {
+    true
+}
+fn default_monitoring_prometheus_addr() -> String {
+    "0.0.0.0:9090".to_string()
+}
+fn default_monitoring_health() -> bool {
+    true
+}
+fn default_monitoring_health_addr() -> String {
+    "0.0.0.0:8080".to_string()
+}
 
-fn default_logging_level() -> String { "info".to_string() }
-fn default_logging_format() -> String { "json".to_string() }
-fn default_logging_max_file_size() -> u64 { 100 }
-fn default_logging_max_files() -> usize { 10 }
-fn default_logging_compress() -> bool { true }
+fn default_logging_level() -> String {
+    "info".to_string()
+}
+fn default_logging_format() -> String {
+    "json".to_string()
+}
+fn default_logging_max_file_size() -> u64 {
+    100
+}
+fn default_logging_max_files() -> usize {
+    10
+}
+fn default_logging_compress() -> bool {
+    true
+}

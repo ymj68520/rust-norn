@@ -1,7 +1,7 @@
 //! Error types for Solidity compiler integration
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use serde::{Serialize, Deserialize};
 
 /// Result type for Solidity operations
 pub type SolidityResult<T> = Result<T, SolidityError>;

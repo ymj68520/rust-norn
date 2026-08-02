@@ -2,8 +2,8 @@
 //!
 //! This test demonstrates the complete state pruning workflow.
 
-use norn_core::state::{StateHistory, PruningConfig, StatePruningManager};
 use norn_common::types::{Address, Hash};
+use norn_core::state::{PruningConfig, StateHistory, StatePruningManager};
 use num_bigint::BigUint;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,29 +20,35 @@ async fn test_complete_pruning_workflow() {
     // Create some test snapshots
     let mut accounts = HashMap::new();
     let address = Address([1u8; 20]);
-    accounts.insert(address, AccountState {
+    accounts.insert(
         address,
-        balance: BigUint::from(1000u64),
-        nonce: 0,
-        code_hash: None,
-        storage_root: Hash::default(),
-        account_type: AccountType::Normal,
-        created_at: 0,
-        updated_at: 0,
-        deleted: false,
-    });
+        AccountState {
+            address,
+            balance: BigUint::from(1000u64),
+            nonce: 0,
+            code_hash: None,
+            storage_root: Hash::default(),
+            account_type: AccountType::Normal,
+            created_at: 0,
+            updated_at: 0,
+            deleted: false,
+        },
+    );
 
     // Create snapshots at blocks 10000, 11000, 12000, ..., 30000 (21 snapshots)
     // This ensures that when we're at block 30000, we'll keep blocks 20000-30000 (10k max)
     // and prune blocks 10000-19000 (10 snapshots)
     for i in 0..21 {
         let block_number = 10000 + (i * 1000);
-        history.create_snapshot(
-            block_number,
-            Hash([i as u8; 32]),
-            accounts.clone(),
-            Hash([0u8; 32]),
-        ).await.unwrap();
+        history
+            .create_snapshot(
+                block_number,
+                Hash([i as u8; 32]),
+                accounts.clone(),
+                Hash([0u8; 32]),
+            )
+            .await
+            .unwrap();
     }
 
     // Verify we have 21 snapshots
@@ -79,10 +85,10 @@ async fn test_pruning_with_intervals() {
     let manager = StatePruningManager::new(config, history.clone());
 
     // Test should_prune logic
-    assert!(!manager.should_prune(100).await);  // Before interval
-    assert!(!manager.should_prune(199).await);  // Just before interval
-    assert!(manager.should_prune(200).await);   // At interval
-    assert!(manager.should_prune(400).await);   // After interval
+    assert!(!manager.should_prune(100).await); // Before interval
+    assert!(!manager.should_prune(199).await); // Just before interval
+    assert!(manager.should_prune(200).await); // At interval
+    assert!(manager.should_prune(400).await); // After interval
 }
 
 #[tokio::test]
@@ -96,26 +102,32 @@ async fn test_aggressive_pruning() {
     // Create snapshots at blocks 100, 200, ..., 2000
     let mut accounts = HashMap::new();
     let address = Address([1u8; 20]);
-    accounts.insert(address, AccountState {
+    accounts.insert(
         address,
-        balance: BigUint::from(1000u64),
-        nonce: 0,
-        code_hash: None,
-        storage_root: Hash::default(),
-        account_type: AccountType::Normal,
-        created_at: 0,
-        updated_at: 0,
-        deleted: false,
-    });
+        AccountState {
+            address,
+            balance: BigUint::from(1000u64),
+            nonce: 0,
+            code_hash: None,
+            storage_root: Hash::default(),
+            account_type: AccountType::Normal,
+            created_at: 0,
+            updated_at: 0,
+            deleted: false,
+        },
+    );
 
     for i in 0..20 {
         let block_number = (i + 1) * 100;
-        history.create_snapshot(
-            block_number,
-            Hash([i as u8; 32]),
-            accounts.clone(),
-            Hash([0u8; 32]),
-        ).await.unwrap();
+        history
+            .create_snapshot(
+                block_number,
+                Hash([i as u8; 32]),
+                accounts.clone(),
+                Hash([0u8; 32]),
+            )
+            .await
+            .unwrap();
     }
 
     // At block 5000, aggressive pruning should remove almost everything

@@ -105,8 +105,6 @@ impl AsRef<[u8]> for Address {
 
 pub struct PublicKey(pub [u8; PUBLIC_KEY_LENGTH]);
 
-
-
 impl Default for PublicKey {
     fn default() -> Self {
         Self([0u8; PUBLIC_KEY_LENGTH])
@@ -188,7 +186,9 @@ impl<'de> Deserialize<'de> for ConsensusPublicKey {
         let s = String::deserialize(deserializer)?;
         let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
         if bytes.len() != 33 {
-            return Err(serde::de::Error::custom("Invalid ConsensusPublicKey length"));
+            return Err(serde::de::Error::custom(
+                "Invalid ConsensusPublicKey length",
+            ));
         }
         let mut arr = [0u8; 33];
         arr.copy_from_slice(&bytes);
@@ -300,56 +300,32 @@ pub struct ChainId(pub Hash);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
 pub struct BlockId(pub Hash);
 
-
-
 impl fmt::Debug for PublicKey {
-
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-
         write!(f, "PublicKey({})", hex::encode(self.0))
-
     }
-
 }
-
-
 
 impl Serialize for PublicKey {
-
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-
     where
-
         S: Serializer,
-
     {
-
         serializer.serialize_str(&hex::encode(self.0))
-
     }
-
 }
 
-
-
 impl<'de> Deserialize<'de> for PublicKey {
-
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-
     where
-
         D: Deserializer<'de>,
-
     {
-
         let s = String::deserialize(deserializer)?;
 
         let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
 
         if bytes.len() != PUBLIC_KEY_LENGTH {
-
             return Err(serde::de::Error::custom("Invalid public key length"));
-
         }
 
         let mut arr = [0u8; PUBLIC_KEY_LENGTH];
@@ -357,12 +333,8 @@ impl<'de> Deserialize<'de> for PublicKey {
         arr.copy_from_slice(&bytes);
 
         Ok(PublicKey(arr))
-
     }
-
 }
-
-
 
 // --- Domain Structs ---
 
@@ -376,11 +348,360 @@ pub enum TransactionType {
     EVM,
 }
 
+/// Stable identifier of a signed TransactionV2.
+///
+/// The identifier is deliberately not a field of the signed preimage. It is
+/// derived after the signature is attached, which prevents a self-referential
+/// hash while keeping the signature committed by the transaction ID.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
+pub struct TransactionId(pub Hash);
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TransactionV2Error {
+    #[error("transaction protocol version must be non-zero")]
+    InvalidProtocolVersion,
+    #[error("transaction chain ID must be non-zero")]
+    InvalidChainId,
+    #[error("transaction sender must be non-zero")]
+    InvalidSender,
+    #[error("transaction gas limit must be non-zero")]
+    InvalidGasLimit,
+    #[error("transaction fee bounds are invalid")]
+    InvalidFeeBounds,
+    #[error("transaction signature must be a non-zero 64-byte value")]
+    InvalidSignature,
+    #[error("transaction public key must be non-zero")]
+    InvalidPublicKey,
+    #[error("transaction ID does not match its canonical bytes")]
+    InvalidTransactionId,
+    #[error("transaction field is too large for canonical encoding")]
+    FieldTooLarge,
+}
+
+/// Protocol-v2 transaction object.
+///
+/// This object is the only transaction shape permitted by the new protocol
+/// path. Inclusion metadata (`height`, `index`, and `block_hash`) is not part
+/// of it; those values are derived from the containing block when needed for
+/// receipts and indexing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransactionV2 {
+    pub protocol_version: ProtocolVersion,
+    pub chain_id: ChainId,
+    pub nonce: u64,
+    pub sender: Address,
+    pub receiver: Option<Address>,
+    pub value: u128,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u64,
+    pub max_priority_fee_per_gas: u64,
+    #[serde(with = "hex_serde")]
+    pub data: Vec<u8>,
+    #[serde(with = "hex_serde")]
+    pub event: Vec<u8>,
+    #[serde(with = "hex_serde")]
+    pub opt: Vec<u8>,
+    #[serde(with = "hex_serde")]
+    pub state: Vec<u8>,
+    pub expire: Option<u64>,
+    pub timestamp: u64,
+    pub tx_type: TransactionType,
+    pub access_list: Vec<AccessListItem>,
+    pub public_key: PublicKey,
+    #[serde(with = "hex_serde_fixed_64")]
+    pub signature: [u8; 64],
+    pub transaction_id: TransactionId,
+}
+
+impl Default for TransactionV2 {
+    fn default() -> Self {
+        Self {
+            protocol_version: ProtocolVersion::default(),
+            chain_id: ChainId::default(),
+            nonce: 0,
+            sender: Address::default(),
+            receiver: None,
+            value: 0,
+            gas_limit: 0,
+            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: 0,
+            data: Vec::new(),
+            event: Vec::new(),
+            opt: Vec::new(),
+            state: Vec::new(),
+            expire: None,
+            timestamp: 0,
+            tx_type: TransactionType::default(),
+            access_list: Vec::new(),
+            public_key: PublicKey::default(),
+            signature: [0u8; 64],
+            transaction_id: TransactionId::default(),
+        }
+    }
+}
+
+impl TransactionV2 {
+    pub const DOMAIN: &'static [u8] = b"NORN_TRANSACTION_V2";
+    pub const MAX_FIELD_BYTES: usize = 256 * 1024;
+    /// Maximum encoded transaction size accepted by the protocol wire.
+    ///
+    /// This is a protocol ceiling, not a node-local tuning option. Genesis
+    /// may select a lower transaction limit, but no node may raise it.
+    pub const MAX_WIRE_BYTES: usize = 256 * 1024;
+
+    /// Bytes signed by the sender. The signature and transaction ID are
+    /// intentionally excluded from this preimage.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, TransactionV2Error> {
+        let mut bytes = Vec::with_capacity(256);
+        bytes.extend_from_slice(Self::DOMAIN);
+        bytes.extend_from_slice(&self.protocol_version.0.to_be_bytes());
+        bytes.extend_from_slice(&self.chain_id.0 .0);
+        bytes.extend_from_slice(&self.nonce.to_be_bytes());
+        bytes.extend_from_slice(&self.sender.0);
+        match self.receiver {
+            Some(receiver) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&receiver.0);
+            }
+            None => bytes.push(0),
+        }
+        bytes.extend_from_slice(&self.value.to_be_bytes());
+        bytes.extend_from_slice(&self.gas_limit.to_be_bytes());
+        bytes.extend_from_slice(&self.max_fee_per_gas.to_be_bytes());
+        bytes.extend_from_slice(&self.max_priority_fee_per_gas.to_be_bytes());
+        bytes.push(match self.tx_type {
+            TransactionType::Native => 0,
+            TransactionType::EVM => 1,
+        });
+        bytes.extend_from_slice(&self.timestamp.to_be_bytes());
+        match self.expire {
+            Some(expire) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&expire.to_be_bytes());
+            }
+            None => bytes.push(0),
+        }
+        append_v2_bytes(&mut bytes, &self.data)?;
+        append_v2_bytes(&mut bytes, &self.event)?;
+        append_v2_bytes(&mut bytes, &self.opt)?;
+        append_v2_bytes(&mut bytes, &self.state)?;
+        let access_list_len =
+            u32::try_from(self.access_list.len()).map_err(|_| TransactionV2Error::FieldTooLarge)?;
+        bytes.extend_from_slice(&access_list_len.to_be_bytes());
+        for item in &self.access_list {
+            bytes.extend_from_slice(&item.address.0);
+            let key_count = u32::try_from(item.storage_keys.len())
+                .map_err(|_| TransactionV2Error::FieldTooLarge)?;
+            bytes.extend_from_slice(&key_count.to_be_bytes());
+            for key in &item.storage_keys {
+                bytes.extend_from_slice(&key.0);
+            }
+        }
+        bytes.extend_from_slice(&self.public_key.0);
+        Ok(bytes)
+    }
+
+    /// Canonical wire bytes, including the signature and derived ID.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, TransactionV2Error> {
+        let mut bytes = self.signing_bytes()?;
+        bytes.extend_from_slice(&self.signature);
+        bytes.extend_from_slice(&self.transaction_id.0 .0);
+        Ok(bytes)
+    }
+
+    /// Derive the transaction ID from the signed transaction without any
+    /// inclusion metadata from a block.
+    pub fn calculate_id(&self) -> Result<TransactionId, TransactionV2Error> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"NORN_TRANSACTION_ID_V2");
+        hasher.update(self.signing_bytes()?);
+        hasher.update(self.signature);
+        Ok(TransactionId(Hash(hasher.finalize().into())))
+    }
+
+    pub fn id(&self) -> Hash {
+        self.transaction_id.0
+    }
+
+    /// Decode a transaction received from the context-bound transaction
+    /// topic. The context check happens before the object is admitted to any
+    /// transaction pool, and malformed/unknown transaction shapes fail
+    /// closed instead of falling back to the legacy transaction format.
+    pub fn decode_and_validate(
+        bytes: &[u8],
+        context: &crate::chain_context::ChainContext,
+    ) -> crate::error::Result<Self> {
+        use crate::error::{NetworkError, NornError, ValidationError};
+
+        if bytes.is_empty() || bytes.len() > Self::MAX_WIRE_BYTES {
+            return Err(NornError::Network(NetworkError::Protocol(
+                "transaction wire size is outside the protocol limit".to_owned(),
+            )));
+        }
+
+        let tx = bincode::deserialize::<Self>(bytes).map_err(|e| {
+            NornError::Serialization(format!("invalid TransactionV2 encoding: {e}"))
+        })?;
+        if tx.protocol_version != context.protocol_version {
+            return Err(NornError::Network(NetworkError::Protocol(
+                "transaction protocol version mismatch".to_owned(),
+            )));
+        }
+        if tx.chain_id != context.chain_id {
+            return Err(NornError::Network(NetworkError::Protocol(
+                "transaction chain ID mismatch".to_owned(),
+            )));
+        }
+        tx.validate().map_err(|e| {
+            NornError::Validation(ValidationError::InvalidTransaction(e.to_string()))
+        })?;
+
+        // bincode has a fixed field order, so requiring a byte-for-byte
+        // re-encoding prevents alternate encodings from entering the pool.
+        let canonical = bincode::serialize(&tx).map_err(|e| {
+            NornError::Serialization(format!("failed to re-encode TransactionV2: {e}"))
+        })?;
+        if canonical != bytes {
+            return Err(NornError::Network(NetworkError::Protocol(
+                "non-canonical TransactionV2 encoding".to_owned(),
+            )));
+        }
+        Ok(tx)
+    }
+
+    pub fn validate(&self) -> Result<(), TransactionV2Error> {
+        if self.protocol_version.0 == 0 {
+            return Err(TransactionV2Error::InvalidProtocolVersion);
+        }
+        if self.chain_id.0 == Hash::default() {
+            return Err(TransactionV2Error::InvalidChainId);
+        }
+        if self.sender == Address::default() {
+            return Err(TransactionV2Error::InvalidSender);
+        }
+        if self.gas_limit == 0 {
+            return Err(TransactionV2Error::InvalidGasLimit);
+        }
+        if self.max_fee_per_gas == 0 || self.max_priority_fee_per_gas > self.max_fee_per_gas {
+            return Err(TransactionV2Error::InvalidFeeBounds);
+        }
+        if self.public_key == PublicKey::default() || self.signature == [0u8; 64] {
+            return if self.public_key == PublicKey::default() {
+                Err(TransactionV2Error::InvalidPublicKey)
+            } else {
+                Err(TransactionV2Error::InvalidSignature)
+            };
+        }
+        if self.data.len() > Self::MAX_FIELD_BYTES
+            || self.event.len() > Self::MAX_FIELD_BYTES
+            || self.opt.len() > Self::MAX_FIELD_BYTES
+            || self.state.len() > Self::MAX_FIELD_BYTES
+        {
+            return Err(TransactionV2Error::FieldTooLarge);
+        }
+        if self.calculate_id()? != self.transaction_id {
+            return Err(TransactionV2Error::InvalidTransactionId);
+        }
+        Ok(())
+    }
+}
+
+fn append_v2_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> Result<(), TransactionV2Error> {
+    if value.len() > TransactionV2::MAX_FIELD_BYTES {
+        return Err(TransactionV2Error::FieldTooLarge);
+    }
+    let len = u32::try_from(value.len()).map_err(|_| TransactionV2Error::FieldTooLarge)?;
+    bytes.extend_from_slice(&len.to_be_bytes());
+    bytes.extend_from_slice(value);
+    Ok(())
+}
+
+#[cfg(test)]
+mod transaction_v2_tests {
+    use super::*;
+
+    fn unsigned_transaction() -> TransactionV2 {
+        TransactionV2 {
+            protocol_version: ProtocolVersion(2),
+            chain_id: ChainId(Hash([1; 32])),
+            nonce: 7,
+            sender: Address([2; 20]),
+            receiver: Some(Address([3; 20])),
+            value: 11,
+            gas_limit: 100_000,
+            max_fee_per_gas: 10,
+            max_priority_fee_per_gas: 2,
+            data: vec![4, 5],
+            event: vec![6],
+            opt: vec![7],
+            state: vec![8],
+            expire: Some(99),
+            timestamp: 88,
+            tx_type: TransactionType::Native,
+            access_list: vec![],
+            public_key: PublicKey([9; PUBLIC_KEY_LENGTH]),
+            signature: [10; 64],
+            transaction_id: TransactionId::default(),
+        }
+    }
+
+    #[test]
+    fn transaction_v2_id_is_self_contained_and_stable() {
+        let mut tx = unsigned_transaction();
+        tx.transaction_id = tx.calculate_id().unwrap();
+        assert_eq!(tx.calculate_id().unwrap(), tx.transaction_id);
+        tx.validate().unwrap();
+
+        let json = serde_json::to_value(&tx).unwrap();
+        let object = json.as_object().unwrap();
+        assert!(!object.contains_key("block_hash"));
+        assert!(!object.contains_key("height"));
+        assert!(!object.contains_key("index"));
+    }
+
+    #[test]
+    fn transaction_v2_changes_when_signed_content_changes() {
+        let mut first = unsigned_transaction();
+        first.transaction_id = first.calculate_id().unwrap();
+        let mut second = first.clone();
+        second.timestamp += 1;
+        assert_ne!(
+            first.calculate_id().unwrap(),
+            second.calculate_id().unwrap()
+        );
+    }
+
+    #[test]
+    fn transaction_v2_wire_decode_is_context_bound_and_canonical() {
+        let mut tx = unsigned_transaction();
+        tx.transaction_id = tx.calculate_id().unwrap();
+        let bytes = bincode::serialize(&tx).unwrap();
+        let context = crate::chain_context::ChainContext::new(
+            1,
+            tx.protocol_version,
+            tx.chain_id,
+            Hash([7; HASH_LENGTH]),
+        );
+
+        let decoded = TransactionV2::decode_and_validate(&bytes, &context).unwrap();
+        assert_eq!(decoded, tx);
+
+        let wrong_context = crate::chain_context::ChainContext::new(
+            1,
+            ProtocolVersion(3),
+            tx.chain_id,
+            Hash([7; HASH_LENGTH]),
+        );
+        assert!(TransactionV2::decode_and_validate(&bytes, &wrong_context).is_err());
+        assert!(TransactionV2::decode_and_validate(b"legacy-transaction", &context).is_err());
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-
+#[serde(deny_unknown_fields)]
 pub struct TransactionBody {
-
     pub hash: Hash,
 
     pub address: Address,
@@ -391,36 +712,25 @@ pub struct TransactionBody {
 
     pub nonce: i64,
 
-    #[serde(with = "hex_serde") ]
-
+    #[serde(with = "hex_serde")]
     pub event: Vec<u8>,
 
-    #[serde(with = "hex_serde") ]
-
+    #[serde(with = "hex_serde")]
     pub opt: Vec<u8>,
 
-    #[serde(with = "hex_serde") ]
-
+    #[serde(with = "hex_serde")]
     pub state: Vec<u8>,
 
-    #[serde(with = "hex_serde") ]
-
+    #[serde(with = "hex_serde")]
     pub data: Vec<u8>,
 
     pub expire: i64,
-
-    pub height: i64,
-
-    pub index: i64,
-
-    pub block_hash: Hash,
 
     pub timestamp: i64,
 
     pub public: PublicKey,
 
-    #[serde(with = "hex_serde") ]
-
+    #[serde(with = "hex_serde")]
     pub signature: Vec<u8>,
 
     /// EVM-specific: Transaction type (Native or EVM)
@@ -450,7 +760,6 @@ pub struct TransactionBody {
     /// EIP-1559: Gas price for legacy transactions
     #[serde(default)]
     pub gas_price: Option<u64>,
-
 }
 
 /// Access list item for EIP-2930 and EIP-1559
@@ -462,24 +771,16 @@ pub struct AccessListItem {
     pub storage_keys: Vec<Hash>,
 }
 
-
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 
 pub struct Transaction {
-
     pub body: TransactionBody,
-
 }
-
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)] // Removed Default
 
 pub struct GenesisParams {
-
-    #[serde(with = "hex_serde_fixed_128") ]
-
+    #[serde(with = "hex_serde_fixed_128")]
     pub order: [u8; 128],
 
     pub time_param: i64,
@@ -487,17 +788,11 @@ pub struct GenesisParams {
     pub seed: Hash, // Reusing Hash for [32]byte fields
 
     pub verify_param: Hash,
-
 }
 
-
-
 impl Default for GenesisParams {
-
     fn default() -> Self {
-
         Self {
-
             order: [0u8; GENESIS_ORDER_LENGTH],
 
             time_param: 0,
@@ -505,11 +800,8 @@ impl Default for GenesisParams {
             seed: Hash::default(),
 
             verify_param: Hash::default(),
-
         }
-
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -551,7 +843,7 @@ impl BlockHeader {
         let mut hasher = Sha256::new();
         hasher.update(b"NORN_BLOCK_HEADER_V2");
         hasher.update(&self.protocol_version.0.to_be_bytes());
-        hasher.update(&self.chain_id.0.0);
+        hasher.update(&self.chain_id.0 .0);
         hasher.update(&self.height.to_be_bytes());
         hasher.update(&self.epoch.to_be_bytes());
         hasher.update(&self.round.to_be_bytes());
@@ -573,6 +865,273 @@ impl BlockHeader {
 pub struct Block {
     pub header: BlockHeader,
     pub transactions: Vec<Transaction>,
+}
+
+/// Protocol-v2 block payload.
+///
+/// `Block` remains as an explicitly separate legacy adapter.  A V2 block
+/// never serializes a legacy `Transaction`, so the transaction/block hash
+/// cycle cannot be reintroduced by a caller accidentally constructing the
+/// old shape.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct BlockV2 {
+    pub header: BlockHeader,
+    pub transactions: Vec<TransactionV2>,
+}
+
+impl BlockV2 {
+    pub const MERKLE_LEAF_DOMAIN: &'static [u8] = b"NORN_TX_LEAF_V2";
+    pub const MERKLE_NODE_DOMAIN: &'static [u8] = b"NORN_MERKLE_NODE_V2";
+
+    /// Build the canonical transaction Merkle root.  Transaction IDs are
+    /// already self-contained signed identifiers, so no block inclusion
+    /// metadata enters this commitment.
+    pub fn calculate_merkle_root(transactions: &[TransactionV2]) -> crate::error::Result<Hash> {
+        use sha2::{Digest, Sha256};
+
+        if transactions.is_empty() {
+            return Ok(Hash::default());
+        }
+
+        let mut level: Vec<Hash> = transactions
+            .iter()
+            .map(|tx| {
+                let mut hasher = Sha256::new();
+                hasher.update(Self::MERKLE_LEAF_DOMAIN);
+                hasher.update(tx.transaction_id.0 .0);
+                Hash(hasher.finalize().into())
+            })
+            .collect();
+
+        while level.len() > 1 {
+            let mut next = Vec::with_capacity((level.len() + 1) / 2);
+            for pair in level.chunks(2) {
+                let right = pair.get(1).copied().unwrap_or_default();
+                let mut hasher = Sha256::new();
+                hasher.update(Self::MERKLE_NODE_DOMAIN);
+                hasher.update(pair[0].0);
+                hasher.update(right.0);
+                next.push(Hash(hasher.finalize().into()));
+            }
+            level = next;
+        }
+        Ok(level[0])
+    }
+
+    /// Recompute the header commitments after the transaction list and state
+    /// execution result are finalized.
+    pub fn finalize_header(&mut self) -> crate::error::Result<()> {
+        self.header.merkle_root = Self::calculate_merkle_root(&self.transactions)?;
+        self.header.block_hash = self.header.calculate_hash()?;
+        Ok(())
+    }
+
+    /// Validate structural, context, and Genesis resource invariants before
+    /// a V2 block can enter execution or consensus.
+    pub fn validate_structure(
+        &self,
+        context: &crate::chain_context::ChainContext,
+        limits: &crate::genesis::ProtocolResourceLimits,
+    ) -> crate::error::Result<()> {
+        limits.validate()?;
+        if self.header.protocol_version != context.protocol_version
+            || self.header.chain_id != context.chain_id
+        {
+            return Err(crate::chain_context::protocol_error(
+                "V2 block chain context mismatch",
+            ));
+        }
+        if self.header.height <= 0 {
+            return Err(crate::chain_context::protocol_error(
+                "V2 block height must be non-zero",
+            ));
+        }
+        if self.transactions.len() > limits.max_transactions_per_block as usize {
+            return Err(crate::chain_context::protocol_error(
+                "V2 block transaction count exceeds Genesis limit",
+            ));
+        }
+        if self.header.gas_limit < 0 || self.header.gas_limit as u64 > limits.max_block_gas {
+            return Err(crate::chain_context::protocol_error(
+                "V2 block gas limit is outside Genesis bounds",
+            ));
+        }
+
+        let mut declared_gas = 0u64;
+        for tx in &self.transactions {
+            tx.validate().map_err(|e| {
+                crate::error::NornError::Validation(
+                    crate::error::ValidationError::InvalidTransaction(e.to_string()),
+                )
+            })?;
+            let encoded = bincode::serialize(tx)
+                .map_err(|e| crate::error::NornError::Serialization(e.to_string()))?;
+            if encoded.len() > limits.max_transaction_bytes as usize {
+                return Err(crate::chain_context::protocol_error(
+                    "V2 transaction exceeds Genesis byte limit",
+                ));
+            }
+            if tx.gas_limit > limits.max_transaction_gas {
+                return Err(crate::chain_context::protocol_error(
+                    "V2 transaction exceeds Genesis gas limit",
+                ));
+            }
+            declared_gas = declared_gas
+                .checked_add(tx.gas_limit)
+                .ok_or_else(|| crate::chain_context::protocol_error("V2 block gas overflow"))?;
+        }
+        if declared_gas > limits.max_block_gas || declared_gas > self.header.gas_limit as u64 {
+            return Err(crate::chain_context::protocol_error(
+                "V2 block declared gas exceeds Genesis limit",
+            ));
+        }
+
+        let encoded = bincode::serialize(self)
+            .map_err(|e| crate::error::NornError::Serialization(e.to_string()))?;
+        if encoded.len() > limits.max_block_bytes as usize {
+            return Err(crate::chain_context::protocol_error(
+                "V2 block exceeds Genesis byte limit",
+            ));
+        }
+        if self.header.merkle_root != Self::calculate_merkle_root(&self.transactions)? {
+            return Err(crate::chain_context::protocol_error(
+                "V2 block Merkle root mismatch",
+            ));
+        }
+        if self.header.block_hash == Hash::default()
+            || self.header.block_hash != self.header.calculate_hash()?
+        {
+            return Err(crate::chain_context::protocol_error(
+                "V2 block header hash mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Strictly decode a V2 block and reject alternate/trailing encodings.
+    pub fn decode_and_validate(
+        bytes: &[u8],
+        context: &crate::chain_context::ChainContext,
+        limits: &crate::genesis::ProtocolResourceLimits,
+    ) -> crate::error::Result<Self> {
+        if bytes.is_empty() || bytes.len() > limits.max_block_bytes as usize {
+            return Err(crate::chain_context::protocol_error(
+                "V2 block wire size is outside Genesis limits",
+            ));
+        }
+        let block = bincode::deserialize::<Self>(bytes)
+            .map_err(|e| crate::error::NornError::Serialization(e.to_string()))?;
+        block.validate_structure(context, limits)?;
+        let canonical = bincode::serialize(&block)
+            .map_err(|e| crate::error::NornError::Serialization(e.to_string()))?;
+        if canonical != bytes {
+            return Err(crate::chain_context::protocol_error(
+                "non-canonical V2 block encoding",
+            ));
+        }
+        Ok(block)
+    }
+}
+
+#[cfg(test)]
+mod block_v2_tests {
+    use super::*;
+    use crate::chain_context::ChainContext;
+    use crate::genesis::ProtocolResourceLimits;
+
+    fn transaction() -> TransactionV2 {
+        let mut tx = TransactionV2 {
+            protocol_version: ProtocolVersion(2),
+            chain_id: ChainId(Hash([1; 32])),
+            nonce: 0,
+            sender: Address([2; 20]),
+            receiver: Some(Address([3; 20])),
+            value: 1,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            data: Vec::new(),
+            event: Vec::new(),
+            opt: Vec::new(),
+            state: Vec::new(),
+            expire: None,
+            timestamp: 1,
+            tx_type: TransactionType::Native,
+            access_list: Vec::new(),
+            public_key: PublicKey([4; PUBLIC_KEY_LENGTH]),
+            signature: [5; 64],
+            transaction_id: TransactionId::default(),
+        };
+        tx.transaction_id = tx.calculate_id().unwrap();
+        tx
+    }
+
+    fn context() -> ChainContext {
+        ChainContext::new(2, ProtocolVersion(2), ChainId(Hash([1; 32])), Hash([9; 32]))
+    }
+
+    #[test]
+    fn v2_block_commits_only_self_contained_transaction_ids() {
+        let tx = transaction();
+        let mut block = BlockV2 {
+            header: BlockHeader {
+                protocol_version: ProtocolVersion(2),
+                chain_id: ChainId(Hash([1; 32])),
+                height: 1,
+                epoch: 0,
+                round: 0,
+                timestamp: 1,
+                prev_block_hash: Hash::default(),
+                block_hash: Hash::default(),
+                merkle_root: Hash::default(),
+                state_root: Hash([8; 32]),
+                proposer: ValidatorId([7; 32]),
+                stake_snapshot_hash: StakeSnapshotHash([6; 32]),
+                parent_randomness: Hash([5; 32]),
+                gas_limit: 10_000_000,
+                base_fee: 1,
+                consensus_data_hash: Hash([4; 32]),
+            },
+            transactions: vec![tx.clone()],
+        };
+        block.finalize_header().unwrap();
+        block
+            .validate_structure(&context(), &ProtocolResourceLimits::default())
+            .unwrap();
+
+        let encoded = bincode::serialize(&block).unwrap();
+        let decoded =
+            BlockV2::decode_and_validate(&encoded, &context(), &ProtocolResourceLimits::default())
+                .unwrap();
+        assert_eq!(decoded, block);
+
+        let mut changed = tx;
+        changed.timestamp += 1;
+        changed.transaction_id = changed.calculate_id().unwrap();
+        assert_ne!(
+            BlockV2::calculate_merkle_root(&[changed]).unwrap(),
+            block.header.merkle_root
+        );
+    }
+
+    #[test]
+    fn v2_block_rejects_header_and_merkle_mutation() {
+        let mut block = BlockV2 {
+            header: BlockHeader {
+                protocol_version: ProtocolVersion(2),
+                chain_id: ChainId(Hash([1; 32])),
+                height: 1,
+                gas_limit: 10_000_000,
+                ..BlockHeader::default()
+            },
+            transactions: vec![transaction()],
+        };
+        block.finalize_header().unwrap();
+        block.header.state_root = Hash([2; 32]);
+        assert!(block
+            .validate_structure(&context(), &ProtocolResourceLimits::default())
+            .is_err());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -623,7 +1182,7 @@ mod hex_serde_fixed_128 {
         let s = String::deserialize(deserializer)?;
         let decoded = hex::decode(s).map_err(serde::de::Error::custom)?;
         if decoded.len() != 128 {
-             return Err(serde::de::Error::custom("Invalid length for [u8; 128]"));
+            return Err(serde::de::Error::custom("Invalid length for [u8; 128]"));
         }
         let mut arr = [0u8; 128];
         arr.copy_from_slice(&decoded);

@@ -7,14 +7,14 @@
 //! - Transaction expiration and cleanup
 
 use crate::txpool::{ChainReader, TransactionPool, TxPoolStats as CommonTxPoolStats};
-use norn_common::types::{Hash, Transaction, Address};
-use std::collections::{HashMap, BinaryHeap};
+use norn_common::types::{Address, Hash, Transaction};
+use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use serde::{Deserialize, Serialize};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 const MAX_TX_POOL_SIZE: usize = 20480;
 const MAX_TX_PACKAGE_COUNT: usize = 10000;
@@ -37,9 +37,7 @@ pub struct PrioritizedTransaction {
 
 impl PrioritizedTransaction {
     fn new(tx: Transaction) -> Self {
-        let effective_gas_price = tx.body.max_fee_per_gas
-            .or(tx.body.gas_price)
-            .unwrap_or(0) as u64;
+        let effective_gas_price = tx.body.max_fee_per_gas.or(tx.body.gas_price).unwrap_or(0) as u64;
 
         let added_at = chrono::Utc::now().timestamp();
         let nonce = tx.body.nonce;
@@ -79,8 +77,9 @@ impl PartialOrd for PrioritizedTransaction {
 impl Ord for PrioritizedTransaction {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Higher gas price = higher priority (max-heap pops largest first)
-        self.effective_gas_price.cmp(&other.effective_gas_price)
-            .then_with(|| other.added_at.cmp(&self.added_at))  // Earlier timestamp = higher priority
+        self.effective_gas_price
+            .cmp(&other.effective_gas_price)
+            .then_with(|| other.added_at.cmp(&self.added_at)) // Earlier timestamp = higher priority
     }
 }
 
@@ -137,14 +136,19 @@ impl EnhancedTxPool {
                     // Check if new transaction has higher gas price
                     let txs = self.transactions.read().await;
                     if let Some(existing) = txs.get(&existing_hash) {
-                        let new_gas_price = tx.body.max_fee_per_gas
-                            .or(tx.body.gas_price)
-                            .unwrap_or(0) as u64;
-                        let price_increase = new_gas_price.saturating_sub(existing.effective_gas_price);
+                        let new_gas_price =
+                            tx.body.max_fee_per_gas.or(tx.body.gas_price).unwrap_or(0) as u64;
+                        let price_increase =
+                            new_gas_price.saturating_sub(existing.effective_gas_price);
 
                         // Require at least 10% gas price increase
-                        if price_increase > 0 && price_increase >= (existing.effective_gas_price / 10) {
-                            debug!("Replacing transaction {:?} with higher fee version", existing_hash);
+                        if price_increase > 0
+                            && price_increase >= (existing.effective_gas_price / 10)
+                        {
+                            debug!(
+                                "Replacing transaction {:?} with higher fee version",
+                                existing_hash
+                            );
                             true
                         } else {
                             return Err(TxPoolError::ReplacementFeeTooLow);
@@ -177,7 +181,10 @@ impl EnhancedTxPool {
             txs.insert(hash, prioritized.clone());
             queue.push(prioritized.clone());
 
-            pending.entry(sender).or_insert_with(HashMap::new).insert(nonce, hash);
+            pending
+                .entry(sender)
+                .or_insert_with(HashMap::new)
+                .insert(nonce, hash);
             *size += 1;
         }
 
@@ -407,9 +414,7 @@ impl EnhancedTxPool {
         let size = *self.size.read().await;
         let txs = self.transactions.read().await;
 
-        let total_gas_price: u64 = txs.values()
-            .map(|p| p.effective_gas_price)
-            .sum();
+        let total_gas_price: u64 = txs.values().map(|p| p.effective_gas_price).sum();
 
         let avg_gas_price = if size > 0 {
             total_gas_price / size as u64
@@ -429,7 +434,9 @@ impl EnhancedTxPool {
 #[async_trait]
 impl TransactionPool for EnhancedTxPool {
     async fn add(&self, tx: Transaction) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.add(tx).await.map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        self.add(tx)
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
     }
 
     async fn remove(&self, hash: &Hash) {
@@ -526,14 +533,14 @@ mod tests {
         tx1.body.hash.0[0] = 1;
         tx1.body.gas_price = Some(100);
         tx1.body.max_fee_per_gas = None;
-        tx1.body.address = Address([1u8; 20]);  // Different sender
+        tx1.body.address = Address([1u8; 20]); // Different sender
         tx1.body.nonce = 0;
 
         let mut tx2 = Transaction::default();
         tx2.body.hash.0[0] = 2;
         tx2.body.gas_price = Some(200);
         tx2.body.max_fee_per_gas = None;
-        tx2.body.address = Address([2u8; 20]);  // Different sender
+        tx2.body.address = Address([2u8; 20]); // Different sender
         tx2.body.nonce = 0;
 
         pool.add(tx1.clone()).await.unwrap();

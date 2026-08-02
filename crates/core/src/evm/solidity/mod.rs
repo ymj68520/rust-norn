@@ -32,9 +32,8 @@
 //! ```
 
 use crate::evm::{
-    ABI, ABIParam, ABIType, ABIParamType, EVMConfig, EVMContext, EVMError,
-    EVMExecutor, EVMResult, EVMExecutionResult, ExecutionLog,
-    CodeStorage,
+    ABIParam, ABIParamType, ABIType, CodeStorage, EVMConfig, EVMContext, EVMError,
+    EVMExecutionResult, EVMExecutor, EVMResult, ExecutionLog, ABI,
 };
 use norn_common::types::{Address, Hash};
 use num_bigint::BigUint;
@@ -43,14 +42,14 @@ use tracing::{debug, info, warn};
 
 // Re-export the solidity compiler types for convenience
 pub use norn_solidity::{
-    SolidityCompiler, SolcConfig, OptimizationSettings, EvmVersion,
-    CompiledContract, CompileResult, SolidityError, SolidityResult,
+    CompileResult, CompiledContract, EvmVersion, OptimizationSettings, SolcConfig,
+    SolidityCompiler, SolidityError, SolidityResult,
 };
 
+pub mod bindings;
 pub mod compiler;
 pub mod deployment;
-pub mod bindings;
 
-pub use compiler::{SolidityCompilerExt, NornContractArtifact};
+pub use bindings::{CallResult, ContractBindings};
+pub use compiler::{NornContractArtifact, SolidityCompilerExt};
 pub use deployment::ContractDeployer;
-pub use bindings::{ContractBindings, CallResult};

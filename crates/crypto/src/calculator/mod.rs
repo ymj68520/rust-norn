@@ -1,9 +1,9 @@
 use num_bigint::BigInt;
 use num_traits::Zero;
+use std::ops::Rem;
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{mpsc, RwLock};
-use tracing::{info, debug};
-use std::ops::Rem;
+use tracing::{debug, info};
 
 // Constants
 pub const RESULT_CHANNEL_CAP: usize = 32;
@@ -36,7 +36,11 @@ pub fn get_calculator() -> Option<Arc<Calculator>> {
     CALCULATOR.get().cloned()
 }
 
-pub async fn init_calculator(proof_param: BigInt, order: BigInt, time_param: i64) -> Arc<Calculator> {
+pub async fn init_calculator(
+    proof_param: BigInt,
+    order: BigInt,
+    time_param: i64,
+) -> Arc<Calculator> {
     let (seed_tx, seed_rx) = mpsc::channel(RESULT_CHANNEL_CAP);
     let (prev_proof_tx, prev_proof_rx) = mpsc::channel(RESULT_CHANNEL_CAP);
 
@@ -75,15 +79,15 @@ impl Calculator {
     // Port: VerifyBlockVDF
     pub async fn verify_block_vdf(&self, seed: &BigInt, proof: &BigInt) -> bool {
         let state = self.state.read().await;
-        
+
         if state.prev_seed == *seed || state.seed == *seed {
             return true;
         }
-        
+
         if !state.seed.is_zero() && self.verify(&state.seed, proof, seed) {
             return true;
         }
-        
+
         false
     }
 
@@ -91,19 +95,19 @@ impl Calculator {
     pub async fn append_new_seed(&self, seed: &BigInt, proof: &BigInt) {
         let mut state = self.state.write().await;
         debug!("Current VDF seed: {}", state.seed);
-        
+
         if state.prev_seed == *seed || state.seed == *seed {
             return;
         }
-        
+
         if !state.seed.is_zero() && !self.verify(&state.seed, proof, seed) {
             debug!("Block VDF verify failed");
             return;
         }
-        
+
         state.changed = true;
         debug!("New Seed: {}, Proof: {}", seed, proof);
-        
+
         // Note: We use try_send or send. If channel full, it might delay.
         let _ = self.seed_tx.send(seed.clone()).await;
         let _ = self.prev_proof_tx.send(proof.clone()).await;
@@ -114,23 +118,27 @@ impl Calculator {
         // r = 2
         let mut r = BigInt::from(2);
         let t = BigInt::from(self.time_param);
-        
+
         // r = r^t mod pp
         r = r.modpow(&t, &self.proof_param);
-        
+
         // h = pi^pp mod order
         let mut h = pi.modpow(&self.proof_param, &self.order);
-        
+
         // s = seed^r mod order
         let s = seed.modpow(&r, &self.order);
-        
+
         h = (&h * &s).rem(&self.order);
-        
+
         result == &h
     }
-    
+
     // Port: run loop
-    async fn run_loop(&self, mut seed_rx: mpsc::Receiver<BigInt>, mut prev_proof_rx: mpsc::Receiver<BigInt>) {
+    async fn run_loop(
+        &self,
+        mut seed_rx: mpsc::Receiver<BigInt>,
+        mut prev_proof_rx: mpsc::Receiver<BigInt>,
+    ) {
         while let Some(seed) = seed_rx.recv().await {
             info!("Starting VDF calculation with seed: {}", seed);
 

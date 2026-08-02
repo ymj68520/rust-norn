@@ -2,12 +2,12 @@
 //!
 //! This module provides Prometheus metrics collection for the Norn blockchain node.
 
+use lazy_static::lazy_static;
 use prometheus::{
-    Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, Registry, HistogramOpts, Opts,
-    TextEncoder, Encoder,
+    Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts,
+    Registry, TextEncoder,
 };
 use std::sync::Arc;
-use lazy_static::lazy_static;
 use tracing::{debug, error};
 
 lazy_static! {
@@ -186,23 +186,45 @@ impl MetricsCollector {
         let registry = Registry::new();
 
         // Register all metrics
-        registry.register(Box::new(BLOCK_PRODUCTION_TOTAL.clone())).unwrap();
-        registry.register(Box::new(BLOCK_PRODUCTION_DURATION.clone())).unwrap();
+        registry
+            .register(Box::new(BLOCK_PRODUCTION_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(BLOCK_PRODUCTION_DURATION.clone()))
+            .unwrap();
         registry.register(Box::new(TXPOOL_SIZE.clone())).unwrap();
-        registry.register(Box::new(TXPOOL_ADD_TOTAL.clone())).unwrap();
-        registry.register(Box::new(TXPOOL_REMOVE_TOTAL.clone())).unwrap();
+        registry
+            .register(Box::new(TXPOOL_ADD_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(TXPOOL_REMOVE_TOTAL.clone()))
+            .unwrap();
 
         // Enhanced transaction pool metrics
-        registry.register(Box::new(TXPACKAGED_TOTAL.clone())).unwrap();
-        registry.register(Box::new(TXPOOL_AVG_GAS_PRICE.clone())).unwrap();
-        registry.register(Box::new(TXPOOL_REPLACEMENT_TOTAL.clone())).unwrap();
-        registry.register(Box::new(TXPOOL_EXPIRED_TOTAL.clone())).unwrap();
+        registry
+            .register(Box::new(TXPACKAGED_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(TXPOOL_AVG_GAS_PRICE.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(TXPOOL_REPLACEMENT_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(TXPOOL_EXPIRED_TOTAL.clone()))
+            .unwrap();
 
         // Fast sync metrics
         registry.register(Box::new(SYNC_MODE.clone())).unwrap();
-        registry.register(Box::new(SYNC_BLOCKS_TOTAL.clone())).unwrap();
-        registry.register(Box::new(SYNC_DURATION_SECONDS.clone())).unwrap();
-        registry.register(Box::new(SYNC_CURRENT_BLOCK.clone())).unwrap();
+        registry
+            .register(Box::new(SYNC_BLOCKS_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(SYNC_DURATION_SECONDS.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(SYNC_CURRENT_BLOCK.clone()))
+            .unwrap();
 
         // TPS metrics
         registry.register(Box::new(TPS.clone())).unwrap();
@@ -210,21 +232,49 @@ impl MetricsCollector {
 
         // State pruning metrics
         registry.register(Box::new(PRUNING_TOTAL.clone())).unwrap();
-        registry.register(Box::new(PRUNING_SNAPSHOTS_REMOVED.clone())).unwrap();
-        registry.register(Box::new(PRUNING_CHANGES_REMOVED.clone())).unwrap();
-        registry.register(Box::new(PRUNING_BYTES_SAVED.clone())).unwrap();
-        registry.register(Box::new(PRUNING_DURATION_SECONDS.clone())).unwrap();
-        registry.register(Box::new(PRUNING_LAST_BLOCK.clone())).unwrap();
+        registry
+            .register(Box::new(PRUNING_SNAPSHOTS_REMOVED.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(PRUNING_CHANGES_REMOVED.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(PRUNING_BYTES_SAVED.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(PRUNING_DURATION_SECONDS.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(PRUNING_LAST_BLOCK.clone()))
+            .unwrap();
 
-        registry.register(Box::new(PEER_CONNECTIONS.clone())).unwrap();
-        registry.register(Box::new(NETWORK_BYTES_TOTAL.clone())).unwrap();
-        registry.register(Box::new(CONSENSUS_ROUNDS_TOTAL.clone())).unwrap();
-        registry.register(Box::new(VRF_EXECUTION_DURATION.clone())).unwrap();
-        registry.register(Box::new(VDF_EXECUTION_DURATION.clone())).unwrap();
-        registry.register(Box::new(STORAGE_READ_DURATION.clone())).unwrap();
-        registry.register(Box::new(STORAGE_WRITE_DURATION.clone())).unwrap();
-        registry.register(Box::new(RPC_REQUESTS_TOTAL.clone())).unwrap();
-        registry.register(Box::new(RPC_REQUEST_DURATION.clone())).unwrap();
+        registry
+            .register(Box::new(PEER_CONNECTIONS.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(NETWORK_BYTES_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(CONSENSUS_ROUNDS_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(VRF_EXECUTION_DURATION.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(VDF_EXECUTION_DURATION.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(STORAGE_READ_DURATION.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(STORAGE_WRITE_DURATION.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(RPC_REQUESTS_TOTAL.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(RPC_REQUEST_DURATION.clone()))
+            .unwrap();
 
         Self {
             registry: Arc::new(registry),
@@ -276,13 +326,19 @@ impl MetricsCollector {
 
     /// Update sync metrics
     pub fn update_sync_metrics(&self, node_type: &str, current_block: i64, mode: &str) {
-        SYNC_CURRENT_BLOCK.with_label_values(&[node_type]).set(current_block as f64);
-        SYNC_MODE.with_label_values(&[node_type]).set(if mode == "fast" { 1.0 } else { 0.0 });
+        SYNC_CURRENT_BLOCK
+            .with_label_values(&[node_type])
+            .set(current_block as f64);
+        SYNC_MODE
+            .with_label_values(&[node_type])
+            .set(if mode == "fast" { 1.0 } else { 0.0 });
     }
 
     /// Record block sync
     pub fn record_sync_blocks(&self, mode: &str, count: u64) {
-        SYNC_BLOCKS_TOTAL.with_label_values(&[mode]).inc_by(count as f64);
+        SYNC_BLOCKS_TOTAL
+            .with_label_values(&[mode])
+            .inc_by(count as f64);
     }
 
     /// Update TPS
@@ -291,7 +347,14 @@ impl MetricsCollector {
     }
 
     /// Record pruning operation
-    pub fn record_pruning(&self, block_number: u64, snapshots: u64, changes: u64, bytes_saved: u64, duration_sec: f64) {
+    pub fn record_pruning(
+        &self,
+        block_number: u64,
+        snapshots: u64,
+        changes: u64,
+        bytes_saved: u64,
+        duration_sec: f64,
+    ) {
         PRUNING_TOTAL.inc();
         PRUNING_SNAPSHOTS_REMOVED.inc_by(snapshots as f64);
         PRUNING_CHANGES_REMOVED.inc_by(changes as f64);
@@ -339,7 +402,11 @@ impl HealthStatus {
         let is_healthy = peer_count > 0 && block_height >= 0;
 
         Self {
-            status: if is_healthy { "healthy".to_string() } else { "unhealthy".to_string() },
+            status: if is_healthy {
+                "healthy".to_string()
+            } else {
+                "unhealthy".to_string()
+            },
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds,
             block_height,

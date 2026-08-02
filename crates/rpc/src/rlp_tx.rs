@@ -3,10 +3,12 @@
 //! This module handles parsing of RLP-encoded Ethereum transactions,
 //! supporting legacy, EIP-2930, and EIP-1559 transaction types.
 
-use norn_common::types::{Hash, Transaction, TransactionBody, TransactionType, PublicKey, AccessListItem, Address};
-use rlp::{Rlp, RlpStream, DecoderError};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use k256::ecdsa::{Signature, VerifyingKey};
+use norn_common::types::{
+    AccessListItem, Address, Hash, PublicKey, Transaction, TransactionBody, TransactionType,
+};
+use rlp::{DecoderError, Rlp, RlpStream};
 use std::str::FromStr;
 
 /// Ethereum transaction type identifiers
@@ -73,7 +75,10 @@ impl EthereumTransaction {
 
         let items = rlp.item_count()?;
         if items < 9 {
-            return Err(anyhow!("Invalid legacy transaction: too few items (got {}, expected 9)", items));
+            return Err(anyhow!(
+                "Invalid legacy transaction: too few items (got {}, expected 9)",
+                items
+            ));
         }
 
         let nonce: u64 = rlp.val_at(0)?;

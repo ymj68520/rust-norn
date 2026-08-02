@@ -3,21 +3,20 @@
 //! This module provides the bridge between revm's Database trait and norn's state management.
 //! It uses the SyncStateManager to provide synchronous access to async state operations.
 
+use crate::evm::{CodeStorage, EVMCodeChange};
 use crate::state::cache::SyncStateManager;
-use crate::evm::CodeStorage;
-use norn_common::types::Address;
+use norn_common::types::{Address, Hash};
+use revm::primitives::HashMap as RevmHashMap;
+use revm::DatabaseCommit;
 use revm::{
     primitives::{
-        AccountInfo, Address as RevmAddress, Bytecode, Bytes, HashMap, B256, U256,
-        KECCAK_EMPTY,
+        AccountInfo, Address as RevmAddress, Bytecode, Bytes, HashMap, B256, KECCAK_EMPTY, U256,
     },
     Database,
 };
-use revm::DatabaseCommit;
-use revm::primitives::HashMap as RevmHashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
-use tracing::{debug, warn, error};
+use tracing::{debug, error, warn};
 
 /// Norn database adapter for revm
 ///
@@ -35,6 +34,19 @@ pub struct NornDatabaseAdapter {
 
     /// Current block number
     block_number: u64,
+
+    /// Whether account code lifecycle changes must be rejected. V2 execution
+    /// may instead enable capture through `capture_code_changes`.
+    reject_code_changes: bool,
+
+    /// Whether code lifecycle changes should be returned as a write-set.
+    capture_code_changes: bool,
+
+    /// Code changes collected during the revm commit callback.
+    code_changes: Vec<EVMCodeChange>,
+
+    /// Error captured by the infallible revm `DatabaseCommit` callback.
+    last_commit_error: Option<String>,
 }
 
 impl NornDatabaseAdapter {
@@ -45,6 +57,10 @@ impl NornDatabaseAdapter {
             code_storage: Arc::new(CodeStorage::new()),
             block_hashes: HashMap::default(),
             block_number,
+            reject_code_changes: false,
+            capture_code_changes: false,
+            code_changes: Vec::new(),
+            last_commit_error: None,
         }
     }
 
@@ -59,7 +75,35 @@ impl NornDatabaseAdapter {
             code_storage,
             block_hashes: HashMap::default(),
             block_number,
+            reject_code_changes: false,
+            capture_code_changes: false,
+            code_changes: Vec::new(),
+            last_commit_error: None,
         }
+    }
+
+    /// Create an adapter that captures code lifecycle changes for the V2
+    /// canonical overlay while projecting account/storage changes locally.
+    pub fn with_code_storage_collecting_code_changes(
+        state: SyncStateManager,
+        code_storage: Arc<CodeStorage>,
+        block_number: u64,
+    ) -> Self {
+        let mut adapter = Self::with_code_storage(state, code_storage, block_number);
+        adapter.capture_code_changes = true;
+        adapter
+    }
+
+    /// Create an adapter for callers that do not have a code write-set.
+    /// Keeping this explicit makes unsupported lifecycle changes fail closed.
+    pub fn with_code_storage_rejecting_code_changes(
+        state: SyncStateManager,
+        code_storage: Arc<CodeStorage>,
+        block_number: u64,
+    ) -> Self {
+        let mut adapter = Self::with_code_storage(state, code_storage, block_number);
+        adapter.reject_code_changes = true;
+        adapter
     }
 
     /// Get reference to code storage
@@ -87,35 +131,42 @@ impl NornDatabaseAdapter {
         let norn_address = Address(addr_bytes);
 
         // Get balance
-        let balance_str = self.state.get_balance(&norn_address)
-            .unwrap_or_else(|e| {
-                warn!("Failed to get balance for {:?}: {}", address, e);
-                "0".to_string()
-            });
+        let balance_str = self.state.get_balance(&norn_address).unwrap_or_else(|e| {
+            warn!("Failed to get balance for {:?}: {}", address, e);
+            "0".to_string()
+        });
 
         // Parse balance from string to U256
         let balance = {
-            let balance_u128: u128 = balance_str.parse()
-                .unwrap_or_else(|e| {
-                    warn!("Failed to parse balance '{}' for {:?}: {}", balance_str, address, e);
-                    0
-                });
+            let balance_u128: u128 = balance_str.parse().unwrap_or_else(|e| {
+                warn!(
+                    "Failed to parse balance '{}' for {:?}: {}",
+                    balance_str, address, e
+                );
+                0
+            });
             U256::from(balance_u128)
         };
 
         // Get nonce
-        let nonce = self.state.get_nonce(&norn_address)
-            .unwrap_or_else(|e| {
-                warn!("Failed to get nonce for {:?}: {}", address, e);
-                0
-            });
+        let nonce = self.state.get_nonce(&norn_address).unwrap_or_else(|e| {
+            warn!("Failed to get nonce for {:?}: {}", address, e);
+            0
+        });
 
         // Get code hash
-        let code_hash = self.state.get_code_hash(&norn_address)
-            .unwrap_or_else(|e| {
-                warn!("Failed to get code hash for {:?}: {}", address, e);
-                B256::default()
-            });
+        let code_hash = self.state.get_code_hash(&norn_address).unwrap_or_else(|e| {
+            warn!("Failed to get code hash for {:?}: {}", address, e);
+            B256::default()
+        });
+        // AccountStateManager represents an EOA/no-code account with the
+        // zero hash, while revm uses KECCAK_EMPTY for an existing empty
+        // account.  CREATE collision checks rely on this distinction.
+        let code_hash = if code_hash == B256::default() {
+            KECCAK_EMPTY
+        } else {
+            code_hash
+        };
 
         // Get code if code_hash is not empty
         let code = if code_hash != KECCAK_EMPTY {
@@ -125,12 +176,9 @@ impl NornDatabaseAdapter {
             let norn_hash = norn_common::types::Hash(code_hash.0);
 
             match std::thread::spawn(move || {
-                let rt = tokio::runtime::Runtime::new()
-                    .expect("Failed to create runtime");
+                let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
 
-                rt.block_on(async move {
-                    code_storage_clone.get_code(&norn_hash).await
-                })
+                rt.block_on(async move { code_storage_clone.get_code(&norn_hash).await })
             })
             .join()
             {
@@ -141,7 +189,10 @@ impl NornDatabaseAdapter {
                     Some(Bytecode::new_raw(Bytes::from(bytecode)))
                 }
                 Ok(Ok(None)) => {
-                    debug!("No bytecode found for hash: {}", hex::encode(code_hash.as_slice()));
+                    debug!(
+                        "No bytecode found for hash: {}",
+                        hex::encode(code_hash.as_slice())
+                    );
                     None
                 }
                 Ok(Err(_)) | Err(_) => {
@@ -175,7 +226,10 @@ impl NornDatabaseAdapter {
     ///
     /// Retrieves contract bytecode from CodeStorage.
     pub fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Infallible> {
-        debug!("Getting code by hash: {}", hex::encode(code_hash.as_slice()));
+        debug!(
+            "Getting code by hash: {}",
+            hex::encode(code_hash.as_slice())
+        );
 
         // Convert B256 to norn Hash
         let norn_hash = norn_common::types::Hash(code_hash.0);
@@ -185,12 +239,9 @@ impl NornDatabaseAdapter {
         let code_storage_clone = Arc::clone(&self.code_storage);
 
         match std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new()
-                .expect("Failed to create runtime");
+            let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
 
-            rt.block_on(async move {
-                code_storage_clone.get_code(&norn_hash).await
-            })
+            rt.block_on(async move { code_storage_clone.get_code(&norn_hash).await })
         })
         .join()
         {
@@ -200,7 +251,10 @@ impl NornDatabaseAdapter {
                 Ok(Bytecode::new_raw(Bytes::from(bytecode)))
             }
             Ok(Ok(None)) => {
-                debug!("Code not found for hash: {}", hex::encode(code_hash.as_slice()));
+                debug!(
+                    "Code not found for hash: {}",
+                    hex::encode(code_hash.as_slice())
+                );
                 Ok(Bytecode::default())
             }
             Ok(Err(_)) | Err(_) => {
@@ -211,12 +265,11 @@ impl NornDatabaseAdapter {
     }
 
     /// Get storage value
-    pub fn storage(
-        &mut self,
-        address: RevmAddress,
-        index: U256,
-    ) -> Result<U256, Infallible> {
-        debug!("Getting storage for address: {:?}, index: {}", address, index);
+    pub fn storage(&mut self, address: RevmAddress, index: U256) -> Result<U256, Infallible> {
+        debug!(
+            "Getting storage for address: {:?}, index: {}",
+            address, index
+        );
 
         let addr_bytes: [u8; 20] = address.as_slice().try_into().unwrap_or([0u8; 20]);
         let norn_address = Address(addr_bytes);
@@ -229,7 +282,9 @@ impl NornDatabaseAdapter {
         };
 
         // Get storage value
-        let value = self.state.get_storage(&norn_address, &key)
+        let value = self
+            .state
+            .get_storage(&norn_address, &key)
             .unwrap_or_else(|e| {
                 warn!("Failed to get storage for {:?}: {}", address, e);
                 None
@@ -277,6 +332,110 @@ impl NornDatabaseAdapter {
         warn!("Block hash not found for block number: {}", number);
         Ok(B256::default())
     }
+
+    /// Apply revm's state result to the synchronous cache. The caller decides
+    /// whether that cache belongs to live state or to an isolated projection.
+    pub fn apply_state_changes(
+        &mut self,
+        changes: revm::primitives::HashMap<RevmAddress, revm::primitives::Account>,
+    ) -> anyhow::Result<()> {
+        for (address, account) in changes {
+            if self.reject_code_changes
+                && (account
+                    .status
+                    .contains(revm::primitives::AccountStatus::Created)
+                    || account
+                        .status
+                        .contains(revm::primitives::AccountStatus::SelfDestructed))
+            {
+                return Err(anyhow::anyhow!(
+                    "EVM code creation/destruction is not represented in the V2 execution overlay"
+                ));
+            }
+            let norn_address = Address(
+                address
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid revm account address length"))?,
+            );
+            let code_created = account
+                .status
+                .contains(revm::primitives::AccountStatus::Created);
+            let code_destroyed = account
+                .status
+                .contains(revm::primitives::AccountStatus::SelfDestructed);
+            if code_created || code_destroyed {
+                if !self.capture_code_changes {
+                    return Err(anyhow::anyhow!(
+                        "EVM code creation/destruction requires a canonical code write-set"
+                    ));
+                }
+                let code = if account.info.code_hash == KECCAK_EMPTY {
+                    Vec::new()
+                } else {
+                    account
+                        .info
+                        .code
+                        .as_ref()
+                        .map(|bytecode| bytecode.original_bytes().to_vec())
+                        .unwrap_or_default()
+                };
+                self.code_changes.push(EVMCodeChange {
+                    address: norn_address,
+                    code_hash: Hash(account.info.code_hash.0),
+                    code,
+                    deleted: code_destroyed,
+                });
+                self.state
+                    .set_code_hash(
+                        &norn_address,
+                        if code_destroyed {
+                            B256::default()
+                        } else {
+                            account.info.code_hash
+                        },
+                    )
+                    .map_err(|e| anyhow::anyhow!("failed to cache account code hash: {e}"))?;
+            }
+            self.state
+                .set_balance(&norn_address, account.info.balance.to_string())
+                .map_err(|e| anyhow::anyhow!("failed to cache account balance: {e}"))?;
+            self.state
+                .set_nonce(&norn_address, account.info.nonce)
+                .map_err(|e| anyhow::anyhow!("failed to cache account nonce: {e}"))?;
+
+            for (key, slot) in account.storage {
+                let storage_key = key
+                    .to_be_bytes_vec()
+                    .into_iter()
+                    .skip_while(|byte| *byte == 0)
+                    .collect::<Vec<_>>();
+                let storage_value = slot
+                    .present_value
+                    .to_be_bytes_vec()
+                    .into_iter()
+                    .skip_while(|byte| *byte == 0)
+                    .collect::<Vec<_>>();
+                self.state
+                    .set_storage(&norn_address, storage_key, storage_value)
+                    .map_err(|e| anyhow::anyhow!("failed to cache account storage: {e}"))?;
+            }
+        }
+        self.state
+            .flush()
+            .map_err(|e| anyhow::anyhow!("failed to flush revm state changes: {e}"))?;
+        Ok(())
+    }
+
+    /// Take the error captured by the infallible revm commit callback.
+    pub fn take_commit_error(&mut self) -> Option<String> {
+        self.last_commit_error.take()
+    }
+
+    /// Take the canonical code write-set collected from revm.
+    pub fn take_code_changes(&mut self) -> Vec<EVMCodeChange> {
+        std::mem::take(&mut self.code_changes)
+    }
 }
 
 /// Error type for Norn database adapter
@@ -288,10 +447,7 @@ pub type NornDBError = Infallible;
 impl Database for NornDatabaseAdapter {
     type Error = NornDBError;
 
-    fn basic(
-        &mut self,
-        address: RevmAddress,
-    ) -> Result<Option<AccountInfo>, Self::Error> {
+    fn basic(&mut self, address: RevmAddress) -> Result<Option<AccountInfo>, Self::Error> {
         self.get_account_basic(address)
     }
 
@@ -299,11 +455,7 @@ impl Database for NornDatabaseAdapter {
         self.code_by_hash(code_hash)
     }
 
-    fn storage(
-        &mut self,
-        address: RevmAddress,
-        index: U256,
-    ) -> Result<U256, Self::Error> {
+    fn storage(&mut self, address: RevmAddress, index: U256) -> Result<U256, Self::Error> {
         self.storage(address, index)
     }
 
@@ -316,11 +468,14 @@ impl DatabaseCommit for NornDatabaseAdapter {
     /// Commit state changes
     ///
     /// This is called by revm after transaction execution to persist state changes.
-    fn commit(&mut self, _changes: revm::primitives::HashMap<RevmAddress, revm::primitives::Account>) {
+    fn commit(
+        &mut self,
+        changes: revm::primitives::HashMap<RevmAddress, revm::primitives::Account>,
+    ) {
         debug!("Committing state changes");
 
-        // Flush the sync state manager to persist dirty state to async backend
-        if let Err(e) = self.state.flush() {
+        if let Err(e) = self.apply_state_changes(changes) {
+            self.last_commit_error = Some(e.to_string());
             error!("Failed to flush state changes: {}", e);
         }
 
@@ -331,8 +486,8 @@ impl DatabaseCommit for NornDatabaseAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::account::AccountStateManager;
     use crate::state::account::AccountStateConfig;
+    use crate::state::account::AccountStateManager;
     use crate::state::cache::SyncCacheConfig;
     use std::sync::Arc;
 
@@ -373,7 +528,9 @@ mod tests {
         let revm_address = RevmAddress::from(norn_address.0);
 
         // Set balance via sync state
-        db.state.set_balance(&norn_address, "1000000000000000000".to_string()).unwrap();
+        db.state
+            .set_balance(&norn_address, "1000000000000000000".to_string())
+            .unwrap();
 
         // Get account info
         let account_info = db.basic(revm_address).unwrap();
@@ -402,7 +559,9 @@ mod tests {
             bytes.iter().skip_while(|&&b| b == 0).copied().collect()
         };
         let value = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        db.state.set_storage(&norn_address, key_bytes, value.clone()).unwrap();
+        db.state
+            .set_storage(&norn_address, key_bytes, value.clone())
+            .unwrap();
 
         // Get storage
         let storage_value = db.storage(revm_address, key).unwrap();

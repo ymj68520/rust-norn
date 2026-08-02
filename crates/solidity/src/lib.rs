@@ -9,7 +9,9 @@ pub mod config;
 pub mod error;
 
 // Re-export main types
-pub use artifact::{AbiItem, AbiParam, StateMutability, CompiledContract, CompileResult, SolcOutput};
+pub use artifact::{
+    AbiItem, AbiParam, CompileResult, CompiledContract, SolcOutput, StateMutability,
+};
 pub use compiler::SolidityCompiler;
 pub use config::{EvmVersion, OptimizationSettings, SolcConfig};
 pub use error::{CompilationError, SolidityError, SolidityResult};

@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
-use tracing::{info, error, debug};
+use tracing::{debug, error, info};
 
-use crate::metrics::{MetricsCollector, HealthStatus};
+use crate::metrics::{HealthStatus, MetricsCollector};
 
 /// Component health status
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -134,7 +134,11 @@ async fn detailed_health_handler(
         block_height: get_metric_value(&metrics_collector, "norn_block_height"),
         peer_count: get_metric_value(&metrics_collector, "norn_peer_connections") as usize,
         txpool_size: get_metric_value(&metrics_collector, "norn_txpool_size") as usize,
-        sync_status: if get_metric_value(&metrics_collector, "norn_sync_current_block{node_type=\"validator\"}") > 0 {
+        sync_status: if get_metric_value(
+            &metrics_collector,
+            "norn_sync_current_block{node_type=\"validator\"}",
+        ) > 0
+        {
             "synced".to_string()
         } else {
             "syncing".to_string()
@@ -142,7 +146,11 @@ async fn detailed_health_handler(
     };
 
     let status = DetailedHealthStatus {
-        status: if is_healthy { "healthy".to_string() } else { "degraded".to_string() },
+        status: if is_healthy {
+            "healthy".to_string()
+        } else {
+            "degraded".to_string()
+        },
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: uptime,
         components,
@@ -170,13 +178,21 @@ async fn readiness_handler(
     let checks = vec![
         ComponentHealth {
             name: "peers_connected".to_string(),
-            status: if peer_count > 0 { "pass".to_string() } else { "fail".to_string() },
+            status: if peer_count > 0 {
+                "pass".to_string()
+            } else {
+                "fail".to_string()
+            },
             message: format!("Connected to {} peers", peer_count),
             last_check: chrono::Utc::now().to_rfc3339(),
         },
         ComponentHealth {
             name: "blockchain_initialized".to_string(),
-            status: if block_height >= 0 { "pass".to_string() } else { "fail".to_string() },
+            status: if block_height >= 0 {
+                "pass".to_string()
+            } else {
+                "fail".to_string()
+            },
             message: format!("Block height: {}", block_height),
             last_check: chrono::Utc::now().to_rfc3339(),
         },
@@ -213,7 +229,7 @@ async fn liveness_handler(
         Json(serde_json::json!({
             "status": "alive",
             "uptime_seconds": uptime,
-        }))
+        })),
     )
 }
 
@@ -222,13 +238,11 @@ async fn metrics_handler(
     State((metrics_collector, _)): State<(Arc<MetricsCollector>, Instant)>,
 ) -> impl IntoResponse {
     match metrics_collector.gather() {
-        Ok(metrics) => {
-            (
-                StatusCode::OK,
-                [("Content-Type", "text/plain; version=0.0.4; charset=utf-8")],
-                metrics,
-            )
-        }
+        Ok(metrics) => (
+            StatusCode::OK,
+            [("Content-Type", "text/plain; version=0.0.4; charset=utf-8")],
+            metrics,
+        ),
         Err(e) => {
             error!("Failed to gather metrics: {:?}", e);
             (
@@ -241,10 +255,7 @@ async fn metrics_handler(
 }
 
 /// Check individual component health
-async fn check_component(
-    component: &str,
-    metrics_collector: &MetricsCollector,
-) -> ComponentHealth {
+async fn check_component(component: &str, metrics_collector: &MetricsCollector) -> ComponentHealth {
     let now = chrono::Utc::now().to_rfc3339();
 
     match component {
@@ -252,7 +263,11 @@ async fn check_component(
             let block_height = get_metric_value(metrics_collector, "norn_block_height");
             ComponentHealth {
                 name: "blockchain".to_string(),
-                status: if block_height >= 0 { "healthy".to_string() } else { "unhealthy".to_string() },
+                status: if block_height >= 0 {
+                    "healthy".to_string()
+                } else {
+                    "unhealthy".to_string()
+                },
                 message: format!("Block height: {}", block_height),
                 last_check: now,
             }
@@ -261,7 +276,11 @@ async fn check_component(
             let peer_count = get_metric_value(metrics_collector, "norn_peer_connections");
             ComponentHealth {
                 name: "network".to_string(),
-                status: if peer_count > 0 { "healthy".to_string() } else { "degraded".to_string() },
+                status: if peer_count > 0 {
+                    "healthy".to_string()
+                } else {
+                    "degraded".to_string()
+                },
                 message: format!("Connected to {} peers", peer_count),
                 last_check: now,
             }
@@ -270,33 +289,33 @@ async fn check_component(
             let pool_size = get_metric_value(metrics_collector, "norn_txpool_size");
             ComponentHealth {
                 name: "txpool".to_string(),
-                status: if pool_size >= 0 { "healthy".to_string() } else { "unhealthy".to_string() },
+                status: if pool_size >= 0 {
+                    "healthy".to_string()
+                } else {
+                    "unhealthy".to_string()
+                },
                 message: format!("Pool size: {}", pool_size),
                 last_check: now,
             }
         }
-        "consensus" => {
-            ComponentHealth {
-                name: "consensus".to_string(),
-                status: "healthy".to_string(),
-                message: "PoVF consensus running".to_string(),
-                last_check: now,
-            }
-        }
-        "storage" => {
-            ComponentHealth {
-                name: "storage".to_string(),
-                status: "healthy".to_string(),
-                message: "SledDB storage operational".to_string(),
-                last_check: now,
-            }
-        }
+        "consensus" => ComponentHealth {
+            name: "consensus".to_string(),
+            status: "healthy".to_string(),
+            message: "PoVF consensus running".to_string(),
+            last_check: now,
+        },
+        "storage" => ComponentHealth {
+            name: "storage".to_string(),
+            status: "healthy".to_string(),
+            message: "SledDB storage operational".to_string(),
+            last_check: now,
+        },
         _ => ComponentHealth {
             name: component.to_string(),
             status: "unknown".to_string(),
             message: "Unknown component".to_string(),
             last_check: now,
-        }
+        },
     }
 }
 
@@ -306,7 +325,9 @@ fn get_metric_value(metrics_collector: &MetricsCollector, metric_name: &str) -> 
     match metrics_collector.gather() {
         Ok(metrics_text) => {
             for line in metrics_text.lines() {
-                if line.starts_with(metric_name) || line.starts_with(&format!("{}{}", metric_name, "{")) {
+                if line.starts_with(metric_name)
+                    || line.starts_with(&format!("{}{}", metric_name, "{"))
+                {
                     // Parse metric line: metric_name{labels} value
                     if let Some(last_space) = line.rfind(' ') {
                         if let Ok(value) = line[last_space + 1..].parse::<i64>() {

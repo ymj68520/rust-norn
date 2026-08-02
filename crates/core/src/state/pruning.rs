@@ -7,11 +7,11 @@
 use super::history::{StateHistory, StateSnapshot};
 use norn_common::error::{NornError, Result};
 use norn_common::types::Hash;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, debug, warn};
-use std::collections::HashMap;
+use tracing::{debug, info, warn};
 
 /// Configuration for state pruning
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,11 +52,7 @@ impl Default for PruningConfig {
 
 impl PruningConfig {
     /// Create a new pruning config with custom values
-    pub fn new(
-        min_blocks_to_keep: u64,
-        max_blocks_to_keep: u64,
-        prune_interval: u64,
-    ) -> Self {
+    pub fn new(min_blocks_to_keep: u64, max_blocks_to_keep: u64, prune_interval: u64) -> Self {
         Self {
             min_blocks_to_keep,
             max_blocks_to_keep,
@@ -202,7 +198,10 @@ impl StatePruningManager {
 
         debug!(
             "Pruning blocks older than {} (current={}, min_keep={}, max_keep={})",
-            effective_cutoff, current_block, self.config.min_blocks_to_keep, self.config.max_blocks_to_keep
+            effective_cutoff,
+            current_block,
+            self.config.min_blocks_to_keep,
+            self.config.max_blocks_to_keep
         );
 
         // Get all snapshots to determine what to prune
@@ -233,7 +232,11 @@ impl StatePruningManager {
         }
 
         let elapsed = start_time.elapsed();
-        let bytes_saved = self.estimate_space_saved(snapshot_count, snapshots_pruned as usize, changes_pruned as usize);
+        let bytes_saved = self.estimate_space_saved(
+            snapshot_count,
+            snapshots_pruned as usize,
+            changes_pruned as usize,
+        );
 
         // Update statistics
         let mut stats = self.stats.write().await;
@@ -268,7 +271,12 @@ impl StatePruningManager {
     }
 
     /// Estimate space saved by pruning (rough approximation)
-    fn estimate_space_saved(&self, total_snapshots: usize, snapshots_pruned: usize, changes_pruned: usize) -> u64 {
+    fn estimate_space_saved(
+        &self,
+        total_snapshots: usize,
+        snapshots_pruned: usize,
+        changes_pruned: usize,
+    ) -> u64 {
         // Rough estimates:
         // - Snapshot: ~1KB per account, assume 1000 accounts per snapshot = ~1MB
         // - Change: ~500 bytes per change

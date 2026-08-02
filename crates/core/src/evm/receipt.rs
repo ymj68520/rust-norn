@@ -155,8 +155,7 @@ impl Bloom {
     pub fn add_hash(&mut self, hash: &Hash) {
         // Use first 3 pairs of 64-bit chunks to set 6 bits in the bloom filter
         for i in 0..3 {
-            let idx = ((hash.0[i * 8] as usize) << 8 |
-                       (hash.0[i * 8 + 1] as usize)) % 2048;
+            let idx = ((hash.0[i * 8] as usize) << 8 | (hash.0[i * 8 + 1] as usize)) % 2048;
             let byte_idx = idx / 8;
             let bit_idx = idx % 8;
             self.0[byte_idx] |= 1 << bit_idx;
@@ -178,8 +177,7 @@ impl Bloom {
     pub fn might_contain(&self, value: &[u8]) -> bool {
         let hash = Hash(sha2::Sha256::digest(value).into());
         for i in 0..3 {
-            let idx = ((hash.0[i * 8] as usize) << 8 |
-                       (hash.0[i * 8 + 1] as usize)) % 2048;
+            let idx = ((hash.0[i * 8] as usize) << 8 | (hash.0[i * 8 + 1] as usize)) % 2048;
             let byte_idx = idx / 8;
             let bit_idx = idx % 8;
             if (self.0[byte_idx] & (1 << bit_idx)) == 0 {
@@ -198,12 +196,7 @@ impl Default for Bloom {
 
 impl Receipt {
     /// Create a new receipt
-    pub fn new(
-        tx_hash: Hash,
-        block_hash: Hash,
-        block_number: u64,
-        tx_index: u64,
-    ) -> Self {
+    pub fn new(tx_hash: Hash, block_hash: Hash, block_number: u64, tx_index: u64) -> Self {
         Self {
             tx_hash,
             block_hash,
@@ -349,26 +342,39 @@ impl ReceiptDB {
         // Store receipt by block
         {
             let mut block_receipts = self.receipts_by_block.write().await;
-            block_receipts.entry(block_hash).or_insert_with(Vec::new).push(receipt.clone());
+            block_receipts
+                .entry(block_hash)
+                .or_insert_with(Vec::new)
+                .push(receipt.clone());
         }
 
         // Index by address
         for log in &receipt.logs {
             let mut addr_index = self.receipts_by_address.write().await;
-            addr_index.entry(log.address).or_insert_with(Vec::new).push(tx_hash);
+            addr_index
+                .entry(log.address)
+                .or_insert_with(Vec::new)
+                .push(tx_hash);
         }
 
         // Index by topics
         for log in &receipt.logs {
             for topic in &log.topics {
                 let mut topic_index = self.receipts_by_topic.write().await;
-                topic_index.entry(*topic).or_insert_with(Vec::new).push(tx_hash);
+                topic_index
+                    .entry(*topic)
+                    .or_insert_with(Vec::new)
+                    .push(tx_hash);
             }
         }
 
         info!("Stored receipt for transaction: {:?}", tx_hash);
-        debug!("Receipt: block={}, gas_used={}, logs={}",
-               receipt.block_number, receipt.gas_used, receipt.logs.len());
+        debug!(
+            "Receipt: block={}, gas_used={}, logs={}",
+            receipt.block_number,
+            receipt.gas_used,
+            receipt.logs.len()
+        );
 
         Ok(())
     }
@@ -448,18 +454,16 @@ impl ReceiptDB {
 
         // Filter by address
         if let Some(addr) = address {
-            receipts.retain(|r| {
-                r.logs.iter().any(|log| log.address == *addr)
-            });
+            receipts.retain(|r| r.logs.iter().any(|log| log.address == *addr));
         }
 
         // Filter by topics
         for (i, topic_opt) in topics.iter().enumerate() {
             if let Some(topic) = topic_opt {
                 receipts.retain(|r| {
-                    r.logs.iter().any(|log| {
-                        log.topics.get(i).map_or(false, |t| t == topic)
-                    })
+                    r.logs
+                        .iter()
+                        .any(|log| log.topics.get(i).map_or(false, |t| t == topic))
                 });
             }
         }
@@ -622,8 +626,8 @@ mod tests {
         let other_address = create_test_address(2);
 
         // Create receipts with logs
-        let receipt1 = Receipt::new(create_test_hash(1), create_test_hash(10), 100, 0)
-            .with_log(ReceiptLog {
+        let receipt1 =
+            Receipt::new(create_test_hash(1), create_test_hash(10), 100, 0).with_log(ReceiptLog {
                 log_index: 0,
                 tx_hash: create_test_hash(1),
                 block_hash: create_test_hash(10),
@@ -633,8 +637,8 @@ mod tests {
                 data: vec![],
             });
 
-        let receipt2 = Receipt::new(create_test_hash(2), create_test_hash(10), 100, 1)
-            .with_log(ReceiptLog {
+        let receipt2 =
+            Receipt::new(create_test_hash(2), create_test_hash(10), 100, 1).with_log(ReceiptLog {
                 log_index: 0,
                 tx_hash: create_test_hash(2),
                 block_hash: create_test_hash(10),
@@ -662,8 +666,8 @@ mod tests {
         let address = create_test_address(1);
 
         // Create receipts with different topics
-        let receipt1 = Receipt::new(create_test_hash(1), create_test_hash(10), 100, 0)
-            .with_log(ReceiptLog {
+        let receipt1 =
+            Receipt::new(create_test_hash(1), create_test_hash(10), 100, 0).with_log(ReceiptLog {
                 log_index: 0,
                 tx_hash: create_test_hash(1),
                 block_hash: create_test_hash(10),
@@ -673,8 +677,8 @@ mod tests {
                 data: vec![],
             });
 
-        let receipt2 = Receipt::new(create_test_hash(2), create_test_hash(10), 100, 1)
-            .with_log(ReceiptLog {
+        let receipt2 =
+            Receipt::new(create_test_hash(2), create_test_hash(10), 100, 1).with_log(ReceiptLog {
                 log_index: 0,
                 tx_hash: create_test_hash(2),
                 block_hash: create_test_hash(10),
@@ -697,12 +701,7 @@ mod tests {
     async fn test_clear_receipts() {
         let db = ReceiptDB::new();
 
-        let receipt = Receipt::new(
-            create_test_hash(1),
-            create_test_hash(2),
-            100,
-            0
-        );
+        let receipt = Receipt::new(create_test_hash(1), create_test_hash(2), 100, 0);
 
         db.put_receipt(receipt).await.unwrap();
         assert_eq!(db.count().await, 1);

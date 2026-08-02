@@ -16,9 +16,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     println!("Sending transaction...");
-    
+
     // Send the request
-    // Note: The server implementation currently returns "Unimplemented" error for logic, 
+    // Note: The server implementation currently returns "Unimplemented" error for logic,
     // but the RPC call itself should succeed in reaching the server.
     // If it returns Err(Status), that's also a "success" in terms of testing connectivity.
     match client.send_transaction(request).await {

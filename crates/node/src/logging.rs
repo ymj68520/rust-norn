@@ -98,8 +98,8 @@ impl LoggingConfig {
     ///
     /// Returns a WorkerGuard that must be kept alive for the duration of the program
     pub fn init(&self) -> Result<Option<WorkerGuard>, anyhow::Error> {
-        let env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(&self.level));
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&self.level));
 
         let mut guards = Vec::new();
 
@@ -115,13 +115,12 @@ impl LoggingConfig {
                 }
 
                 if self.outputs.contains(&LogOutput::File) {
-                    let file_path = self.file_path.as_ref()
+                    let file_path = self
+                        .file_path
+                        .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("File output requires file_path"))?;
 
-                    let file_appender = tracing_appender::rolling::daily(
-                        file_path,
-                        "norn.log",
-                    );
+                    let file_appender = tracing_appender::rolling::daily(file_path, "norn.log");
                     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
                     guards.push(guard);
 
@@ -143,19 +142,23 @@ impl LoggingConfig {
                 }
 
                 if self.outputs.contains(&LogOutput::File) {
-                    let file_path = self.file_path.as_ref()
+                    let file_path = self
+                        .file_path
+                        .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("File output requires file_path"))?;
 
-                    let file_appender = tracing_appender::rolling::daily(
-                        file_path,
-                        "norn.log",
-                    );
+                    let file_appender = tracing_appender::rolling::daily(file_path, "norn.log");
                     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
                     guards.push(guard);
 
                     let subscriber = tracing_subscriber::registry()
                         .with(env_filter.clone())
-                        .with(fmt::layer().pretty().with_writer(non_blocking).with_span_events(FmtSpan::CLOSE));
+                        .with(
+                            fmt::layer()
+                                .pretty()
+                                .with_writer(non_blocking)
+                                .with_span_events(FmtSpan::CLOSE),
+                        );
                     tracing::subscriber::set_global_default(subscriber)
                         .map_err(|e| anyhow::anyhow!("Failed to set subscriber: {}", e))?;
                 }

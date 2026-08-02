@@ -3639,6 +3639,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.7.9",
+ "bincode",
  "chrono",
  "config",
  "hex",
@@ -3765,6 +3766,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode",
+ "hex",
  "libp2p",
  "norn-common",
  "serde",

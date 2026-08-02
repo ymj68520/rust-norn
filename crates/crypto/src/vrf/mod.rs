@@ -1,12 +1,13 @@
 //! VRF (Verifiable Random Function) Module using schnorrkel (Ristretto255 + Merlin Transcript)
-//! 
+//!
 //! Implements VRF signing, verification, and domain-separated score/randomness derivation
 //! according to the Norn security and consensus specification.
 
 use anyhow::{anyhow, Result};
 use merlin::Transcript;
-use norn_common::consensus_types::ValidatorRecord;
-use norn_common::types::{ChainId, Hash, ProtocolVersion, StakeSnapshotHash, ValidatorId, VrfPublicKey};
+use norn_common::types::{
+    ChainId, Hash, ProtocolVersion, StakeSnapshotHash, ValidatorId, VrfPublicKey,
+};
 use schnorrkel::vrf::{VRFInOut, VRFPreOut, VRFProof};
 use schnorrkel::{Keypair, PublicKey};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -29,7 +30,7 @@ impl VrfContext {
     pub fn build_transcript(&self) -> Transcript {
         let mut t = Transcript::new(b"NORN_VRF_V2");
         t.append_message(b"protocol_version", &self.protocol_version.0.to_be_bytes());
-        t.append_message(b"chain_id", &self.chain_id.0.0);
+        t.append_message(b"chain_id", &self.chain_id.0 .0);
         t.append_message(b"epoch", &self.epoch.to_be_bytes());
         t.append_message(b"height", &self.height.to_be_bytes());
         t.append_message(b"round", &self.round.to_be_bytes());
@@ -55,7 +56,11 @@ pub struct VRFKeyPair {
 
 impl fmt::Debug for VRFKeyPair {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "VRFKeyPair(public: {:?})", hex::encode(self.public_key_bytes()))
+        write!(
+            f,
+            "VRFKeyPair(public: {:?})",
+            hex::encode(self.public_key_bytes())
+        )
     }
 }
 
@@ -211,7 +216,7 @@ pub fn verify_vrf(
 ) -> Result<VRFInOut> {
     let public_key = PublicKey::from_bytes(pub_key_bytes)
         .map_err(|e| anyhow!("Invalid public key bytes: {:?}", e))?;
-    
+
     let preout = VRFPreOut::from_bytes(&preout_bytes.0)
         .map_err(|e| anyhow!("Invalid VRF preout bytes: {:?}", e))?;
     let proof = VRFProof::from_bytes(&proof_bytes.0)
@@ -271,7 +276,10 @@ impl VRFCalculator {
         })
     }
 
-    pub fn calculate_with_context(key_pair: &VRFKeyPair, context: &VrfContext) -> Result<VRFOutputData> {
+    pub fn calculate_with_context(
+        key_pair: &VRFKeyPair,
+        context: &VrfContext,
+    ) -> Result<VRFOutputData> {
         let transcript = context.build_transcript();
         let (preout, proof) = key_pair.vrf_sign(transcript.clone());
         let vrf_inout = verify_vrf(&key_pair.public_key_bytes(), transcript, &preout, &proof)?;
@@ -336,7 +344,9 @@ impl VRFSelector {
     }
 
     pub fn total_voting_power(&self) -> u128 {
-        self.validators.values().fold(0u128, |acc, (_, weight)| acc.saturating_add(*weight as u128))
+        self.validators.values().fold(0u128, |acc, (_, weight)| {
+            acc.saturating_add(*weight as u128)
+        })
     }
 
     pub fn validator_count(&self) -> usize {
@@ -380,7 +390,8 @@ mod tests {
         assert!(valid);
 
         let wrong_message = b"Wrong message";
-        let invalid = VRFCalculator::verify(&keypair.public_key_bytes(), wrong_message, &output).unwrap();
+        let invalid =
+            VRFCalculator::verify(&keypair.public_key_bytes(), wrong_message, &output).unwrap();
         assert!(!invalid);
     }
 
@@ -390,13 +401,39 @@ mod tests {
         let transcript = build_message_transcript(b"test_domain");
         let (preout, proof) = keypair.vrf_sign(transcript.clone());
 
-        let vrf_inout = verify_vrf(&keypair.public_key_bytes(), transcript, &preout, &proof).unwrap();
+        let vrf_inout =
+            verify_vrf(&keypair.public_key_bytes(), transcript, &preout, &proof).unwrap();
 
         let score = derive_vrf_score_bytes(&vrf_inout);
         let randomness = derive_vrf_randomness_bytes(&vrf_inout);
 
         // NORN_VRF_SCORE_V2 and NORN_VRF_RANDOMNESS_V2 must yield different outputs
         assert_ne!(score, randomness);
+    }
+
+    #[test]
+    fn test_verify_and_derive_reconstructs_both_outputs() {
+        let keypair = VRFKeyPair::from_seed(b"stage-four-vrf");
+        let context = VrfContext {
+            protocol_version: ProtocolVersion(2),
+            chain_id: ChainId(Hash([1; 32])),
+            epoch: 1,
+            height: 1,
+            round: 0,
+            parent_block_hash: Hash([2; 32]),
+            stake_snapshot_hash: StakeSnapshotHash([3; 32]),
+            validator_id: ValidatorId([4; 32]),
+        };
+        let output = VRFCalculator::calculate_with_context(&keypair, &context).unwrap();
+        let derived = verify_and_derive(
+            &keypair.public_key_bytes(),
+            &context,
+            &output.preout,
+            &output.proof,
+        )
+        .unwrap();
+        assert_eq!(derived.score, output.output_bytes);
+        assert_ne!(derived.score, derived.randomness);
     }
 
     #[test]

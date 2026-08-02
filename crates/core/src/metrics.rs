@@ -1,8 +1,8 @@
 //! Metrics and Monitoring Module
-//! 
+//!
 //! Provides comprehensive metrics collection for blockchain monitoring.
 
-use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
@@ -16,22 +16,22 @@ pub struct Metrics {
     pub block_height: AtomicI64,
     pub blocks_processed: AtomicU64,
     pub blocks_per_second: AtomicU64,
-    
-    // Transaction metrics  
+
+    // Transaction metrics
     pub tx_pool_size: AtomicU64,
     pub txs_processed: AtomicU64,
     pub txs_per_second: AtomicU64,
-    
+
     // Network metrics
     pub peer_count: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub bytes_received: AtomicU64,
-    
+
     // Consensus metrics
     pub round_number: AtomicU64,
     pub proposal_count: AtomicU64,
     pub vote_count: AtomicU64,
-    
+
     // Performance metrics
     pub block_validation_time_ms: AtomicU64,
     pub tx_validation_time_ms: AtomicU64,
@@ -45,19 +45,19 @@ impl Metrics {
             block_height: AtomicI64::new(0),
             blocks_processed: AtomicU64::new(0),
             blocks_per_second: AtomicU64::new(0),
-            
+
             tx_pool_size: AtomicU64::new(0),
             txs_processed: AtomicU64::new(0),
             txs_per_second: AtomicU64::new(0),
-            
+
             peer_count: AtomicU64::new(0),
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
-            
+
             round_number: AtomicU64::new(0),
             proposal_count: AtomicU64::new(0),
             vote_count: AtomicU64::new(0),
-            
+
             block_validation_time_ms: AtomicU64::new(0),
             tx_validation_time_ms: AtomicU64::new(0),
             sync_progress_percent: AtomicU64::new(100),
@@ -106,12 +106,14 @@ impl Metrics {
 
     /// Record block validation time
     pub fn record_block_validation(&self, duration_ms: u64) {
-        self.block_validation_time_ms.store(duration_ms, Ordering::Relaxed);
+        self.block_validation_time_ms
+            .store(duration_ms, Ordering::Relaxed);
     }
 
     /// Record tx validation time
     pub fn record_tx_validation(&self, duration_ms: u64) {
-        self.tx_validation_time_ms.store(duration_ms, Ordering::Relaxed);
+        self.tx_validation_time_ms
+            .store(duration_ms, Ordering::Relaxed);
     }
 
     /// Get metrics snapshot
@@ -230,10 +232,10 @@ mod tests {
     #[test]
     fn test_metrics_update() {
         let metrics = Metrics::new();
-        
+
         metrics.set_block_height(100);
         assert_eq!(metrics.block_height.load(Ordering::Relaxed), 100);
-        
+
         metrics.inc_blocks_processed();
         assert_eq!(metrics.blocks_processed.load(Ordering::Relaxed), 1);
     }
@@ -243,7 +245,7 @@ mod tests {
         let metrics = Metrics::new();
         metrics.set_block_height(50);
         metrics.set_peer_count(10);
-        
+
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.block_height, 50);
         assert_eq!(snapshot.peer_count, 10);

@@ -12,6 +12,7 @@ norn-common = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bincode = { workspace = true }
+hex = { workspace = true }
 
 # Compression libraries
 zstd = { version = "0.13", optional = true }

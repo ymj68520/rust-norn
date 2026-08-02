@@ -2,15 +2,15 @@
 //!
 //! This module extends AccountStateManager with database persistence capabilities.
 
-use crate::state::{AccountStateManager, AccountState, AccountStateConfig, AccountType};
-use norn_common::types::{Address, Hash};
+use crate::state::{AccountState, AccountStateConfig, AccountStateManager, AccountType};
 use norn_common::error::Result;
+use norn_common::types::{Address, Hash};
 use norn_storage::SledDB;
-use serde::{Serialize, Deserialize};
+use num_bigint::BigUint;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn, error};
-use num_bigint::BigUint;
+use tracing::{debug, error, info, warn};
 
 /// Database keys for state storage
 mod keys {
@@ -108,13 +108,17 @@ impl PersistentStateManager {
             let address = Address(addr);
 
             // Deserialize account state
-            let account_state: AccountState = bincode::deserialize(&value)
-                .map_err(|e| {
-                    norn_common::error::NornError::Internal(format!("Failed to deserialize account: {}", e))
-                })?;
+            let account_state: AccountState = bincode::deserialize(&value).map_err(|e| {
+                norn_common::error::NornError::Internal(format!(
+                    "Failed to deserialize account: {}",
+                    e
+                ))
+            })?;
 
             // Insert into base manager
-            self.base_manager.set_account(&address, account_state).await?;
+            self.base_manager
+                .set_account(&address, account_state)
+                .await?;
             loaded_count += 1;
         }
 
@@ -125,16 +129,18 @@ impl PersistentStateManager {
     /// Save account to database
     async fn save_account_to_db(&self, address: &Address, account: &AccountState) -> Result<()> {
         // Serialize account state
-        let serialized = bincode::serialize(account)
-            .map_err(|e| norn_common::error::NornError::Internal(format!("Failed to serialize account: {}", e)))?;
+        let serialized = bincode::serialize(account).map_err(|e| {
+            norn_common::error::NornError::Internal(format!("Failed to serialize account: {}", e))
+        })?;
 
         // Create database key
         let mut key = Vec::from(keys::ACCOUNT_PREFIX);
         key.extend_from_slice(&address.0);
 
         // Write to database
-        self.db.insert_sync(&key, &serialized)
-            .map_err(|e| norn_common::error::NornError::Internal(format!("Failed to write account to DB: {}", e)))?;
+        self.db.insert_sync(&key, &serialized).map_err(|e| {
+            norn_common::error::NornError::Internal(format!("Failed to write account to DB: {}", e))
+        })?;
 
         debug!("Saved account {:?} to database", address);
         Ok(())
@@ -148,8 +154,9 @@ impl PersistentStateManager {
         db_key.extend_from_slice(key);
 
         // Write to database
-        self.db.insert_sync(&db_key, value)
-            .map_err(|e| norn_common::error::NornError::Internal(format!("Failed to write storage to DB: {}", e)))?;
+        self.db.insert_sync(&db_key, value).map_err(|e| {
+            norn_common::error::NornError::Internal(format!("Failed to write storage to DB: {}", e))
+        })?;
 
         Ok(())
     }
@@ -159,8 +166,12 @@ impl PersistentStateManager {
         let mut key = Vec::from(keys::ACCOUNT_PREFIX);
         key.extend_from_slice(&address.0);
 
-        self.db.remove_sync(&key)
-            .map_err(|e| norn_common::error::NornError::Internal(format!("Failed to delete account from DB: {}", e)))?;
+        self.db.remove_sync(&key).map_err(|e| {
+            norn_common::error::NornError::Internal(format!(
+                "Failed to delete account from DB: {}",
+                e
+            ))
+        })?;
 
         debug!("Deleted account {:?} from database", address);
         Ok(())
@@ -184,7 +195,8 @@ impl PersistentStateManager {
             let address = entry.key();
             let account_storage = entry.value();
             for (key, storage_item) in account_storage.iter() {
-                self.save_storage_to_db(address, key, &storage_item.value).await?;
+                self.save_storage_to_db(address, key, &storage_item.value)
+                    .await?;
             }
         }
 
@@ -204,10 +216,16 @@ impl PersistentStateManager {
         let checkpoint_hash = Hash([block_number as u8; 32]); // Simplified
 
         // Store checkpoint reference
-        self.db.insert_sync(checkpoint_key.as_bytes(), checkpoint_hash.0.as_ref())
-            .map_err(|e| norn_common::error::NornError::Internal(format!("Failed to save checkpoint: {}", e)))?;
+        self.db
+            .insert_sync(checkpoint_key.as_bytes(), checkpoint_hash.0.as_ref())
+            .map_err(|e| {
+                norn_common::error::NornError::Internal(format!("Failed to save checkpoint: {}", e))
+            })?;
 
-        info!("Created checkpoint for block {} with hash {:?}", block_number, checkpoint_hash);
+        info!(
+            "Created checkpoint for block {} with hash {:?}",
+            block_number, checkpoint_hash
+        );
         Ok(checkpoint_hash)
     }
 
@@ -217,8 +235,9 @@ impl PersistentStateManager {
 
         let checkpoint_key = format!("checkpoint_{}", block_number);
 
-        let checkpoint_hash = self.db.get_sync(checkpoint_key.as_bytes())
-            .map_err(|e| norn_common::error::NornError::Internal(format!("Failed to load checkpoint: {}", e)))?;
+        let checkpoint_hash = self.db.get_sync(checkpoint_key.as_bytes()).map_err(|e| {
+            norn_common::error::NornError::Internal(format!("Failed to load checkpoint: {}", e))
+        })?;
 
         if let Some(_) = checkpoint_hash {
             // In a full implementation, this would:
@@ -242,7 +261,9 @@ impl PersistentStateManager {
 
     /// Set account (write-through to DB)
     pub async fn set_account(&self, address: &Address, account: AccountState) -> Result<()> {
-        self.base_manager.set_account(address, account.clone()).await?;
+        self.base_manager
+            .set_account(address, account.clone())
+            .await?;
 
         if self.config.write_through {
             self.save_account_to_db(address, &account).await?;
@@ -267,10 +288,13 @@ impl PersistentStateManager {
     /// Update balance
     pub async fn update_balance(&self, address: &Address, new_balance: String) -> Result<()> {
         // Parse String to BigUint
-        let balance_biguint: num_bigint::BigUint = new_balance.parse()
+        let balance_biguint: num_bigint::BigUint = new_balance
+            .parse()
             .unwrap_or_else(|_| num_bigint::BigUint::from(0u32));
 
-        self.base_manager.update_balance(address, balance_biguint.clone()).await?;
+        self.base_manager
+            .update_balance(address, balance_biguint.clone())
+            .await?;
 
         // Reload account to get full state
         if let Some(mut account) = self.base_manager.get_account(address).await? {
@@ -309,7 +333,9 @@ impl PersistentStateManager {
 
     /// Set storage
     pub async fn set_storage(&self, address: &Address, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-        self.base_manager.set_storage(address, key.clone(), value.clone()).await?;
+        self.base_manager
+            .set_storage(address, key.clone(), value.clone())
+            .await?;
 
         if self.config.write_through {
             self.save_storage_to_db(address, &key, &value).await?;
@@ -339,7 +365,8 @@ impl PersistentStateManager {
         let interval_sec = self.config.flush_interval;
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_sec));
+            let mut interval =
+                tokio::time::interval(tokio::time::Duration::from_secs(interval_sec));
 
             loop {
                 interval.tick().await;
@@ -385,7 +412,10 @@ impl PersistentStateManager {
             }
         });
 
-        info!("Started background flush task with {}s interval", interval_sec);
+        info!(
+            "Started background flush task with {}s interval",
+            interval_sec
+        );
         Ok(())
     }
 }
@@ -420,7 +450,10 @@ mod tests {
             deleted: false,
         };
 
-        manager.set_account(&address, account.clone()).await.unwrap();
+        manager
+            .set_account(&address, account.clone())
+            .await
+            .unwrap();
 
         // Verify we can retrieve it
         let retrieved = manager.get_account(&address).await.unwrap();
@@ -512,7 +545,10 @@ mod tests {
         let key = vec![1u8; 32];
         let value = vec![255u8; 32];
 
-        manager.set_storage(&address, key.clone(), value.clone()).await.unwrap();
+        manager
+            .set_storage(&address, key.clone(), value.clone())
+            .await
+            .unwrap();
 
         // Verify storage
         let retrieved = manager.get_storage(&address, &key).await.unwrap();

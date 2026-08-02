@@ -3,15 +3,15 @@
 //! Calculates the state root hash from account states, incorporating both
 //! native and EVM contract states. Uses Merkle Patricia Tree (MPT) approach.
 
-use crate::state::{AccountStateManager, AccountState, AccountType};
-use norn_common::types::{Hash, Address};
-use norn_common::error::{Result, NornError};
-use serde::{Serialize, Deserialize};
-use sha2::{Sha256, Digest};
-use tracing::{debug, info};
+use crate::state::{AccountState, AccountStateManager, AccountType};
+use norn_common::error::{NornError, Result};
+use norn_common::types::{Address, Hash};
 use num_bigint::BigUint;
 use num_traits::Zero;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use tracing::{debug, info};
 
 /// State root calculator
 pub struct StateRootCalculator {
@@ -36,10 +36,7 @@ impl StateRootCalculator {
     }
 
     /// Calculate state root from account state manager
-    pub async fn calculate_from_manager(
-        &self,
-        manager: &AccountStateManager,
-    ) -> Result<Hash> {
+    pub async fn calculate_from_manager(&self, manager: &AccountStateManager) -> Result<Hash> {
         // Build state tree
         let mut state_entries: Vec<(Address, AccountStateData)> = Vec::new();
 
@@ -50,10 +47,10 @@ impl StateRootCalculator {
             // Get storage root for this account
             let storage_root = if let Some(account_storage) = manager.storage.get(address) {
                 // Convert StorageItem to Vec<u8>
-                let storage_map: std::collections::HashMap<Vec<u8>, Vec<u8>> =
-                    account_storage.iter()
-                        .map(|(k, v)| (k.clone(), v.value.clone()))
-                        .collect();
+                let storage_map: std::collections::HashMap<Vec<u8>, Vec<u8>> = account_storage
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.value.clone()))
+                    .collect();
                 self.calculate_storage_root(address, &storage_map)
             } else {
                 Hash::default()
@@ -196,7 +193,7 @@ struct AccountStateData {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{AccountStateManager, AccountState, AccountStateConfig, AccountType};
+    use crate::state::{AccountState, AccountStateConfig, AccountStateManager, AccountType};
     use std::sync::Arc;
 
     #[tokio::test]
@@ -204,10 +201,7 @@ mod tests {
         let manager = AccountStateManager::new(AccountStateConfig::default());
         let calculator = StateRootCalculator::default();
 
-        let root = calculator
-            .calculate_from_manager(&manager)
-            .await
-            .unwrap();
+        let root = calculator.calculate_from_manager(&manager).await.unwrap();
 
         // Empty state should produce zero hash
         assert_eq!(root, Hash::default());
@@ -233,10 +227,7 @@ mod tests {
 
         manager.set_account(&address, account).await.unwrap();
 
-        let root = calculator
-            .calculate_from_manager(&manager)
-            .await
-            .unwrap();
+        let root = calculator.calculate_from_manager(&manager).await.unwrap();
 
         // State root should be non-zero
         assert_ne!(root, Hash::default());
@@ -265,19 +256,16 @@ mod tests {
             manager.set_account(&address, account).await.unwrap();
         }
 
-        let root1 = calculator
-            .calculate_from_manager(&manager)
-            .await
-            .unwrap();
+        let root1 = calculator.calculate_from_manager(&manager).await.unwrap();
 
         // Modify an account
         let address = Address([1u8; 20]);
-        manager.update_balance(&address, BigUint::from(9999u32)).await.unwrap();
-
-        let root2 = calculator
-            .calculate_from_manager(&manager)
+        manager
+            .update_balance(&address, BigUint::from(9999u32))
             .await
             .unwrap();
+
+        let root2 = calculator.calculate_from_manager(&manager).await.unwrap();
 
         // State roots should be different after modification
         assert_ne!(root1, root2);
@@ -309,10 +297,7 @@ mod tests {
             .await
             .unwrap();
 
-        let root = calculator
-            .calculate_from_manager(&manager)
-            .await
-            .unwrap();
+        let root = calculator.calculate_from_manager(&manager).await.unwrap();
 
         // State root should be non-zero for contract with storage
         assert_ne!(root, Hash::default());
@@ -339,18 +324,15 @@ mod tests {
                 deleted: false,
             };
 
-            manager1.set_account(&address, account.clone()).await.unwrap();
+            manager1
+                .set_account(&address, account.clone())
+                .await
+                .unwrap();
             manager2.set_account(&address, account).await.unwrap();
         }
 
-        let root1 = calculator
-            .calculate_from_manager(&manager1)
-            .await
-            .unwrap();
-        let root2 = calculator
-            .calculate_from_manager(&manager2)
-            .await
-            .unwrap();
+        let root1 = calculator.calculate_from_manager(&manager1).await.unwrap();
+        let root2 = calculator.calculate_from_manager(&manager2).await.unwrap();
 
         // Same state should produce same root
         assert_eq!(root1, root2);
@@ -368,15 +350,9 @@ enum MPTNode {
         value: Option<Vec<u8>>,
     },
     /// Extension node: shared prefix + child hash
-    Extension {
-        nibbles: Vec<u8>,
-        child: Hash,
-    },
+    Extension { nibbles: Vec<u8>, child: Hash },
     /// Leaf node: key fragment + value
-    Leaf {
-        nibbles: Vec<u8>,
-        value: Vec<u8>,
-    },
+    Leaf { nibbles: Vec<u8>, value: Vec<u8> },
 }
 
 /// Enhanced State Root Calculator with full MPT support
@@ -414,10 +390,7 @@ impl EnhancedStateRootCalculator {
     }
 
     /// Build MPT tree from account data
-    fn build_mpt_tree(
-        &self,
-        accounts: &HashMap<Address, AccountStateData>,
-    ) -> Result<MPTNode> {
+    fn build_mpt_tree(&self, accounts: &HashMap<Address, AccountStateData>) -> Result<MPTNode> {
         // Convert addresses to nibble paths
         let mut paths: Vec<(Vec<u8>, Vec<u8>)> = accounts
             .iter()
@@ -452,10 +425,8 @@ impl EnhancedStateRootCalculator {
             }
             _ => {
                 // Find common prefix
-                let common_prefix = Self::find_common_prefix(
-                    &paths[0].0,
-                    &paths[paths.len() - 1].0,
-                );
+                let common_prefix =
+                    Self::find_common_prefix(&paths[0].0, &paths[paths.len() - 1].0);
 
                 if !common_prefix.is_empty() {
                     // Create extension node for common prefix
@@ -532,8 +503,9 @@ impl EnhancedStateRootCalculator {
 
     /// Hash an MPT node
     fn hash_node(&self, node: &MPTNode) -> Result<Hash> {
-        let serialized = bincode::serialize(node)
-            .map_err(|e| norn_common::error::NornError::Internal(format!("Serialization failed: {}", e)))?;
+        let serialized = bincode::serialize(node).map_err(|e| {
+            norn_common::error::NornError::Internal(format!("Serialization failed: {}", e))
+        })?;
 
         let hash = if self.use_keccak {
             // Use Keccak-256 for Ethereum compatibility
@@ -587,7 +559,10 @@ impl EnhancedStateRootCalculator {
         // Reconstruct the path and verify the proof
         let path = Self::address_to_nibbles(address);
 
-        info!("Verifying proof for address {:?} against root {:?}", address, root_hash);
+        info!(
+            "Verifying proof for address {:?} against root {:?}",
+            address, root_hash
+        );
         debug!("Proof contains {} nodes", proof.len());
 
         // Start with the root hash
@@ -600,7 +575,8 @@ impl EnhancedStateRootCalculator {
             .map(|node_data| {
                 serde_json::from_slice(node_data)
                     .or_else(|e| {
-                        bincode::deserialize(node_data).map_err(|e2| format!("JSON error: {}, Bincode error: {}", e, e2))
+                        bincode::deserialize(node_data)
+                            .map_err(|e2| format!("JSON error: {}, Bincode error: {}", e, e2))
                     })
                     .map_err(|e| format!("Failed to deserialize proof node: {}", e))
             })
@@ -617,7 +593,10 @@ impl EnhancedStateRootCalculator {
             // Verify node hash matches current_hash
             let node_hash = self.calculate_mpt_hash(node)?;
             if node_hash != current_hash {
-                debug!("Node hash mismatch at level {}: expected {:?}, got {:?}", i, current_hash, node_hash);
+                debug!(
+                    "Node hash mismatch at level {}: expected {:?}, got {:?}",
+                    i, current_hash, node_hash
+                );
                 return Ok(false);
             }
 
@@ -691,9 +670,7 @@ impl EnhancedStateRootCalculator {
 
 impl Default for EnhancedStateRootCalculator {
     fn default() -> Self {
-        Self {
-            use_keccak: false,
-        }
+        Self { use_keccak: false }
     }
 }
 

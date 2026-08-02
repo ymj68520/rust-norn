@@ -1,14 +1,14 @@
 //! Tendermint BFT Consensus Types & Integer Election Math
-//! 
+//!
 //! Pure integer math (no f32/f64/ln) for stake qualification, proposer selection, and Tendermint state steps.
 
-use num_bigint::BigUint;
-use num_traits::ToPrimitive;
+use anyhow::Result;
 use norn_common::consensus_types::StakeSnapshot;
 use norn_common::types::{ChainId, Hash, ProtocolVersion, ValidatorId};
+use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use anyhow::Result;
 
 pub trait ProposalSigner: Send + Sync {
     fn validator_id(&self) -> ValidatorId;
@@ -39,6 +39,9 @@ pub struct ConsensusConfig {
     pub timeout_precommit_ms: u64,
     pub target_numerator: u64,
     pub target_denominator: u64,
+    pub max_certificate_members: u32,
+    pub max_future_height: u64,
+    pub max_future_round: u32,
 }
 
 impl Default for ConsensusConfig {
@@ -53,7 +56,25 @@ impl Default for ConsensusConfig {
             timeout_precommit_ms: 2000,
             target_numerator: 1,
             target_denominator: 1,
+            max_certificate_members: 1024,
+            max_future_height: 2,
+            max_future_round: 2,
         }
+    }
+}
+
+impl ConsensusConfig {
+    /// Return the protocol epoch for a block height.  Height one is the first
+    /// block after Genesis and therefore belongs to the Genesis epoch; every
+    /// subsequent complete `epoch_length` interval advances exactly once.
+    pub fn epoch_for_height(&self, height: u64) -> Result<u64> {
+        if self.epoch_length == 0 {
+            return Err(anyhow::anyhow!("epoch length must be non-zero"));
+        }
+        let offset = height.saturating_sub(1) / self.epoch_length;
+        self.epoch
+            .checked_add(offset)
+            .ok_or_else(|| anyhow::anyhow!("epoch overflow for height {}", height))
     }
 }
 
@@ -108,7 +129,7 @@ impl ElectionMath {
 
         let mut hasher = Sha256::new();
         hasher.update(b"NORN_PROPOSER_V2");
-        hasher.update(&chain_id.0.0);
+        hasher.update(&chain_id.0 .0);
         hasher.update(&epoch.to_be_bytes());
         hasher.update(&height.to_be_bytes());
         hasher.update(&round.to_be_bytes());
@@ -146,5 +167,18 @@ mod tests {
         let max_score = [0xFFu8; 32];
         let not_qualified = ElectionMath::verify_qualification(&max_score, 100, 1000, 1, 1);
         assert!(!not_qualified);
+    }
+
+    #[test]
+    fn test_epoch_schedule_matches_genesis_height_rule() {
+        let config = ConsensusConfig {
+            epoch: 7,
+            epoch_length: 3,
+            ..ConsensusConfig::default()
+        };
+        assert_eq!(config.epoch_for_height(1).unwrap(), 7);
+        assert_eq!(config.epoch_for_height(3).unwrap(), 7);
+        assert_eq!(config.epoch_for_height(4).unwrap(), 8);
+        assert_eq!(config.epoch_for_height(7).unwrap(), 9);
     }
 }

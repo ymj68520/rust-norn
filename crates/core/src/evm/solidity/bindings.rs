@@ -82,17 +82,12 @@ impl ContractBindings {
 
     /// Get the contract address (requires deployment first)
     pub fn address(&self) -> EVMResult<Address> {
-        self.address.ok_or_else(|| EVMError::Execution(
-            "Contract not yet deployed".to_string()
-        ))
+        self.address
+            .ok_or_else(|| EVMError::Execution("Contract not yet deployed".to_string()))
     }
 
     /// Encode a function call data
-    pub fn encode_call(
-        &self,
-        function_name: &str,
-        params: &[ABIParam],
-    ) -> EVMResult<Vec<u8>> {
+    pub fn encode_call(&self, function_name: &str, params: &[ABIParam]) -> EVMResult<Vec<u8>> {
         ABI::encode_function_call(function_name, params)
     }
 

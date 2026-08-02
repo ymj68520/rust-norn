@@ -1,12 +1,12 @@
 mod cli;
-mod keys;
 mod config_loader;
+mod keys;
 
 use clap::Parser;
-use tracing::info;
-use norn_node::NornNode;
 use norn_common::utils::logging::{init_logging, LoggingConfig};
+use norn_node::NornNode;
 use std::path::PathBuf;
+use tracing::info;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

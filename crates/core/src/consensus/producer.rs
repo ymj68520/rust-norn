@@ -1,27 +1,34 @@
 //! Block Producer Module
-//! 
+//!
 //! Responsible for producing new blocks and signed proposals when this node is selected as proposer.
 
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Instant};
-use tracing::{info, error};
+use tracing::info;
 
-use norn_common::types::{Block, BlockHeader, BlockId, Hash, Transaction, PublicKey, GeneralParams};
-use norn_common::consensus_types::Proposal;
 use anyhow::{anyhow, Result};
-use norn_crypto::vrf::{VRFKeyPair, VRFCalculator, VrfContext};
-use sha2::{Sha256, Digest};
+use norn_common::chain_context::ChainContext;
+use norn_common::consensus_types::{
+    ConsensusEnvelope, ConsensusMessage, Proposal, MAX_CONSENSUS_ENVELOPE_BYTES,
+};
+use norn_common::genesis::ProtocolResourceLimits;
+use norn_common::types::{
+    Address, Block, BlockHeader, BlockId, BlockV2, Hash, PublicKey, Transaction, TransactionV2,
+};
+use norn_crypto::vrf::{VRFCalculator, VRFKeyPair, VrfContext};
 
 use crate::blockchain::Blockchain;
-use crate::txpool::TxPool;
-use crate::merkle::build_merkle_tree;
 use crate::consensus::povf::PoVFEngine;
 use crate::consensus::types::ProposalSigner;
-use crate::state::AccountStateManager;
+use crate::evm::{CodeStorage, EIP1559FeeCalculator};
+use crate::execution::{calculate_v2_execution_data_hash, execute_v2_block, V2ExecutionContext};
+use crate::merkle::build_merkle_tree;
 use crate::state::merkle::StateRootCalculator;
-use crate::evm::EIP1559FeeCalculator;
+use crate::state::AccountStateManager;
+use crate::txpool::TxPool;
+use crate::txpool_v2::TransactionV2Pool;
 
 /// Block producer configuration
 #[derive(Debug, Clone)]
@@ -32,6 +39,10 @@ pub struct BlockProducerConfig {
     pub max_txs_per_block: usize,
     /// Maximum gas per block
     pub max_gas_per_block: i64,
+    /// Maximum serialized block size from Genesis resource parameters
+    pub max_block_bytes: usize,
+    /// Maximum serialized transaction size from Genesis resource parameters
+    pub max_transaction_bytes: usize,
     /// Whether this node is a validator
     pub is_validator: bool,
 }
@@ -42,6 +53,8 @@ impl Default for BlockProducerConfig {
             block_interval: 5,
             max_txs_per_block: 1000,
             max_gas_per_block: 10_000_000,
+            max_block_bytes: 8 * 1024 * 1024,
+            max_transaction_bytes: 256 * 1024,
             is_validator: false,
         }
     }
@@ -63,6 +76,8 @@ pub struct BlockProducer {
     config: BlockProducerConfig,
     blockchain: Arc<Blockchain>,
     tx_pool: Arc<TxPool>,
+    v2_tx_pool: Option<Arc<TransactionV2Pool>>,
+    v2_code_storage: Option<Arc<CodeStorage>>,
     vrf_key_pair: VRFKeyPair,
     state_manager: Arc<AccountStateManager>,
     state: Arc<RwLock<ProducerState>>,
@@ -89,6 +104,8 @@ impl BlockProducer {
             config,
             blockchain,
             tx_pool,
+            v2_tx_pool: None,
+            v2_code_storage: None,
             vrf_key_pair,
             state_manager,
             state: Arc::new(RwLock::new(ProducerState::Idle)),
@@ -97,6 +114,17 @@ impl BlockProducer {
             proposal_signer,
             fee_calculator,
         }
+    }
+
+    /// Attach the protocol-v2 pool before the producer is shared with node
+    /// tasks.  The pool is optional only for the legacy compatibility
+    /// producer; V2 production fails closed when it has not been attached.
+    pub fn attach_v2_pool(&mut self, tx_pool: Arc<TransactionV2Pool>) {
+        self.v2_tx_pool = Some(tx_pool);
+    }
+
+    pub fn attach_v2_code_storage(&mut self, code_storage: Arc<CodeStorage>) {
+        self.v2_code_storage = Some(code_storage);
     }
 
     /// Get current producer state
@@ -128,14 +156,14 @@ impl BlockProducer {
     /// Produce a new block and signed Proposal for BFT broadcast
     pub async fn produce_proposal(&self) -> Result<(Proposal, Block)> {
         info!("Starting block and proposal production");
-        
+
         {
             let mut state = self.state.write().await;
             *state = ProducerState::Preparing;
         }
 
         let transactions = self.select_transactions().await;
-        
+
         let latest = self.blockchain.latest_block.read().await;
         let prev_hash = latest.header.block_hash;
         let new_height: u64 = (latest.header.height + 1) as u64;
@@ -144,30 +172,42 @@ impl BlockProducer {
 
         let merkle_root = build_merkle_tree(&transactions);
 
-        let gas_used: i64 = transactions.iter()
-            .map(|tx| tx.body.gas)
-            .sum();
+        let gas_used: i64 = transactions.iter().map(|tx| tx.body.gas).sum();
 
-        let base_fee = self.fee_calculator.calculate_next_base_fee(
-            parent_base_fee,
-            gas_used as u64,
-        );
+        let base_fee = self
+            .fee_calculator
+            .calculate_next_base_fee(parent_base_fee, gas_used as u64);
 
-        let (config, snapshot, (round, valid_round, valid_round_cert), parent_rand) = if let Some(ref engine) = self.consensus_engine {
-            let sm = engine.state_machine.read().await;
-            (sm.config.clone(), sm.snapshot.clone(), (sm.round, sm.valid_round, sm.valid_round_certificate.clone()), sm.parent_randomness)
-        } else {
-            (Default::default(), Default::default(), (0, None, None), Hash::default())
-        };
+        let (config, snapshot, (round, valid_round, valid_round_cert), parent_rand, epoch) =
+            if let Some(ref engine) = self.consensus_engine {
+                let sm = engine.state_machine.read().await;
+                (
+                    sm.config.clone(),
+                    sm.snapshot.clone(),
+                    (sm.round, sm.valid_round, sm.valid_round_certificate.clone()),
+                    sm.parent_randomness,
+                    sm.current_epoch()?,
+                )
+            } else {
+                (
+                    Default::default(),
+                    Default::default(),
+                    (0, None, None),
+                    Hash::default(),
+                    1,
+                )
+            };
 
-        let local_proposer = self.proposal_signer.as_ref()
+        let local_proposer = self
+            .proposal_signer
+            .as_ref()
             .map(|s| s.validator_id())
             .unwrap_or_else(|| norn_common::types::ValidatorId([0u8; 32]));
 
         let vrf_context = VrfContext {
             protocol_version: config.protocol_version.clone(),
             chain_id: config.chain_id.clone(),
-            epoch: config.epoch,
+            epoch,
             height: new_height,
             round,
             parent_block_hash: prev_hash,
@@ -187,7 +227,7 @@ impl BlockProducer {
             protocol_version: config.protocol_version.clone(),
             chain_id: config.chain_id.clone(),
             height: new_height as i64,
-            epoch: config.epoch,
+            epoch,
             round,
             timestamp: chrono::Utc::now().timestamp(),
             prev_block_hash: prev_hash,
@@ -250,11 +290,279 @@ impl BlockProducer {
         Ok((unsigned_proposal, block))
     }
 
+    /// Produce a fully committed V2 block template.  This path deliberately
+    /// does not mutate the live state or remove transactions from the pool:
+    /// finality/recovery owns those side effects in the later commit stage.
+    pub async fn produce_v2_block(
+        &self,
+        context: &ChainContext,
+        limits: &ProtocolResourceLimits,
+    ) -> Result<BlockV2> {
+        {
+            let mut state = self.state.write().await;
+            *state = ProducerState::Preparing;
+        }
+
+        let result = self.produce_v2_block_inner(context, limits).await;
+        match result {
+            Ok(block) => {
+                let mut state = self.state.write().await;
+                *state = ProducerState::ReadyToPropose;
+                let mut last = self.last_produced.write().await;
+                *last = Some(Instant::now());
+                Ok(block)
+            }
+            Err(error) => {
+                let mut state = self.state.write().await;
+                *state = ProducerState::Idle;
+                Err(error)
+            }
+        }
+    }
+
+    async fn produce_v2_block_inner(
+        &self,
+        context: &ChainContext,
+        limits: &ProtocolResourceLimits,
+    ) -> Result<BlockV2> {
+        limits.validate()?;
+        let tx_pool = self
+            .v2_tx_pool
+            .as_ref()
+            .ok_or_else(|| anyhow!("V2 transaction pool is not attached"))?;
+        if self.proposal_signer.is_none() || self.consensus_engine.is_none() {
+            return Err(anyhow!(
+                "V2 block production requires a consensus engine and validator signer"
+            ));
+        }
+        let transactions = self.select_v2_transactions(tx_pool, limits);
+
+        let latest = self.blockchain.latest_block.read().await;
+        if latest.header.protocol_version != context.protocol_version
+            || latest.header.chain_id != context.chain_id
+        {
+            return Err(anyhow!("latest block does not match V2 chain context"));
+        }
+        if latest.header.height == i64::MAX {
+            return Err(anyhow!("block height overflow"));
+        }
+        let prev_hash = latest.header.block_hash;
+        let new_height = (latest.header.height + 1) as u64;
+        let parent_base_fee = latest.header.base_fee;
+        drop(latest);
+
+        let engine = self
+            .consensus_engine
+            .as_ref()
+            .expect("V2 production checked consensus engine above");
+        let sm = engine.state_machine.read().await;
+        let epoch = sm.current_epoch()?;
+        let round = sm.round;
+        let snapshot = sm.snapshot.clone();
+        let parent_randomness = sm.parent_randomness;
+        drop(sm);
+        let proposer = self
+            .proposal_signer
+            .as_ref()
+            .map(|signer| signer.validator_id())
+            .unwrap_or_else(|| norn_common::types::ValidatorId([0u8; 32]));
+        if proposer.0 == [0u8; 32] || snapshot.snapshot_hash.0 == [0u8; 32] {
+            return Err(anyhow!(
+                "V2 block production requires non-zero proposer and snapshot identities"
+            ));
+        }
+
+        let timestamp = chrono::Utc::now().timestamp();
+        let evm_context = self
+            .v2_code_storage
+            .as_ref()
+            .map(|code_storage| V2ExecutionContext {
+                block_number: new_height,
+                block_timestamp: timestamp.max(0) as u64,
+                block_coinbase: Address(proposer.0[..20].try_into().unwrap_or([0u8; 20])),
+                block_gas_limit: limits.max_block_gas,
+                code_storage: code_storage.clone(),
+            });
+        let execution = execute_v2_block(
+            &self.state_manager,
+            &transactions,
+            limits,
+            evm_context.as_ref(),
+        )
+        .await?;
+        let state_root = execution
+            .overlay
+            .projected_state_root(&self.state_manager)
+            .await?;
+
+        let gas_used = i64::try_from(execution.gas_used)
+            .map_err(|_| anyhow!("V2 execution gas exceeds header range"))?;
+        let base_fee = self
+            .fee_calculator
+            .calculate_next_base_fee(parent_base_fee, execution.gas_used);
+        let header = BlockHeader {
+            protocol_version: context.protocol_version,
+            chain_id: context.chain_id,
+            height: new_height as i64,
+            epoch,
+            round,
+            timestamp,
+            prev_block_hash: prev_hash,
+            block_hash: Hash::default(),
+            merkle_root: Hash::default(),
+            state_root,
+            proposer,
+            stake_snapshot_hash: snapshot.snapshot_hash,
+            parent_randomness,
+            gas_limit: i64::try_from(limits.max_block_gas)
+                .map_err(|_| anyhow!("Genesis block gas limit exceeds header range"))?,
+            base_fee,
+            consensus_data_hash: calculate_v2_execution_data_hash(&execution.results),
+        };
+        let mut block = BlockV2 {
+            header,
+            transactions,
+        };
+        block.finalize_header()?;
+        block.validate_structure(context, limits)?;
+
+        // The final encoded size check includes the complete header and is
+        // intentionally performed after all commitments are populated.
+        let encoded_size = bincode::serialized_size(&block)? as usize;
+        if encoded_size > limits.max_block_bytes as usize {
+            return Err(anyhow!("V2 block exceeds Genesis byte limit"));
+        }
+        if gas_used > block.header.gas_limit {
+            return Err(anyhow!("V2 execution gas exceeds block gas limit"));
+        }
+        Ok(block)
+    }
+
+    fn select_v2_transactions(
+        &self,
+        tx_pool: &TransactionV2Pool,
+        limits: &ProtocolResourceLimits,
+    ) -> Vec<TransactionV2> {
+        let mut selected = Vec::with_capacity(limits.max_transactions_per_block as usize);
+        let mut total_bytes = 0usize;
+        let mut total_gas = 0u64;
+        for tx in tx_pool.select(limits.max_transactions_per_block as usize) {
+            let Ok(tx_bytes) = bincode::serialize(&tx) else {
+                continue;
+            };
+            let Some(next_bytes) = total_bytes.checked_add(tx_bytes.len()) else {
+                break;
+            };
+            let Some(next_gas) = total_gas.checked_add(tx.gas_limit) else {
+                break;
+            };
+            if tx_bytes.len() > limits.max_transaction_bytes as usize
+                || next_bytes > limits.max_block_bytes as usize
+                || tx.gas_limit > limits.max_transaction_gas
+                || next_gas > limits.max_block_gas
+            {
+                continue;
+            }
+            selected.push(tx);
+            total_bytes = next_bytes;
+            total_gas = next_gas;
+        }
+        selected
+    }
+
+    /// Produce the V2 block together with the existing consensus proposal
+    /// envelope.  Consensus voting is wired to this payload in the following
+    /// consensus-state-machine stage; keeping the constructor explicit here
+    /// prevents a legacy `Block` from being silently substituted.
+    pub async fn produce_v2_proposal(
+        &self,
+        context: &ChainContext,
+        limits: &ProtocolResourceLimits,
+    ) -> Result<(Proposal, BlockV2)> {
+        let block = self.produce_v2_block(context, limits).await?;
+        let engine = self
+            .consensus_engine
+            .as_ref()
+            .expect("V2 production checked consensus engine above");
+        let sm = engine.state_machine.read().await;
+        let valid_round = sm.valid_round;
+        let valid_round_certificate = sm.valid_round_certificate.clone();
+        drop(sm);
+        let vrf_context = VrfContext {
+            protocol_version: block.header.protocol_version,
+            chain_id: block.header.chain_id,
+            epoch: block.header.epoch,
+            height: block.header.height as u64,
+            round: block.header.round,
+            parent_block_hash: block.header.prev_block_hash,
+            stake_snapshot_hash: block.header.stake_snapshot_hash,
+            validator_id: block.header.proposer,
+        };
+        let vrf_output = VRFCalculator::calculate_with_context(&self.vrf_key_pair, &vrf_context)?;
+        let mut proposal = Proposal {
+            protocol_version: block.header.protocol_version,
+            chain_id: block.header.chain_id,
+            epoch: block.header.epoch,
+            height: block.header.height as u64,
+            round: block.header.round,
+            valid_round,
+            valid_round_certificate,
+            block_id: BlockId(block.header.block_hash),
+            parent_block_hash: block.header.prev_block_hash,
+            stake_snapshot_hash: block.header.stake_snapshot_hash,
+            proposer: block.header.proposer,
+            vrf_preout: vrf_output.preout.0,
+            vrf_proof: vrf_output.proof.0,
+            signature: [0u8; 64],
+        };
+        let signer = self
+            .proposal_signer
+            .as_ref()
+            .ok_or_else(|| anyhow!("V2 proposal requires a validator signer"))?;
+        proposal.signature = signer.sign_proposal(&proposal.canonical_bytes())?;
+        let envelope = ConsensusEnvelope {
+            wire_version: context.wire_version,
+            protocol_version: proposal.protocol_version,
+            chain_id: proposal.chain_id,
+            genesis_hash: context.genesis_hash,
+            payload: ConsensusMessage::ProposalV2 {
+                proposal: proposal.clone(),
+                block: block.clone(),
+            },
+        };
+        if bincode::serialized_size(&envelope)? as usize > MAX_CONSENSUS_ENVELOPE_BYTES {
+            return Err(anyhow!("V2 proposal exceeds consensus envelope limit"));
+        }
+        Ok((proposal, block))
+    }
+
     async fn select_transactions(&self) -> Vec<Transaction> {
-        self.tx_pool.package(&*self.blockchain).await
-            .into_iter()
-            .take(self.config.max_txs_per_block)
-            .collect()
+        let mut selected = Vec::with_capacity(self.config.max_txs_per_block);
+        let mut total_bytes = 0usize;
+        let mut total_gas = 0i64;
+        for tx in self.tx_pool.package(&*self.blockchain).await {
+            if selected.len() >= self.config.max_txs_per_block {
+                break;
+            }
+            let Ok(tx_bytes) = bincode::serialize(&tx) else {
+                continue;
+            };
+            if tx_bytes.len() > self.config.max_transaction_bytes
+                || total_bytes.saturating_add(tx_bytes.len()) > self.config.max_block_bytes
+            {
+                continue;
+            }
+            let Some(next_gas) = total_gas.checked_add(tx.body.gas) else {
+                continue;
+            };
+            if next_gas > self.config.max_gas_per_block {
+                continue;
+            }
+            total_bytes += tx_bytes.len();
+            total_gas = next_gas;
+            selected.push(tx);
+        }
+        selected
     }
 
     fn vrf_to_public_key(&self) -> PublicKey {
@@ -272,14 +580,21 @@ impl BlockProducer {
     pub async fn run(&self) {
         info!("Block producer started");
         let mut timer = interval(Duration::from_secs(1));
-        
+
         loop {
             timer.tick().await;
             if self.should_produce().await {
                 if let Ok((proposal, block)) = self.produce_proposal().await {
-                    info!("Produced signed proposal for block {:?} at height {}", proposal.block_id, block.header.height);
+                    info!(
+                        "Produced signed proposal for block {:?} at height {}",
+                        proposal.block_id, block.header.height
+                    );
                     if let Some(ref engine) = self.consensus_engine {
-                        let _ = engine.candidate_blocks.write().await.insert((block.header.height as u64, proposal.block_id), block);
+                        let _ = engine
+                            .candidate_blocks
+                            .write()
+                            .await
+                            .insert((block.header.height as u64, proposal.block_id), block);
                     }
                 }
             }
@@ -303,8 +618,47 @@ mod tests {
         let vrf_key_pair = VRFKeyPair::generate();
 
         let config = BlockProducerConfig::default();
-        let producer = BlockProducer::new(config, blockchain, tx_pool, vrf_key_pair, state_manager, None, None);
+        let producer = BlockProducer::new(
+            config,
+            blockchain,
+            tx_pool,
+            vrf_key_pair,
+            state_manager,
+            None,
+            None,
+        );
 
+        assert_eq!(producer.get_state().await, ProducerState::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_v2_block_production_fails_closed_without_consensus_identity() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(SledDB::new(temp_dir.path().to_str().unwrap()).unwrap());
+        let blockchain = Blockchain::new_with_fixed_genesis(db).await;
+        let tx_pool = Arc::new(TxPool::new());
+        let tx_pool_v2 = Arc::new(TransactionV2Pool::new());
+        let state_manager = Arc::new(AccountStateManager::default());
+        let vrf_key_pair = VRFKeyPair::generate();
+
+        let mut producer = BlockProducer::new(
+            BlockProducerConfig::default(),
+            blockchain,
+            tx_pool,
+            vrf_key_pair,
+            state_manager,
+            None,
+            None,
+        );
+        producer.attach_v2_pool(tx_pool_v2.clone());
+
+        let genesis = norn_common::genesis::GenesisConfig::from_fixed_genesis();
+        let result = producer
+            .produce_v2_block(&genesis.context(), &genesis.resource_limits)
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(tx_pool_v2.len(), 0);
         assert_eq!(producer.get_state().await, ProducerState::Idle);
     }
 }
