@@ -1,4 +1,209 @@
-use crate::types::{Block, BlockHeader, Hash, GenesisParams, PublicKey};
+use crate::chain_context::ChainContext;
+use crate::consensus_types::{StakeSnapshot, ValidatorRecord};
+use crate::error::{NornError, Result};
+use crate::types::{Block, BlockHeader, ChainId, Hash, GenesisParams, ProtocolVersion};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::Path;
+
+pub const GENESIS_SCHEMA_VERSION: u16 = 2;
+pub const GENESIS_IDENTITY_KEY: &[u8] = b"genesis_identity_v2";
+
+/// Versioned, canonical network bootstrap document.
+///
+/// The validator vector is normalized by ValidatorId when hashing, so the
+/// ordering in a JSON file cannot create different network identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenesisConfig {
+    pub schema_version: u16,
+    pub protocol_version: ProtocolVersion,
+    pub chain_id: ChainId,
+    pub epoch: u64,
+    pub epoch_length: u64,
+    pub initial_randomness: Hash,
+    pub genesis_block: Block,
+    pub validators: Vec<ValidatorRecord>,
+}
+
+impl GenesisConfig {
+    pub fn from_fixed_genesis() -> Self {
+        let genesis_block = get_genesis_block();
+        Self {
+            schema_version: GENESIS_SCHEMA_VERSION,
+            protocol_version: genesis_block.header.protocol_version,
+            chain_id: genesis_block.header.chain_id,
+            epoch: genesis_block.header.epoch as u64,
+            epoch_length: 1_000,
+            initial_randomness: genesis_block.header.parent_randomness,
+            genesis_block,
+            validators: Vec::new(),
+        }
+    }
+
+    pub fn load_from_path<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let bytes = std::fs::read(path)
+            .map_err(|e| anyhow::anyhow!("failed to read Genesis {:?}: {}", path, e))?;
+        let config: Self = serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("failed to decode Genesis {:?}: {}", path, e))?;
+        config
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid Genesis {:?}: {}", path, e))?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.validate_internal(true)
+    }
+
+    /// Validate the fixed development Genesis shape while allowing an empty
+    /// validator set for a non-consensus FullNode test process.
+    pub fn validate_allow_empty_validators(&self) -> Result<()> {
+        self.validate_internal(false)
+    }
+
+    fn validate_internal(&self, require_validators: bool) -> Result<()> {
+        if self.schema_version != GENESIS_SCHEMA_VERSION {
+            return Err(NornError::Config(format!(
+                "unsupported Genesis schema version {}",
+                self.schema_version
+            )));
+        }
+        if self.protocol_version.0 == 0 {
+            return Err(NornError::Config("Genesis protocol version must be non-zero".into()));
+        }
+        if self.chain_id.0 == Hash::default() {
+            return Err(NornError::Config("Genesis chain ID must be non-zero".into()));
+        }
+        if self.epoch_length == 0 {
+            return Err(NornError::Config("Genesis epoch length must be non-zero".into()));
+        }
+        if self.initial_randomness == Hash::default() {
+            return Err(NornError::Config("Genesis initial randomness must be non-zero".into()));
+        }
+
+        let header = &self.genesis_block.header;
+        if header.height != 0 {
+            return Err(NornError::Config("Genesis block height must be zero".into()));
+        }
+        if header.prev_block_hash != Hash::default() {
+            return Err(NornError::Config("Genesis previous hash must be zero".into()));
+        }
+        if !self.genesis_block.transactions.is_empty() {
+            return Err(NornError::Config("Genesis block must not contain transactions".into()));
+        }
+        if header.protocol_version != self.protocol_version {
+            return Err(NornError::Config(
+                "Genesis block protocol version does not match Genesis config".into(),
+            ));
+        }
+        if header.chain_id != self.chain_id {
+            return Err(NornError::Config(
+                "Genesis block chain ID does not match Genesis config".into(),
+            ));
+        }
+        if header.epoch as u64 != self.epoch {
+            return Err(NornError::Config(
+                "Genesis block epoch does not match Genesis config".into(),
+            ));
+        }
+        if header.parent_randomness != self.initial_randomness {
+            return Err(NornError::Config(
+                "Genesis initial randomness does not match Genesis block".into(),
+            ));
+        }
+        if header.block_hash == Hash::default() {
+            return Err(NornError::Config("Genesis block hash must be non-zero".into()));
+        }
+        let calculated_header_hash = header
+            .calculate_hash()
+            .map_err(|e| NornError::Config(format!("failed to hash Genesis header: {}", e)))?;
+        if header.block_hash != GENESIS_BLOCK_HASH && header.block_hash != calculated_header_hash {
+            return Err(NornError::Config(
+                "Genesis block hash does not match its canonical header hash".into(),
+            ));
+        }
+
+        // This performs deterministic ordering, duplicate ValidatorId checks,
+        // non-zero voting-power checks and overflow checks. Cryptographic key
+        // encoding is checked by the node/crypto boundary where those curve
+        // implementations are available.
+        if require_validators || !self.validators.is_empty() {
+            let snapshot = StakeSnapshot::from_genesis(self.epoch, self.validators.clone())?;
+            if header.stake_snapshot_hash != snapshot.snapshot_hash {
+                return Err(NornError::Config(
+                    "Genesis block snapshot hash does not match validator records".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn stake_snapshot(&self) -> Result<StakeSnapshot> {
+        StakeSnapshot::from_genesis(self.epoch, self.validators.clone())
+    }
+
+    pub fn context(&self) -> ChainContext {
+        ChainContext::new(
+            self.schema_version,
+            self.protocol_version,
+            self.chain_id,
+            self.genesis_hash(),
+        )
+    }
+
+    /// Canonical identity hash for the complete Genesis document.
+    pub fn genesis_hash(&self) -> Hash {
+        Hash(Sha256::digest(self.canonical_bytes()).into())
+    }
+
+    /// Canonical, order-independent encoding used for Genesis identity.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(512 + self.validators.len() * 105);
+        bytes.extend_from_slice(b"NORN_GENESIS_V2");
+        bytes.extend_from_slice(&self.schema_version.to_be_bytes());
+        bytes.extend_from_slice(&self.protocol_version.0.to_be_bytes());
+        bytes.extend_from_slice(&self.chain_id.0.0);
+        bytes.extend_from_slice(&self.epoch.to_be_bytes());
+        bytes.extend_from_slice(&self.epoch_length.to_be_bytes());
+        bytes.extend_from_slice(&self.initial_randomness.0);
+        append_block_header(&mut bytes, &self.genesis_block.header);
+
+        let mut validators = self.validators.clone();
+        validators.sort_by_key(|record| record.validator_id);
+        bytes.extend_from_slice(&(validators.len() as u32).to_be_bytes());
+        for record in validators {
+            append_validator(&mut bytes, &record);
+        }
+        bytes
+    }
+}
+
+fn append_block_header(bytes: &mut Vec<u8>, header: &BlockHeader) {
+    bytes.extend_from_slice(&header.protocol_version.0.to_be_bytes());
+    bytes.extend_from_slice(&header.chain_id.0.0);
+    bytes.extend_from_slice(&header.height.to_be_bytes());
+    bytes.extend_from_slice(&header.epoch.to_be_bytes());
+    bytes.extend_from_slice(&header.round.to_be_bytes());
+    bytes.extend_from_slice(&header.timestamp.to_be_bytes());
+    bytes.extend_from_slice(&header.prev_block_hash.0);
+    bytes.extend_from_slice(&header.block_hash.0);
+    bytes.extend_from_slice(&header.merkle_root.0);
+    bytes.extend_from_slice(&header.state_root.0);
+    bytes.extend_from_slice(&header.proposer.0);
+    bytes.extend_from_slice(&header.stake_snapshot_hash.0);
+    bytes.extend_from_slice(&header.parent_randomness.0);
+    bytes.extend_from_slice(&header.gas_limit.to_be_bytes());
+    bytes.extend_from_slice(&header.base_fee.to_be_bytes());
+    bytes.extend_from_slice(&header.consensus_data_hash.0);
+}
+
+fn append_validator(bytes: &mut Vec<u8>, record: &ValidatorRecord) {
+    bytes.extend_from_slice(&record.validator_id.0);
+    bytes.extend_from_slice(&record.consensus_public_key.0);
+    bytes.extend_from_slice(&record.vrf_public_key.0);
+    bytes.extend_from_slice(&record.voting_power.to_be_bytes());
+}
 
 /// 获取固定的创世块
 ///
@@ -106,10 +311,10 @@ pub fn is_valid_genesis_block(block: &Block) -> bool {
 pub async fn validate_genesis_start<F, Fut>(
     _db: &F,
     get_block: F,
-) -> Result<bool, Box<dyn std::error::Error>>
+) -> std::result::Result<bool, Box<dyn std::error::Error>>
 where
     F: Fn(Hash) -> Fut,
-    Fut: std::future::Future<Output = Result<Option<Block>, Box<dyn std::error::Error>>>,
+    Fut: std::future::Future<Output = std::result::Result<Option<Block>, Box<dyn std::error::Error>>>,
 {
     // 尝试获取高度为0的区块
     match get_block(GENESIS_BLOCK_HASH).await {
@@ -122,6 +327,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{ConsensusPublicKey, ValidatorId, VrfPublicKey};
 
     #[test]
     fn test_genesis_block_constants() {
@@ -157,5 +363,56 @@ mod tests {
         // 两次调用应该返回相同的创世块
         assert_eq!(genesis1.header.block_hash, genesis2.header.block_hash);
         assert_eq!(genesis1.header.timestamp, genesis2.header.timestamp);
+    }
+
+    #[test]
+    fn test_canonical_genesis_hash_is_validator_order_independent() {
+        let record_a = ValidatorRecord {
+            validator_id: ValidatorId([1u8; 32]),
+            consensus_public_key: ConsensusPublicKey([2u8; 33]),
+            vrf_public_key: VrfPublicKey([3u8; 32]),
+            voting_power: 10,
+        };
+        let record_b = ValidatorRecord {
+            validator_id: ValidatorId([4u8; 32]),
+            consensus_public_key: ConsensusPublicKey([5u8; 33]),
+            vrf_public_key: VrfPublicKey([6u8; 32]),
+            voting_power: 20,
+        };
+
+        let mut first = GenesisConfig::from_fixed_genesis();
+        first.validators = vec![record_a.clone(), record_b.clone()];
+        first.genesis_block.header.stake_snapshot_hash =
+            first.stake_snapshot().unwrap().snapshot_hash;
+        let mut second = first.clone();
+        second.validators.reverse();
+
+        assert!(first.validate().is_ok());
+        assert!(second.validate().is_ok());
+        assert_eq!(first.genesis_hash(), second.genesis_hash());
+        assert_eq!(first.stake_snapshot().unwrap(), second.stake_snapshot().unwrap());
+    }
+
+    #[test]
+    fn test_genesis_rejects_duplicate_keys_and_empty_validator_set() {
+        let mut config = GenesisConfig::from_fixed_genesis();
+        assert!(config.validate().is_err());
+
+        config.validators = vec![
+            ValidatorRecord {
+                validator_id: ValidatorId([1u8; 32]),
+                consensus_public_key: ConsensusPublicKey([2u8; 33]),
+                vrf_public_key: VrfPublicKey([3u8; 32]),
+                voting_power: 1,
+            },
+            ValidatorRecord {
+                validator_id: ValidatorId([4u8; 32]),
+                consensus_public_key: ConsensusPublicKey([2u8; 33]),
+                vrf_public_key: VrfPublicKey([6u8; 32]),
+                voting_power: 1,
+            },
+        ];
+
+        assert!(config.validate().is_err());
     }
 }

@@ -28,7 +28,29 @@ impl PoVFEngine {
         safety_store: Arc<dyn ConsensusSafetyStore>,
         local_validator_id: Option<ValidatorId>,
     ) -> Self {
-        let state_machine = TendermintStateMachine::new(config, snapshot, Hash::default(), safety_store, local_validator_id);
+        Self::new_with_parent_randomness(
+            config,
+            snapshot,
+            Hash::default(),
+            safety_store,
+            local_validator_id,
+        )
+    }
+
+    pub fn new_with_parent_randomness(
+        config: ConsensusConfig,
+        snapshot: StakeSnapshot,
+        parent_randomness: Hash,
+        safety_store: Arc<dyn ConsensusSafetyStore>,
+        local_validator_id: Option<ValidatorId>,
+    ) -> Self {
+        let state_machine = TendermintStateMachine::new(
+            config,
+            snapshot,
+            parent_randomness,
+            safety_store,
+            local_validator_id,
+        );
         Self {
             state_machine: Arc::new(RwLock::new(state_machine)),
             candidate_blocks: Arc::new(RwLock::new(HashMap::new())),

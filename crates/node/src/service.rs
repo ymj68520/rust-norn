@@ -10,10 +10,11 @@ use norn_core::evm::{EVMExecutor, EVMConfig};
 use norn_network::{NetworkCommand, NetworkService};
 use norn_storage::SledDB;
 use norn_common::consensus_types::{
-    ConsensusEnvelope, ConsensusMessage, StakeSnapshot, ValidatorRecord,
+    ConsensusEnvelope, ConsensusMessage,
 };
+use norn_common::chain_context::ChainContext;
 use norn_common::types::{
-    ConsensusPublicKey, ValidatorId, VrfPublicKey,
+    ValidatorId,
 };
 use k256::ecdsa::SigningKey;
 use k256::ecdsa::signature::Signer;
@@ -21,7 +22,7 @@ use k256::ecdsa::signature::Signer;
 use libp2p::identity::Keypair;
 use std::path::Path;
 use std::sync::Arc;
-use crate::config::NodeConfig;
+use crate::config::{validate_validator_key_match, NodeConfig, NodeRole};
 use crate::keystore::NodeKeyStore;
 use crate::manager::PeerManager;
 use crate::syncer::BlockSyncer;
@@ -80,10 +81,12 @@ pub struct NornNode {
 
     /// Consensus engine for PoVF BFT consensus
     consensus: Arc<PoVFEngine>,
-    signer: Arc<EcdsaConsensusSigner>,
+    signer: Option<Arc<EcdsaConsensusSigner>>,
 
     /// Block producer
-    block_producer: Arc<BlockProducer>,
+    block_producer: Option<Arc<BlockProducer>>,
+
+    chain_context: ChainContext,
 
     peer_manager: Arc<PeerManager>,
     syncer: Arc<BlockSyncer>,
@@ -140,53 +143,75 @@ impl NornNode {
             info!("Health check endpoint disabled");
         }
 
+        let genesis_config = config.load_genesis_config()?;
+        let genesis_snapshot = config.validate_genesis_for_role(&genesis_config)?;
+        let chain_context = genesis_config.context();
+
         let db = Arc::new(SledDB::new(&config.data_dir)?);
-        let blockchain = Blockchain::new_with_fixed_genesis(db.clone()).await;
+        let blockchain = Blockchain::try_new_with_genesis(
+            db.clone(),
+            genesis_config.genesis_block.clone(),
+            chain_context.genesis_hash,
+        )
+        .await?;
 
         let tx_pool = Arc::new(TxPool::new());
-        
-        let keystore_dir = Path::new(&config.data_dir).join("keystore");
-        let keystore = NodeKeyStore::open_or_create(&keystore_dir)?;
-        info!("Loaded persistent keystore from {:?}", keystore_dir);
 
-        let consensus_pubkey_bytes: [u8; 33] = keystore
-            .consensus_key()
-            .verifying_key()
-            .to_sec1_bytes()
-            .as_ref()
-            .try_into()
-            .map_err(|_| anyhow!("Invalid SEC1 public key length"))?;
+        let (local_validator_id, signer, vrf_key_pair) = if config.node_role == NodeRole::Validator {
+            let keystore_dir = Path::new(&config.data_dir).join("keystore");
+            let keystore = NodeKeyStore::open_or_create(&keystore_dir)?;
+            info!("Loaded persistent validator keystore from {:?}", keystore_dir);
 
-        let vrf_pubkey_bytes = keystore.vrf_key().public_key_bytes();
+            let consensus_pubkey_bytes: [u8; 33] = keystore
+                .consensus_key()
+                .verifying_key()
+                .to_sec1_bytes()
+                .as_ref()
+                .try_into()
+                .map_err(|_| anyhow!("Invalid SEC1 public key length"))?;
+            let vrf_pubkey_bytes = keystore.vrf_key().public_key_bytes();
+            let local_validator_id = validate_validator_key_match(
+                &genesis_snapshot,
+                consensus_pubkey_bytes,
+                vrf_pubkey_bytes,
+            )?;
 
-        let mut vid_bytes = [0u8; 32];
-        vid_bytes.copy_from_slice(&vrf_pubkey_bytes);
-        let local_validator_id = ValidatorId(vid_bytes);
+            let signer = Arc::new(EcdsaConsensusSigner::new(
+                keystore.consensus_key().clone(),
+                local_validator_id,
+            ));
+            (
+                Some(local_validator_id),
+                Some(signer),
+                Some(keystore.vrf_key().clone()),
+            )
+        } else {
+            info!("Starting as FullNode; validator private keys are not loaded");
+            (None, None, None)
+        };
 
-        let signer = Arc::new(EcdsaConsensusSigner::new(
-            keystore.consensus_key().clone(),
-            local_validator_id,
-        ));
-
-        let consensus_config = ConsensusConfig::default();
-        let mut stake_snapshot = StakeSnapshot::default();
-        
-        stake_snapshot.validators.insert(local_validator_id, ValidatorRecord {
-            validator_id: local_validator_id,
-            consensus_public_key: ConsensusPublicKey(consensus_pubkey_bytes),
-            vrf_public_key: VrfPublicKey(vrf_pubkey_bytes),
-            voting_power: 100,
-        });
-        stake_snapshot.snapshot_hash = stake_snapshot.compute_hash();
+        let defaults = ConsensusConfig::default();
+        let consensus_config = ConsensusConfig {
+            protocol_version: chain_context.protocol_version,
+            chain_id: chain_context.chain_id,
+            epoch: genesis_config.epoch,
+            epoch_length: genesis_config.epoch_length,
+            timeout_propose_ms: defaults.timeout_propose_ms,
+            timeout_prevote_ms: defaults.timeout_prevote_ms,
+            timeout_precommit_ms: defaults.timeout_precommit_ms,
+            target_numerator: defaults.target_numerator,
+            target_denominator: defaults.target_denominator,
+        };
 
         let safety_path = Path::new(&config.data_dir).join("safety_store.log");
         let persistent_safety_store = Arc::new(PersistentSafetyStore::open(safety_path)?);
 
-        let consensus = Arc::new(PoVFEngine::new(
+        let consensus = Arc::new(PoVFEngine::new_with_parent_randomness(
             consensus_config,
-            stake_snapshot,
+            genesis_snapshot,
+            genesis_config.initial_randomness,
             persistent_safety_store,
-            Some(local_validator_id),
+            local_validator_id,
         ));
         info!("Initialized disk-backed BFT consensus engine");
 
@@ -194,21 +219,26 @@ impl NornNode {
         let evm_config = EVMConfig::default();
         let evm_executor = Arc::new(EVMExecutor::new(state_manager.clone(), evm_config));
 
-        let producer_config = BlockProducerConfig {
-            is_validator: true,
-            block_interval: 1,
-            ..Default::default()
+        let block_producer = match (config.node_role, vrf_key_pair, signer.clone()) {
+            (NodeRole::Validator, Some(vrf_key_pair), Some(signer)) => {
+                let producer_config = BlockProducerConfig {
+                    is_validator: true,
+                    block_interval: 1,
+                    ..Default::default()
+                };
+                Some(Arc::new(BlockProducer::new(
+                    producer_config,
+                    blockchain.clone(),
+                    tx_pool.clone(),
+                    vrf_key_pair,
+                    state_manager.clone(),
+                    Some(consensus.clone()),
+                    Some(signer),
+                )))
+            }
+            (NodeRole::FullNode, None, None) => None,
+            _ => return Err(anyhow!("invalid node role/key initialization state")),
         };
-
-        let block_producer = Arc::new(BlockProducer::new(
-            producer_config,
-            blockchain.clone(),
-            tx_pool.clone(),
-            keystore.vrf_key().clone(),
-            state_manager.clone(),
-            Some(consensus.clone()),
-            Some(signer.clone()),
-        ));
         
         let mut network_svc = NetworkService::start(config.network.clone(), keypair).await?;
         let rx = std::mem::replace(&mut network_svc.event_rx, tokio::sync::mpsc::channel(1).1);
@@ -226,6 +256,7 @@ impl NornNode {
             consensus,
             signer,
             block_producer,
+            chain_context,
             peer_manager,
             syncer,
             tx_handler,
@@ -278,33 +309,37 @@ impl NornNode {
             syncer.start().await;
         });
 
-        let producer = self.block_producer.clone();
-        let network_ref = self.network.clone();
-        tokio::spawn(async move {
-            let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
-            loop {
-                timer.tick().await;
-                if producer.should_produce().await {
-                    if let Ok((proposal, block)) = producer.produce_proposal().await {
-                        let envelope = ConsensusEnvelope {
-                            wire_version: 1,
-                            protocol_version: proposal.protocol_version.clone(),
-                            chain_id: proposal.chain_id.clone(),
-                            genesis_hash: norn_common::types::Hash::default(),
-                            payload: ConsensusMessage::Proposal {
-                                proposal: proposal.clone(),
-                                block: block.clone(),
-                            },
-                        };
+        if let Some(producer) = self.block_producer.clone() {
+            let network_ref = self.network.clone();
+            let chain_context = self.chain_context;
+            tokio::spawn(async move {
+                let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+                loop {
+                    timer.tick().await;
+                    if producer.should_produce().await {
+                        if let Ok((proposal, block)) = producer.produce_proposal().await {
+                            let envelope = ConsensusEnvelope {
+                                wire_version: chain_context.wire_version,
+                                protocol_version: proposal.protocol_version,
+                                chain_id: proposal.chain_id,
+                                genesis_hash: chain_context.genesis_hash,
+                                payload: ConsensusMessage::Proposal {
+                                    proposal: proposal.clone(),
+                                    block: block.clone(),
+                                },
+                            };
 
-                        if let Ok(msg_bytes) = bincode::serialize(&envelope) {
-                            let _ = network_ref.command_tx.send(NetworkCommand::BroadcastConsensus(msg_bytes)).await;
+                            if let Ok(msg_bytes) = bincode::serialize(&envelope) {
+                                let _ = network_ref.command_tx.send(NetworkCommand::BroadcastConsensus(msg_bytes)).await;
+                            }
                         }
                     }
                 }
-            }
-        });
-        info!("Block Producer started");
+            });
+            info!("Block Producer started");
+        } else {
+            info!("Block Producer disabled for FullNode");
+        }
 
         if let Some(rx) = self.network_rx.take() {
             self.run_loop(rx).await;
@@ -335,12 +370,19 @@ impl NornNode {
                                     if let Ok(envelope) = bincode::deserialize::<ConsensusEnvelope>(&data) {
                                         match envelope.payload {
                                             ConsensusMessage::Proposal { proposal, block } => {
-                                                if let Ok(Some(vote)) = self.consensus.handle_proposal(proposal, block, self.signer.as_ref()).await {
+                                                let Some(signer) = self.signer.clone() else {
+                                                    // FullNode participation in consensus validation is
+                                                    // completed in the proposal-validation phase; it must
+                                                    // never manufacture a signer or vote here.
+                                                    warn!("FullNode received Proposal; no local vote will be cast");
+                                                    continue;
+                                                };
+                                                if let Ok(Some(vote)) = self.consensus.handle_proposal(proposal, block, signer.as_ref()).await {
                                                     let resp_env = ConsensusEnvelope {
-                                                        wire_version: 1,
-                                                        protocol_version: vote.protocol_version.clone(),
-                                                        chain_id: vote.chain_id.clone(),
-                                                        genesis_hash: envelope.genesis_hash.clone(),
+                                                        wire_version: self.chain_context.wire_version,
+                                                        protocol_version: vote.protocol_version,
+                                                        chain_id: vote.chain_id,
+                                                        genesis_hash: self.chain_context.genesis_hash,
                                                         payload: ConsensusMessage::Vote(vote),
                                                     };
                                                     if let Ok(vote_msg) = bincode::serialize(&resp_env) {
@@ -349,13 +391,17 @@ impl NornNode {
                                                 }
                                             }
                                             ConsensusMessage::Vote(vote) => {
-                                                if let Ok((vote_opt, cert_opt)) = self.consensus.handle_vote(vote, self.signer.as_ref()).await {
+                                                let Some(signer) = self.signer.clone() else {
+                                                    warn!("FullNode received Vote; no local vote action will be produced");
+                                                    continue;
+                                                };
+                                                if let Ok((vote_opt, cert_opt)) = self.consensus.handle_vote(vote, signer.as_ref()).await {
                                                     if let Some(precommit_vote) = vote_opt {
                                                         let resp_env = ConsensusEnvelope {
-                                                            wire_version: 1,
-                                                            protocol_version: precommit_vote.protocol_version.clone(),
-                                                            chain_id: precommit_vote.chain_id.clone(),
-                                                            genesis_hash: envelope.genesis_hash.clone(),
+                                                            wire_version: self.chain_context.wire_version,
+                                                            protocol_version: precommit_vote.protocol_version,
+                                                            chain_id: precommit_vote.chain_id,
+                                                            genesis_hash: self.chain_context.genesis_hash,
                                                             payload: ConsensusMessage::Vote(precommit_vote),
                                                         };
                                                         if let Ok(vote_msg) = bincode::serialize(&resp_env) {
@@ -364,10 +410,10 @@ impl NornNode {
                                                     }
                                                     if let Some(commit_cert) = cert_opt {
                                                         let commit_env = ConsensusEnvelope {
-                                                            wire_version: 1,
-                                                            protocol_version: commit_cert.protocol_version.clone(),
-                                                            chain_id: commit_cert.chain_id.clone(),
-                                                            genesis_hash: envelope.genesis_hash.clone(),
+                                                            wire_version: self.chain_context.wire_version,
+                                                            protocol_version: commit_cert.protocol_version,
+                                                            chain_id: commit_cert.chain_id,
+                                                            genesis_hash: self.chain_context.genesis_hash,
                                                             payload: ConsensusMessage::Commit(commit_cert.clone()),
                                                         };
                                                         if let Ok(commit_msg) = bincode::serialize(&commit_env) {

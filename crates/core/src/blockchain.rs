@@ -36,6 +36,81 @@ pub struct Blockchain {
 }
 
 impl Blockchain {
+    /// Initialize a chain only after checking the configured Genesis against
+    /// the persisted database identity. This is the fail-closed entry point
+    /// used by real nodes; legacy helpers remain available for old tests and
+    /// non-node callers until the later storage migration phase.
+    pub async fn try_new_with_genesis(
+        db: Arc<dyn DBInterface>,
+        genesis: Block,
+        genesis_identity: Hash,
+    ) -> anyhow::Result<Arc<Self>> {
+        if genesis.header.height != 0
+            || genesis.header.prev_block_hash != Hash::default()
+            || genesis.header.block_hash == Hash::default()
+            || !genesis.transactions.is_empty()
+        {
+            anyhow::bail!("configured Genesis block has an invalid shape");
+        }
+
+        let identity_key = norn_common::genesis::GENESIS_IDENTITY_KEY;
+        let stored_identity = db.get(identity_key).await?;
+        if let Some(stored) = &stored_identity {
+            if stored.as_slice() != genesis_identity.0.as_slice() {
+                anyhow::bail!("database Genesis identity does not match configured Genesis");
+            }
+        }
+
+        let genesis_key = norn_common::utils::db_keys::block_hash_to_db_key(
+            &genesis.header.block_hash,
+        );
+        let stored_genesis = db.get(&genesis_key).await?;
+        let has_stored_genesis = stored_genesis.is_some();
+        if let Some(bytes) = stored_genesis {
+            let stored_block = norn_common::utils::codec::deserialize::<Block>(&bytes)
+                .map_err(|e| anyhow::anyhow!("failed to decode persisted Genesis: {}", e))?;
+            if stored_block != genesis {
+                anyhow::bail!("persisted Genesis block does not match configured Genesis");
+            }
+        }
+
+        let height_key = norn_common::utils::db_keys::block_height_to_db_key(0);
+        let stored_height = db.get(&height_key).await?;
+        let has_stored_height = stored_height.is_some();
+        if let Some(height_bytes) = stored_height {
+            if height_bytes.as_slice() != genesis.header.block_hash.0.as_slice() {
+                anyhow::bail!("database height-zero index does not match configured Genesis");
+            }
+        }
+
+        let latest_bytes = db.get(b"latest").await?;
+        let has_latest = latest_bytes.is_some();
+        if let Some(latest_bytes) = latest_bytes {
+            if latest_bytes.len() != 32 {
+                anyhow::bail!("database latest pointer has an invalid length");
+            }
+            let latest_hash = Hash::from_slice(&latest_bytes);
+            let latest_key = norn_common::utils::db_keys::block_hash_to_db_key(&latest_hash);
+            if db.get(&latest_key).await?.is_none() {
+                anyhow::bail!("database latest pointer references a missing block");
+            }
+        }
+
+        let has_existing_chain = stored_identity.is_some()
+            || has_stored_genesis
+            || has_stored_height
+            || has_latest;
+        if has_existing_chain && (!has_stored_genesis || !has_stored_height) {
+            anyhow::bail!("database has chain data but no verifiable Genesis record");
+        }
+
+        let chain = Self::new_with_genesis(db.clone(), genesis).await;
+        if stored_identity.is_none() {
+            db.insert(identity_key, &genesis_identity.0).await?;
+        }
+        Ok(chain)
+    }
+
     /// Create blockchain with fixed genesis block (recommended approach)
     /// This ensures all nodes use the same genesis block
     pub async fn new_with_fixed_genesis(db: Arc<dyn DBInterface>) -> Arc<Self> {
@@ -383,5 +458,34 @@ mod tests {
         let retrieved_height = chain.get_block_by_height(1).await;
         assert!(retrieved_height.is_some());
         assert_eq!(retrieved_height.unwrap().header.block_hash, b1.header.block_hash);
+    }
+
+    #[tokio::test]
+    async fn test_checked_genesis_identity_is_persisted_and_fail_closed() {
+        let genesis_config = norn_common::genesis::GenesisConfig::from_fixed_genesis();
+        let genesis = genesis_config.genesis_block.clone();
+        let identity = genesis_config.genesis_hash();
+        let db = Arc::new(MockDB::new());
+
+        Blockchain::try_new_with_genesis(db.clone(), genesis.clone(), identity)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get(norn_common::genesis::GENESIS_IDENTITY_KEY)
+                .await
+                .unwrap(),
+            Some(identity.0.to_vec())
+        );
+
+        let mismatched_db = Arc::new(MockDB::new());
+        mismatched_db
+            .insert(norn_common::genesis::GENESIS_IDENTITY_KEY, &[0xAA; 32])
+            .await
+            .unwrap();
+        assert!(
+            Blockchain::try_new_with_genesis(mismatched_db, genesis, identity)
+                .await
+                .is_err()
+        );
     }
 }

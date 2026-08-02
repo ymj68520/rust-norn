@@ -1,7 +1,40 @@
 use serde::Deserialize;
+use norn_common::consensus_types::StakeSnapshot;
+use norn_common::genesis::GenesisConfig;
 use norn_core::config::CoreConfig;
 use norn_network::config::NetworkConfig;
+use k256::ecdsa::VerifyingKey;
+use norn_common::types::ValidatorId;
 use std::net::SocketAddr;
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkMode {
+    Production,
+    Devnet,
+    Test,
+}
+
+impl Default for NetworkMode {
+    fn default() -> Self {
+        Self::Devnet
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeRole {
+    Validator,
+    FullNode,
+}
+
+impl Default for NodeRole {
+    fn default() -> Self {
+        // A node without an explicitly selected role must not accidentally
+        // generate validator keys or participate in consensus.
+        Self::FullNode
+    }
+}
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct NodeConfig {
@@ -9,6 +42,17 @@ pub struct NodeConfig {
     pub network: NetworkConfig,
     pub rpc_address: SocketAddr,
     pub data_dir: String,
+
+    #[serde(default)]
+    pub network_mode: NetworkMode,
+
+    #[serde(default)]
+    pub node_role: NodeRole,
+
+    /// Explicit Genesis JSON path. Production mode never falls back to the
+    /// historical built-in Genesis block.
+    #[serde(default)]
+    pub genesis_path: Option<String>,
 
     // Enhanced features configuration
     #[serde(default)]
@@ -22,6 +66,247 @@ pub struct NodeConfig {
 
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+impl NodeConfig {
+    pub fn load_genesis_config(&self) -> anyhow::Result<GenesisConfig> {
+        match self.genesis_path.as_deref() {
+            Some(path) => GenesisConfig::load_from_path(path),
+            None if self.network_mode == NetworkMode::Production => Err(anyhow::anyhow!(
+                "Production mode requires an explicit genesis_path"
+            )),
+            None => Ok(GenesisConfig::from_fixed_genesis()),
+        }
+    }
+
+    pub fn validate_genesis_for_role(
+        &self,
+        genesis: &GenesisConfig,
+    ) -> anyhow::Result<StakeSnapshot> {
+        let allow_empty_non_production_genesis = self.genesis_path.is_none()
+            && matches!(self.network_mode, NetworkMode::Devnet | NetworkMode::Test)
+            && self.node_role == NodeRole::FullNode;
+
+        if allow_empty_non_production_genesis {
+            genesis
+                .validate_allow_empty_validators()
+                .map_err(|e| anyhow::anyhow!("invalid test Genesis: {}", e))?;
+            return Ok(StakeSnapshot::default());
+        }
+
+        genesis
+            .validate()
+            .map_err(|e| anyhow::anyhow!("invalid Genesis: {}", e))?;
+        let snapshot = genesis
+            .stake_snapshot()
+            .map_err(|e| anyhow::anyhow!("invalid Genesis validator snapshot: {}", e))?;
+
+        for (map_id, record) in &snapshot.validators {
+            if *map_id != record.validator_id {
+                return Err(anyhow::anyhow!(
+                    "Genesis validator map key does not match ValidatorId {}",
+                    record.validator_id
+                ));
+            }
+            VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0).map_err(|_| {
+                anyhow::anyhow!(
+                    "Genesis validator {} has an invalid consensus public key",
+                    record.validator_id
+                )
+            })?;
+            norn_crypto::vrf::VRFKeyPair::validate_public_key_bytes(&record.vrf_public_key.0)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Genesis validator {} has an invalid VRF public key: {}",
+                        record.validator_id,
+                        e
+                    )
+                })?;
+        }
+
+        Ok(snapshot)
+    }
+}
+
+pub fn validate_validator_key_match(
+    snapshot: &StakeSnapshot,
+    consensus_public_key: [u8; 33],
+    vrf_public_key: [u8; 32],
+) -> anyhow::Result<ValidatorId> {
+    let validator_id = ValidatorId(vrf_public_key);
+    let record = snapshot
+        .validators
+        .get(&validator_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "validator key does not match any Genesis ValidatorId {}",
+                validator_id
+            )
+        })?;
+
+    if record.consensus_public_key.0 != consensus_public_key
+        || record.vrf_public_key.0 != vrf_public_key
+    {
+        return Err(anyhow::anyhow!(
+            "validator public keys do not match Genesis record {}",
+            validator_id
+        ));
+    }
+
+    Ok(validator_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use norn_common::consensus_types::ValidatorRecord;
+    use norn_common::genesis::GenesisConfig;
+    use norn_common::types::{ConsensusPublicKey, VrfPublicKey};
+    use norn_core::consensus::types::ElectionMath;
+    use norn_crypto::vrf::VRFKeyPair;
+    use k256::ecdsa::SigningKey;
+    use tempfile::tempdir;
+
+    fn test_core_config() -> CoreConfig {
+        CoreConfig {
+            consensus: norn_core::config::ConsensusConfig {
+                pub_key: "".into(),
+                prv_key: "".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn production_requires_explicit_genesis() {
+        let config = NodeConfig {
+            core: test_core_config(),
+            network: NetworkConfig::default(),
+            rpc_address: "127.0.0.1:0".parse().unwrap(),
+            data_dir: tempdir().unwrap().path().to_string_lossy().to_string(),
+            network_mode: NetworkMode::Production,
+            node_role: NodeRole::FullNode,
+            genesis_path: None,
+            ..NodeConfig::test_defaults()
+        };
+
+        assert!(config.load_genesis_config().is_err());
+    }
+
+    #[test]
+    fn validator_keys_must_match_genesis_record() {
+        let consensus_key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let vrf_key = VRFKeyPair::from_seed(b"stage-one-validator");
+        let consensus_bytes: [u8; 33] = consensus_key
+            .verifying_key()
+            .to_sec1_bytes()
+            .as_ref()
+            .try_into()
+            .unwrap();
+        let vrf_bytes = vrf_key.public_key_bytes();
+        let validator_id = ValidatorId(vrf_bytes);
+
+        let snapshot = StakeSnapshot::from_genesis(
+            1,
+            vec![ValidatorRecord {
+                validator_id,
+                consensus_public_key: ConsensusPublicKey(consensus_bytes),
+                vrf_public_key: VrfPublicKey(vrf_bytes),
+                voting_power: 1,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            validate_validator_key_match(&snapshot, consensus_bytes, vrf_bytes).unwrap(),
+            validator_id
+        );
+        assert!(validate_validator_key_match(&snapshot, [2u8; 33], vrf_bytes).is_err());
+    }
+
+    #[test]
+    fn four_configs_load_identical_snapshot_and_proposer_sequence() {
+        let mut genesis = GenesisConfig::from_fixed_genesis();
+        let mut records = Vec::new();
+        for index in 1u8..=4 {
+            let consensus_key = SigningKey::from_slice(&[index; 32]).unwrap();
+            let vrf_key = VRFKeyPair::from_seed(&[index; 8]);
+            let consensus_bytes: [u8; 33] = consensus_key
+                .verifying_key()
+                .to_sec1_bytes()
+                .as_ref()
+                .try_into()
+                .unwrap();
+            let vrf_bytes = vrf_key.public_key_bytes();
+            records.push(ValidatorRecord {
+                validator_id: ValidatorId(vrf_bytes),
+                consensus_public_key: ConsensusPublicKey(consensus_bytes),
+                vrf_public_key: VrfPublicKey(vrf_bytes),
+                voting_power: u64::from(index),
+            });
+        }
+
+        let snapshot = StakeSnapshot::from_genesis(1, records.clone()).unwrap();
+        genesis.validators = records;
+        genesis.genesis_block.header.stake_snapshot_hash = snapshot.snapshot_hash;
+
+        let genesis_path = tempdir().unwrap();
+        let path = genesis_path.path().join("genesis.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&genesis).unwrap()).unwrap();
+
+        let mut expected = None;
+        for index in 0..4 {
+            let mut config = NodeConfig::test_defaults();
+            config.genesis_path = Some(path.to_string_lossy().to_string());
+            config.node_role = NodeRole::FullNode;
+            config.network_mode = NetworkMode::Test;
+            config.data_dir = format!("node-{index}");
+
+            let loaded = config.load_genesis_config().unwrap();
+            let loaded_snapshot = config.validate_genesis_for_role(&loaded).unwrap();
+            let sequence: Vec<_> = (1..=8)
+                .map(|height| {
+                    ElectionMath::select_deterministic_proposer(
+                        &loaded.context().chain_id,
+                        loaded.epoch,
+                        height,
+                        0,
+                        &loaded.initial_randomness,
+                        &loaded_snapshot,
+                    )
+                })
+                .collect();
+
+            if let Some((expected_hash, expected_snapshot, expected_sequence)) = &expected {
+                assert_eq!(loaded.context().genesis_hash, *expected_hash);
+                assert_eq!(&loaded_snapshot, expected_snapshot);
+                assert_eq!(&sequence, expected_sequence);
+            } else {
+                expected = Some((
+                    loaded.context().genesis_hash,
+                    loaded_snapshot,
+                    sequence,
+                ));
+            }
+        }
+    }
+
+    impl NodeConfig {
+        fn test_defaults() -> Self {
+            Self {
+                core: test_core_config(),
+                network: NetworkConfig::default(),
+                rpc_address: "127.0.0.1:0".parse().unwrap(),
+                data_dir: String::new(),
+                network_mode: NetworkMode::Devnet,
+                node_role: NodeRole::FullNode,
+                genesis_path: None,
+                txpool: TxPoolConfig::default(),
+                sync: SyncConfig::default(),
+                monitoring: MonitoringConfig::default(),
+                logging: LoggingConfig::default(),
+            }
+        }
+    }
 }
 
 /// Transaction pool configuration

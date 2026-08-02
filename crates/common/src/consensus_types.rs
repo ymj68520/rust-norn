@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use crate::types::{
     Block, BlockId, ChainId, ConsensusPublicKey, Hash, ProtocolVersion, StakeSnapshotHash,
     ValidatorId, VrfPublicKey,
@@ -182,15 +182,32 @@ impl StakeSnapshot {
             return Err(NornError::ConsensusError("Genesis validator set cannot be empty".into()));
         }
         let mut validators = BTreeMap::new();
+        let mut consensus_keys = HashSet::new();
+        let mut vrf_keys = HashSet::new();
         let mut total_power = 0u128;
         for record in records {
             if record.voting_power == 0 {
                 return Err(NornError::ConsensusError("Validator voting power must be > 0".into()));
             }
+            if record.validator_id.0 == [0u8; 32] {
+                return Err(NornError::ConsensusError("Validator ID must be non-zero".into()));
+            }
+            if record.consensus_public_key.0 == [0u8; 33] {
+                return Err(NornError::ConsensusError("Consensus public key must be non-zero".into()));
+            }
+            if record.vrf_public_key.0 == [0u8; 32] {
+                return Err(NornError::ConsensusError("VRF public key must be non-zero".into()));
+            }
             total_power = total_power.checked_add(record.voting_power as u128)
                 .ok_or_else(|| NornError::ConsensusError("Voting power overflow".into()))?;
             if validators.contains_key(&record.validator_id) {
                 return Err(NornError::ConsensusError("Duplicate validator ID in genesis".into()));
+            }
+            if !consensus_keys.insert(record.consensus_public_key.0) {
+                return Err(NornError::ConsensusError("Duplicate consensus public key in genesis".into()));
+            }
+            if !vrf_keys.insert(record.vrf_public_key.0) {
+                return Err(NornError::ConsensusError("Duplicate VRF public key in genesis".into()));
             }
             validators.insert(record.validator_id, record);
         }

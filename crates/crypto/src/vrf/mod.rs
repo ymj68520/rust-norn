@@ -60,6 +60,15 @@ impl fmt::Debug for VRFKeyPair {
 }
 
 impl VRFKeyPair {
+    /// Validate a serialized Schnorrkel public key without requiring the
+    /// corresponding private key. Genesis loading uses this to fail closed on
+    /// malformed validator records.
+    pub fn validate_public_key_bytes(bytes: &[u8; 32]) -> Result<()> {
+        PublicKey::from_bytes(bytes)
+            .map(|_| ())
+            .map_err(|e| anyhow!("Invalid Schnorrkel VRF public key: {:?}", e))
+    }
+
     /// Generate a new random VRF KeyPair
     pub fn generate() -> Self {
         let keypair = Keypair::generate_with(&mut rand::thread_rng());
