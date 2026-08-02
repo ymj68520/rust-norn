@@ -40,21 +40,15 @@ impl StateRootCalculator {
         &self,
         manager: &AccountStateManager,
     ) -> Result<Hash> {
-        // Get accounts and storage locks
-        let accounts_lock = manager.accounts_lock().await;
-        let storage_lock = manager.storage_lock().await;
-
-        // Lock and read accounts and storage
-        let accounts = accounts_lock.read().await;
-        let storage = storage_lock.read().await;
-
         // Build state tree
         let mut state_entries: Vec<(Address, AccountStateData)> = Vec::new();
 
-        for (address, account) in accounts.iter() {
+        for entry in manager.accounts.iter() {
+            let address = entry.key();
+            let account = entry.value();
+
             // Get storage root for this account
-            let account_storage = storage.get(address);
-            let storage_root = if let Some(account_storage) = account_storage {
+            let storage_root = if let Some(account_storage) = manager.storage.get(address) {
                 // Convert StorageItem to Vec<u8>
                 let storage_map: std::collections::HashMap<Vec<u8>, Vec<u8>> =
                     account_storage.iter()

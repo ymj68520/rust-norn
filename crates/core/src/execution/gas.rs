@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use num_bigint::BigUint;
-use num_traits::{Zero, One};
+use num_traits::{Zero, One, FromPrimitive, ToPrimitive};
 use crate::state::AccountStateManager;
 
 /// Gas 价格和限制配置
@@ -256,13 +256,11 @@ impl GasCalculator {
         let mut gas_used = intrinsic_gas;
 
         // 3. 如果是合约创建，添加创建成本
-        if transaction.to.is_none() {
+        if transaction.body.receiver.0 == [0u8; 20] {
             gas_used += gas_schedule.contract_costs.contract_create;
-            gas_used += transaction.data.len() as u64 * gas_schedule.contract_costs.contract_code_byte;
-        }
-
-        // 4. 如果是合约调用，添加调用成本
-        if transaction.to.is_some() {
+            gas_used += transaction.body.data.len() as u64 * gas_schedule.contract_costs.contract_code_byte;
+        } else {
+            // 4. 如果是合约调用，添加调用成本
             gas_used += gas_schedule.contract_costs.contract_call;
         }
 
@@ -271,20 +269,12 @@ impl GasCalculator {
     }
 
     /// 计算交易的内在 Gas（Intrinsic Gas）
-    ///
-    /// 这是交易必须支付的最小 gas，包括：
-    /// - 基础交易成本（21,000 gas）
-    /// - 数据成本（每字节非零数据 16 gas，零数据 4 gas）
-    /// - 支持 EIP-150 (Tangerine Whistle) - 调用深度限制
-    /// - 支持 EIP-1884 - 净 gas 计量
     async fn calculate_intrinsic_gas(&self, transaction: &Transaction, gas_schedule: &GasSchedule) -> Result<u64> {
         // 1. 基础交易成本
         let mut gas = gas_schedule.base_costs.get("transaction").copied().unwrap_or(21000);
 
         // 2. 数据成本（EIP-7623: 交易数据成本）
-        // 零字节成本: 4 gas per byte
-        // 非零字节成本: 16 gas per byte
-        let (zero_count, non_zero_count) = transaction.data.iter()
+        let (zero_count, non_zero_count) = transaction.body.data.iter()
             .fold((0, 0), |(zeros, non_zeros), &byte| {
                 if byte == 0 {
                     (zeros + 1, non_zeros)
@@ -312,9 +302,7 @@ impl GasCalculator {
     }
 
     /// 计算数据传输成本（辅助方法）
-    fn calculate_data_cost(&self, data: &[u8], gas_schedule: &GasSchedule) -> u64 {
-        // 零字节成本: 4 gas per byte
-        // 非零字节成本: 16 gas per byte
+    fn calculate_data_cost(&self, data: &[u8], _gas_schedule: &GasSchedule) -> u64 {
         data.iter()
             .fold(0, |acc, &byte| {
                 acc + if byte == 0 { 4 } else { 16 }
@@ -322,8 +310,6 @@ impl GasCalculator {
     }
 
     /// 计算调用深度 Gas 成本（EIP-150）
-    ///
-    /// EIP-150 引入了调用深度相关的 gas 成本，以防止堆栈溢出攻击
     pub fn calculate_call_depth_cost(depth: u64, gas_schedule: &GasSchedule) -> u64 {
         if depth > 0 {
             depth * gas_schedule.contract_costs.call_depth_cost
@@ -333,27 +319,19 @@ impl GasCalculator {
     }
 
     /// 计算 refunds（Gas 退款）
-    ///
-    /// 某些操作可以退还 gas，例如：
-    /// - 清除存储（SSTORE 清除）: 15,000 gas
-    /// - 自毁合约（SELFDESTRUCT）: 24,000 gas
     pub fn calculate_refund(&self, storage_clears: u64, self_destructs: u64) -> u64 {
         let storage_refund = storage_clears * 15000;
         let self_destruct_refund = self_destructs * 24000;
 
-        // 总退款不能超过 gas 使用量的一半（EIP-3529）
         let total_refund = storage_refund + self_destruct_refund;
-        total_refund // 注意：调用者需要确保不超过上限
+        total_refund
     }
 
     /// 验证 Gas 价格（EIP-1559: Base fee）
-    ///
-    /// EIP-1559 引入了基础费用（base fee）和优先费用（priority fee）
     pub async fn validate_gas_price(&self, transaction: &Transaction, base_fee: Option<&BigUint>) -> Result<bool> {
-        let tx_gas_price = BigUint::from_bytes(&transaction.gas_price);
+        let tx_gas_price = BigUint::from(transaction.body.gas_price.unwrap_or(0));
 
         if let Some(base) = base_fee {
-            // EIP-1559: gas price 必须 >= base fee
             if tx_gas_price < *base {
                 warn!(
                     "Gas price below base fee: {} < {}",
@@ -363,7 +341,6 @@ impl GasCalculator {
             }
         }
 
-        // 检查最小 gas price
         let config = self.config.read().await;
         if tx_gas_price < config.min_gas_price {
             warn!(
@@ -455,16 +432,15 @@ impl GasCalculator {
     pub async fn validate_transaction_gas(&self, transaction: &Transaction) -> Result<bool> {
         debug!("Validating transaction gas: {:?}", transaction);
         
-        // 1. 检查 Gas 限制
         let config = self.config.read().await;
-        if transaction.gas_limit > config.max_gas_limit {
+        let gas_limit = transaction.body.gas as u64;
+        if gas_limit > config.max_gas_limit {
             warn!("Gas limit exceeds maximum: {} > {}", 
-                   transaction.gas_limit, config.max_gas_limit);
+                   gas_limit, config.max_gas_limit);
             return Ok(false);
         }
         
-        // 2. 检查 Gas 价格
-        let gas_price = BigUint::from_bytes(&transaction.gas_price);
+        let gas_price = BigUint::from(transaction.body.gas_price.unwrap_or(0));
         if gas_price < config.min_gas_price {
             warn!("Gas price below minimum: {} < {}", 
                    gas_price, config.min_gas_price);
@@ -477,15 +453,14 @@ impl GasCalculator {
             return Ok(false);
         }
         
-        // 3. 检查账户余额是否足够支付费用
-        let max_fee = BigUint::from(transaction.gas_limit) * &gas_price;
-        let total_cost = BigUint::from_bytes(&transaction.value) + &max_fee;
+        let max_fee = BigUint::from(gas_limit) * &gas_price;
+        let val_bytes = transaction.body.value.as_ref().map(|s| s.as_bytes()).unwrap_or(&[]);
+        let total_cost = BigUint::from_bytes_be(val_bytes) + &max_fee;
 
-        // 检查发送者余额
         if let Some(state_manager) = &self.state_manager {
-            match state_manager.get_account_state(&transaction.from).await {
+            match state_manager.get_account(&transaction.body.address).await {
                 Ok(Some(account)) => {
-                    let sender_balance = BigUint::from_bytes(&account.balance.0);
+                    let sender_balance = account.balance.clone();
                     if sender_balance < total_cost {
                         warn!(
                             "Insufficient balance: required={}, have={}",
@@ -499,12 +474,11 @@ impl GasCalculator {
                     );
                 }
                 Ok(None) => {
-                    warn!("Sender account does not exist: {:?}", transaction.from);
+                    warn!("Sender account does not exist: {:?}", transaction.body.address);
                     return Ok(false);
                 }
                 Err(e) => {
                     error!("Failed to get sender balance: {:?}", e);
-                    // 继续处理，但记录警告
                     warn!("Unable to verify balance due to error, proceeding with caution");
                 }
             }
@@ -527,16 +501,16 @@ impl GasCalculator {
         
         // 检查价格范围
         if new_price < config.min_gas_price {
-            return Err(NornError::ValidationError("Gas price below minimum".to_string()));
+            return Err(NornError::Validation(norn_common::error::ValidationError::InvalidTransaction("Gas price below minimum".to_string())));
         }
         
         if new_price > config.max_gas_price {
-            return Err(NornError::ValidationError("Gas price above maximum".to_string()));
+            return Err(NornError::Validation(norn_common::error::ValidationError::InvalidTransaction("Gas price above maximum".to_string())));
         }
         
         // 更新价格
         let mut current_price = self.current_gas_price.write().await;
-        *current_price = new_price;
+        *current_price = new_price.clone();
         
         info!("Gas price updated to: {}", new_price);
         Ok(())
@@ -576,7 +550,7 @@ impl GasCalculator {
             config.min_gas_price.clone()
         );
         
-        self.update_gas_price(adjusted_price).await?;
+        self.update_gas_price(adjusted_price.clone()).await?;
         
         info!("Gas price adjusted: {} (utilization: {:.2}%)", 
                adjusted_price, utilization_rate * 100.0);
@@ -634,18 +608,6 @@ impl GasCalculator {
         }
         
         stats
-    }
-
-    /// 计算数据传输成本
-    fn calculate_data_cost(&self, data: &[u8], gas_schedule: &GasSchedule) -> u64 {
-        let zero_bytes = data.iter().filter(|&&b| b == 0).count() as u64;
-        let non_zero_bytes = data.len() as u64 - zero_bytes;
-        
-        // 零字节成本较低，非零字节成本较高
-        let zero_cost = zero_bytes * gas_schedule.base_costs.get("zero_byte").copied().unwrap_or(4);
-        let non_zero_cost = non_zero_bytes * gas_schedule.base_costs.get("non_zero_byte").copied().unwrap_or(16);
-        
-        zero_cost + non_zero_cost
     }
 
     /// 创建默认 Gas 调度表
@@ -710,14 +672,14 @@ mod tests {
         let calculator = GasCalculator::new(config);
 
         let transaction = Transaction {
-            from: Address::default(),
-            to: Some(Address::default()),
-            value: vec![100u8; 32],
-            gas_price: vec![1u8; 32],
-            gas_limit: 21000,
-            nonce: 0,
-            data: vec![],
-            signature: vec![],
+            body: norn_common::types::TransactionBody {
+                address: Address::default(),
+                receiver: Address::default(),
+                gas: 21000,
+                gas_price: Some(1),
+                data: vec![],
+                ..Default::default()
+            },
         };
 
         let estimated_gas = calculator.estimate_gas(&transaction).await.unwrap();
@@ -731,20 +693,19 @@ mod tests {
 
         // Test with zero data
         let tx_zero_data = Transaction {
-            from: Address::default(),
-            to: Some(Address::default()),
-            value: vec![0u8; 32],
-            gas_price: vec![1u8; 32],
-            gas_limit: 100000,
-            nonce: 0,
-            data: vec![0u8; 100], // 100 zero bytes
-            signature: vec![],
+            body: norn_common::types::TransactionBody {
+                address: Address::default(),
+                receiver: Address::default(),
+                gas: 100000,
+                gas_price: Some(1),
+                data: vec![0u8; 100],
+                ..Default::default()
+            },
         };
 
         let gas_schedule = calculator.gas_schedule.read().await;
         let intrinsic = calculator.calculate_intrinsic_gas(&tx_zero_data, &gas_schedule).await.unwrap();
 
-        // Base: 21000 + Zero bytes: 100 * 4 = 400 = 21400
         assert_eq!(intrinsic, 21400, "Intrinsic gas calculation incorrect for zero data");
     }
 
@@ -753,22 +714,20 @@ mod tests {
         let config = GasConfig::default();
         let calculator = GasCalculator::new(config);
 
-        // Test with non-zero data
         let tx_non_zero = Transaction {
-            from: Address::default(),
-            to: Some(Address::default()),
-            value: vec![0u8; 32],
-            gas_price: vec![1u8; 32],
-            gas_limit: 100000,
-            nonce: 0,
-            data: vec![0xFF; 50], // 50 non-zero bytes
-            signature: vec![],
+            body: norn_common::types::TransactionBody {
+                address: Address::default(),
+                receiver: Address::default(),
+                gas: 100000,
+                gas_price: Some(1),
+                data: vec![0xFF; 50],
+                ..Default::default()
+            },
         };
 
         let gas_schedule = calculator.gas_schedule.read().await;
         let intrinsic = calculator.calculate_intrinsic_gas(&tx_non_zero, &gas_schedule).await.unwrap();
 
-        // Base: 21000 + Non-zero bytes: 50 * 16 = 800 = 21800
         assert_eq!(intrinsic, 21800, "Intrinsic gas calculation incorrect for non-zero data");
     }
 
@@ -777,26 +736,23 @@ mod tests {
         let config = GasConfig::default();
         let calculator = GasCalculator::new(config);
 
-        // Test with mixed zero and non-zero data
         let mut data = vec![0u8; 100];
-        data[0..50].copy_from_slice(&[0xFF; 50]); // First 50 are non-zero
+        data[0..50].copy_from_slice(&[0xFF; 50]);
 
         let tx_mixed = Transaction {
-            from: Address::default(),
-            to: Some(Address::default()),
-            value: vec![0u8; 32],
-            gas_price: vec![1u8; 32],
-            gas_limit: 100000,
-            nonce: 0,
-            data,
-            signature: vec![],
+            body: norn_common::types::TransactionBody {
+                address: Address::default(),
+                receiver: Address::default(),
+                gas: 100000,
+                gas_price: Some(1),
+                data,
+                ..Default::default()
+            },
         };
 
         let gas_schedule = calculator.gas_schedule.read().await;
         let intrinsic = calculator.calculate_intrinsic_gas(&tx_mixed, &gas_schedule).await.unwrap();
 
-        // Base: 21000 + Zero: 50 * 4 = 200 + Non-zero: 50 * 16 = 800
-        // Total: 21000 + 200 + 800 = 22000
         assert_eq!(intrinsic, 22000, "Intrinsic gas calculation incorrect for mixed data");
     }
 
@@ -806,7 +762,6 @@ mod tests {
         let calculator = GasCalculator::new(config);
         let gas_schedule = calculator.gas_schedule.read().await;
 
-        // Test different call depths
         let cost_depth_0 = GasCalculator::calculate_call_depth_cost(0, &gas_schedule);
         assert_eq!(cost_depth_0, 0, "Zero depth should have zero cost");
 
@@ -821,12 +776,10 @@ mod tests {
     async fn test_gas_refund() {
         let calculator = GasCalculator::new(GasConfig::default());
 
-        // Test refund calculation
-        let refund = GasCalculator::calculate_refund(2, 1);
+        let refund = calculator.calculate_refund(2, 1);
         assert_eq!(refund, 54000, "Refund should be 2*15000 + 1*24000 = 54000");
 
-        // Test with zero operations
-        let refund_zero = GasCalculator::calculate_refund(0, 0);
+        let refund_zero = calculator.calculate_refund(0, 0);
         assert_eq!(refund_zero, 0, "No operations should have zero refund");
     }
 
@@ -834,7 +787,6 @@ mod tests {
     async fn test_eip1559_fee_calculation() {
         let calculator = GasCalculator::new(GasConfig::default());
 
-        // Test EIP-1559 fee calculation
         let base_fee = BigUint::from(100u64);
         let max_fee = BigUint::from(200u64);
         let max_priority = BigUint::from(50u64);
@@ -846,9 +798,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(base, BigUint::from(100u64));
-        // Priority fee should be min(50, 200-100) = 50
         assert_eq!(priority, BigUint::from(50u64));
-        // Total = (100 + 50) * 21000 = 3,150,000
         assert_eq!(total, BigUint::from(3150000u64));
     }
 
@@ -857,31 +807,26 @@ mod tests {
         let calculator = GasCalculator::new(GasConfig::default());
 
         let tx_valid = Transaction {
-            from: Address::default(),
-            to: Some(Address::default()),
-            value: vec![0u8; 32],
-            gas_price: vec![100u8; 32],
-            gas_limit: 21000,
-            nonce: 0,
-            data: vec![],
-            signature: vec![],
+            body: norn_common::types::TransactionBody {
+                address: Address::default(),
+                receiver: Address::default(),
+                gas: 21000,
+                gas_price: Some(100),
+                data: vec![],
+                ..Default::default()
+            },
         };
 
-        // Should pass with sufficient gas price
         let result = calculator.validate_gas_price(&tx_valid, None).await.unwrap();
         assert!(result, "Valid gas price should pass");
 
-        // Test with base fee
         let base_fee = BigUint::from(50u64);
         let result = calculator.validate_gas_price(&tx_valid, Some(&base_fee)).await.unwrap();
         assert!(result, "Gas price above base fee should pass");
 
-        // Test with gas price below base fee
         let base_fee_high = BigUint::from(200u64);
         let result = calculator.validate_gas_price(&tx_valid, Some(&base_fee_high)).await.unwrap();
         assert!(!result, "Gas price below base fee should fail");
-    }
-        assert!(estimated_gas > 0);
     }
 
     #[tokio::test]
@@ -890,18 +835,18 @@ mod tests {
         let calculator = GasCalculator::new(config);
         
         let transaction = Transaction {
-            from: Address::default(),
-            to: Some(Address::default()),
-            value: vec![100u8; 32],
-            gas_price: vec![1u8; 32],
-            gas_limit: 21000,
-            nonce: 0,
-            data: vec![],
-            signature: vec![],
+            body: norn_common::types::TransactionBody {
+                address: Address::default(),
+                receiver: Address([1u8; 20]),
+                gas: 30000,
+                gas_price: Some(1),
+                data: vec![],
+                ..Default::default()
+            },
         };
         
-        let usage = calculator.calculate_gas_usage(&transaction, 21000).await.unwrap();
-        assert_eq!(usage.gas_limit, 21000);
+        let usage = calculator.calculate_gas_usage(&transaction, 30000).await.unwrap();
+        assert_eq!(usage.gas_limit, 30000);
         assert!(!usage.exceeded_limit);
     }
 
@@ -910,15 +855,12 @@ mod tests {
         let config = GasConfig::default();
         let calculator = GasCalculator::new(config);
         
-        // 高使用率应该提高价格
         calculator.adjust_gas_price(100, 8000000, 10000000).await.unwrap();
         let high_price = calculator.get_current_gas_price().await;
         
-        // 低使用率应该降低价格
         calculator.adjust_gas_price(101, 2000000, 10000000).await.unwrap();
         let low_price = calculator.get_current_gas_price().await;
         
-        // 高使用率时的价格应该高于低使用率时
         assert!(high_price > low_price);
     }
 
@@ -928,25 +870,25 @@ mod tests {
         let calculator = GasCalculator::new(config);
         
         let valid_transaction = Transaction {
-            from: Address::default(),
-            to: Some(Address::default()),
-            value: vec![100u8; 32],
-            gas_price: vec![1000u8; 32], // 合理的价格
-            gas_limit: 21000,
-            nonce: 0,
-            data: vec![],
-            signature: vec![],
+            body: norn_common::types::TransactionBody {
+                address: Address::default(),
+                receiver: Address::default(),
+                gas: 21000,
+                gas_price: Some(1000),
+                data: vec![],
+                ..Default::default()
+            },
         };
         
         let invalid_transaction = Transaction {
-            from: Address::default(),
-            to: Some(Address::default()),
-            value: vec![100u8; 32],
-            gas_price: vec![0u8; 32], // 价格太低
-            gas_limit: 21000,
-            nonce: 0,
-            data: vec![],
-            signature: vec![],
+            body: norn_common::types::TransactionBody {
+                address: Address::default(),
+                receiver: Address::default(),
+                gas: 21000,
+                gas_price: Some(0),
+                data: vec![],
+                ..Default::default()
+            },
         };
         
         assert!(calculator.validate_transaction_gas(&valid_transaction).await.unwrap());

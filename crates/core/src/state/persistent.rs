@@ -170,19 +170,19 @@ impl PersistentStateManager {
     pub async fn flush_to_db(&self) -> Result<()> {
         debug!("Flushing state to database...");
 
-        let accounts_lock = self.base_manager.accounts_lock().await;
-        let accounts = accounts_lock.read().await;
         let mut flushed = 0;
 
-        for (address, account) in accounts.iter() {
+        for entry in self.base_manager.accounts.iter() {
+            let address = entry.key();
+            let account = entry.value();
             self.save_account_to_db(address, account).await?;
             flushed += 1;
         }
 
         // Flush storage
-        let storage_lock = self.base_manager.storage_lock().await;
-        let storage = storage_lock.read().await;
-        for (address, account_storage) in storage.iter() {
+        for entry in self.base_manager.storage.iter() {
+            let address = entry.key();
+            let account_storage = entry.value();
             for (key, storage_item) in account_storage.iter() {
                 self.save_storage_to_db(address, key, &storage_item.value).await?;
             }
@@ -335,15 +335,7 @@ impl PersistentStateManager {
         }
 
         let db = self.db.clone();
-        // Get locks that will be moved into the spawn
-        let accounts_lock = {
-            let lock = self.base_manager.accounts_lock().await;
-            Arc::clone(&lock)
-        };
-        let storage_lock = {
-            let lock = self.base_manager.storage_lock().await;
-            Arc::clone(&lock)
-        };
+        let base_manager = self.base_manager.clone();
         let interval_sec = self.config.flush_interval;
 
         tokio::spawn(async move {
@@ -355,12 +347,9 @@ impl PersistentStateManager {
                 debug!("Background flush task running...");
 
                 // Flush accounts
-                let accounts_snapshot = {
-                    let accounts_read = accounts_lock.read().await;
-                    accounts_read.clone()
-                };
-
-                for (address, account) in accounts_snapshot.iter() {
+                for entry in base_manager.accounts.iter() {
+                    let address = entry.key();
+                    let account = entry.value();
                     let serialized = match bincode::serialize(account) {
                         Ok(s) => s,
                         Err(e) => {
@@ -378,12 +367,9 @@ impl PersistentStateManager {
                 }
 
                 // Flush storage
-                let storage_snapshot = {
-                    let storage_read = storage_lock.read().await;
-                    storage_read.clone()
-                };
-
-                for (address, account_storage) in storage_snapshot.iter() {
+                for entry in base_manager.storage.iter() {
+                    let address = entry.key();
+                    let account_storage = entry.value();
                     for (key, storage_item) in account_storage.iter() {
                         let mut db_key = Vec::from(keys::STORAGE_PREFIX);
                         db_key.extend_from_slice(&address.0);

@@ -176,7 +176,6 @@ impl SyncStateManager {
     }
 
     /// Helper method to run async code in a blocking context
-    /// Always uses a separate thread with its own runtime to avoid nested runtime issues
     fn block_on_async<R, F>(&self, f: F) -> Result<R>
     where
         R: Send + 'static,
@@ -184,17 +183,31 @@ impl SyncStateManager {
     {
         let async_manager = Arc::clone(&self.async_manager);
 
-        // Always use a separate thread to avoid nested runtime issues
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new()
-                .map_err(|e| NornError::Internal(format!("Failed to create runtime: {}", e)))?;
-
-            rt.block_on(async move {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| {
+                    handle.block_on(async move {
+                        f(async_manager).await
+                    })
+                })
+            } else {
+                std::thread::scope(|s| {
+                    s.spawn(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .unwrap();
+                        rt.block_on(async move {
+                            f(async_manager).await
+                        })
+                    }).join().unwrap()
+                })
+            }
+        } else {
+            self.runtime_handle.block_on(async move {
                 f(async_manager).await
             })
-        })
-        .join()
-        .map_err(|e| NornError::Internal(format!("Thread join failed: {:?}", e)))?
+        }
     }
 
     /// Start background task to sync dirty state

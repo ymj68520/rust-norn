@@ -72,13 +72,16 @@ pub struct StorageItem {
     pub updated_at: u64,
 }
 
+use dashmap::DashMap;
+
 /// 账户状态管理器
+#[derive(Clone)]
 pub struct AccountStateManager {
     /// 账户状态存储
-    accounts: Arc<RwLock<HashMap<Address, AccountState>>>,
+    pub accounts: DashMap<Address, AccountState>,
     
     /// 存储状态存储
-    storage: Arc<RwLock<HashMap<Address, HashMap<Vec<u8>, StorageItem>>>>,
+    pub storage: DashMap<Address, HashMap<Vec<u8>, StorageItem>>,
     
     /// 状态根哈希
     state_root: Arc<RwLock<Hash>>,
@@ -193,8 +196,8 @@ impl AccountStateManager {
     /// 创建新的账户状态管理器
     pub fn new(config: AccountStateConfig) -> Self {
         Self {
-            accounts: Arc::new(RwLock::new(HashMap::new())),
-            storage: Arc::new(RwLock::new(HashMap::new())),
+            accounts: DashMap::new(),
+            storage: DashMap::new(),
             state_root: Arc::new(RwLock::new(Hash::default())),
             config,
         }
@@ -203,10 +206,7 @@ impl AccountStateManager {
     /// 获取账户状态
     pub async fn get_account(&self, address: &Address) -> Result<Option<AccountState>> {
         debug!("Getting account state for address: {:?}", address);
-        
-        let accounts = self.accounts.read().await;
-        let account = accounts.get(address).cloned();
-        
+        let account = self.accounts.get(address).map(|r| r.value().clone());
         debug!("Account state for {:?}: {:?}", address, account.is_some());
         Ok(account)
     }
@@ -215,11 +215,10 @@ impl AccountStateManager {
     pub async fn set_account(&self, address: &Address, account: AccountState) -> Result<()> {
         debug!("Setting account state for address: {:?}", address);
         
-        let mut accounts = self.accounts.write().await;
-        let old_account = accounts.get(address).cloned();
+        let old_account = self.accounts.get(address).map(|r| r.value().clone());
         
         // 检查账户数量限制
-        if old_account.is_none() && accounts.len() >= self.config.max_accounts {
+        if old_account.is_none() && self.accounts.len() >= self.config.max_accounts {
             return Err(NornError::Internal("Maximum account limit reached".to_string()));
         }
 
@@ -236,7 +235,7 @@ impl AccountStateManager {
             }
         };
 
-        accounts.insert(*address, account);
+        self.accounts.insert(*address, account);
         
         // 记录变更
         self.record_change(change).await;
@@ -249,8 +248,7 @@ impl AccountStateManager {
     pub async fn delete_account(&self, address: &Address) -> Result<()> {
         debug!("Deleting account: {:?}", address);
         
-        let mut accounts = self.accounts.write().await;
-        let old_account = accounts.remove(address);
+        let old_account = self.accounts.remove(address).map(|(_, v)| v);
         
         if let Some(account) = old_account {
             let change = StateChange::AccountDeleted {
@@ -262,8 +260,7 @@ impl AccountStateManager {
             self.record_change(change).await;
             
             // 删除相关存储
-            let mut storage = self.storage.write().await;
-            storage.remove(address);
+            self.storage.remove(address);
             
             debug!("Account deleted: {:?}", address);
         } else {
@@ -276,13 +273,8 @@ impl AccountStateManager {
     /// 获取存储值
     pub async fn get_storage(&self, address: &Address, key: &[u8]) -> Result<Option<Vec<u8>>> {
         debug!("Getting storage for address: {:?}, key: {:?}", address, key);
-        
-        let storage = self.storage.read().await;
-        let value = storage
-            .get(address)
-            .and_then(|account_storage| account_storage.get(key))
-            .map(|item| item.value.clone());
-        
+        let value = self.storage.get(address)
+            .and_then(|account_storage| account_storage.get(key).map(|item| item.value.clone()));
         debug!("Storage value for {:?}/{:?}: {:?}", address, key, value.is_some());
         Ok(value)
     }
@@ -291,8 +283,7 @@ impl AccountStateManager {
     pub async fn set_storage(&self, address: &Address, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
         debug!("Setting storage for address: {:?}, key: {:?}", address, key);
 
-        let mut storage = self.storage.write().await;
-        let account_storage = storage.entry(*address).or_insert_with(HashMap::new);
+        let mut account_storage = self.storage.entry(*address).or_default();
 
         // 检查存储项数量限制
         if !account_storage.contains_key(&key) && account_storage.len() >= self.config.max_storage_items {
@@ -305,20 +296,11 @@ impl AccountStateManager {
             .map_err(|e| NornError::Internal(format!("Time error: {}", e)))?
             .as_secs();
 
-        let change = if old_value.is_none() {
-            StateChange::StorageSet {
-                address: *address,
-                key: key.clone(),
-                old_value: None,
-                new_value: value.clone(),
-            }
-        } else {
-            StateChange::StorageSet {
-                address: *address,
-                key: key.clone(),
-                old_value,
-                new_value: value.clone(),
-            }
+        let change = StateChange::StorageSet {
+            address: *address,
+            key: key.clone(),
+            old_value,
+            new_value: value.clone(),
         };
 
         let storage_item = StorageItem {
@@ -329,6 +311,7 @@ impl AccountStateManager {
         };
 
         account_storage.insert(key, storage_item);
+        drop(account_storage);
 
         // 记录变更
         self.record_change(change).await;
@@ -341,14 +324,14 @@ impl AccountStateManager {
     pub async fn delete_storage(&self, address: &Address, key: &[u8]) -> Result<()> {
         debug!("Deleting storage for address: {:?}, key: {:?}", address, key);
         
-        let mut storage = self.storage.write().await;
-        if let Some(account_storage) = storage.get_mut(address) {
+        if let Some(mut account_storage) = self.storage.get_mut(address) {
             if let Some(item) = account_storage.remove(key) {
                 let change = StateChange::StorageDeleted {
                     address: *address,
                     key: key.to_vec(),
                     old_value: item.value,
                 };
+                drop(account_storage);
                 
                 // 记录变更
                 self.record_change(change).await;
@@ -365,44 +348,39 @@ impl AccountStateManager {
     /// 更新账户余额
     pub async fn update_balance(&self, address: &Address, new_balance: BigUint) -> Result<()> {
         debug!("Updating balance for address: {:?}, new balance: {}", address, new_balance);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         
-        let mut accounts = self.accounts.write().await;
-        let account = accounts.entry(*address).or_insert_with(|| AccountState {
+        let mut entry = self.accounts.entry(*address).or_insert_with(|| AccountState {
             address: *address,
             balance: BigUint::zero(),
             nonce: 0,
             code_hash: None,
             storage_root: Hash::default(),
             account_type: AccountType::Normal,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            updated_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            created_at: now,
+            updated_at: now,
             deleted: false,
         });
 
-        let old_balance = account.balance.clone();
-        account.balance = new_balance.clone();
-        account.updated_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let old_balance = entry.balance.clone();
+        entry.balance = new_balance.clone();
+        entry.updated_at = now;
+
+        let old_account = entry.value().clone();
+        drop(entry);
 
         let change = StateChange::AccountUpdated {
             address: *address,
             old_account: AccountState {
                 balance: old_balance,
-                ..account.clone()
+                ..old_account.clone()
             },
-            new_account: account.clone(),
+            new_account: old_account,
         };
 
-        // 记录变更
-        drop(accounts);
         self.record_change(change).await;
         
         debug!("Balance updated for address: {:?}", address);
@@ -433,33 +411,27 @@ impl AccountStateManager {
     /// 增加 Nonce
     pub async fn increment_nonce(&self, address: &Address) -> Result<u64> {
         debug!("Incrementing nonce for address: {:?}", address);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         
-        let mut accounts = self.accounts.write().await;
-        let account = accounts.entry(*address).or_insert_with(|| AccountState {
+        let mut entry = self.accounts.entry(*address).or_insert_with(|| AccountState {
             address: *address,
             balance: BigUint::zero(),
             nonce: 0,
             code_hash: None,
             storage_root: Hash::default(),
             account_type: AccountType::Normal,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            updated_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            created_at: now,
+            updated_at: now,
             deleted: false,
         });
 
-        account.nonce += 1;
-        account.updated_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let new_nonce = account.nonce;
+        entry.nonce += 1;
+        entry.updated_at = now;
+        let new_nonce = entry.nonce;
+        drop(entry);
         
         debug!("Nonce incremented for address: {:?}, new nonce: {}", address, new_nonce);
         Ok(new_nonce)
@@ -494,20 +466,19 @@ impl AccountStateManager {
     pub async fn compute_state_root(&self) -> Result<Hash> {
         debug!("Computing state root hash");
         
-        let accounts = self.accounts.read().await;
-        let storage = self.storage.read().await;
-        
         // 创建包含所有账户数据的映射
         let mut state_data = HashMap::new();
         
-        for (address, account) in accounts.iter() {
+        for entry in self.accounts.iter() {
+            let address = entry.key();
+            let account = entry.value();
             if !account.deleted {
                 // 序列化账户状态
                 let account_data = serde_json::to_vec(account)?;
                 state_data.insert(address.0.to_vec(), account_data);
 
                 // 添加存储数据
-                if let Some(account_storage) = storage.get(address) {
+                if let Some(account_storage) = self.storage.get(address) {
                     for (key, item) in account_storage.iter() {
                         let storage_key = [&address.0[..], key].concat();
                         state_data.insert(storage_key, item.value.clone());
@@ -546,8 +517,12 @@ impl AccountStateManager {
     pub async fn create_snapshot(&self, snapshot_id: u64) -> Result<StateSnapshot> {
         debug!("Creating state snapshot: {}", snapshot_id);
         
-        let accounts = self.accounts.read().await;
-        let storage = self.storage.read().await;
+        let accounts_map: HashMap<Address, AccountState> = self.accounts.iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
+        let storage_map: HashMap<Address, HashMap<Vec<u8>, StorageItem>> = self.storage.iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
         let state_root = self.state_root.read().await;
         
         let snapshot = StateSnapshot {
@@ -557,9 +532,9 @@ impl AccountStateManager {
                 .unwrap()
                 .as_secs(),
             state_root: *state_root,
-            accounts: accounts.clone(),
-            storage: storage.clone(),
-            changes: Vec::new(), // TODO: 收集变更历史
+            accounts: accounts_map,
+            storage: storage_map,
+            changes: Vec::new(),
         };
         
         debug!("State snapshot created: {}", snapshot_id);
@@ -570,14 +545,14 @@ impl AccountStateManager {
     pub async fn restore_snapshot(&self, snapshot: &StateSnapshot) -> Result<()> {
         debug!("Restoring state snapshot: {}", snapshot.id);
         
-        {
-            let mut accounts = self.accounts.write().await;
-            *accounts = snapshot.accounts.clone();
+        self.accounts.clear();
+        for (k, v) in &snapshot.accounts {
+            self.accounts.insert(*k, v.clone());
         }
         
-        {
-            let mut storage = self.storage.write().await;
-            *storage = snapshot.storage.clone();
+        self.storage.clear();
+        for (k, v) in &snapshot.storage {
+            self.storage.insert(*k, v.clone());
         }
         
         {
@@ -593,19 +568,16 @@ impl AccountStateManager {
     pub async fn cleanup_deleted_accounts(&self) -> Result<usize> {
         debug!("Cleaning up deleted accounts");
         
-        let mut accounts = self.accounts.write().await;
-        let mut storage = self.storage.write().await;
-        
-        let mut deleted_count = 0;
-        let addresses_to_remove: Vec<Address> = accounts
+        let addresses_to_remove: Vec<Address> = self.accounts
             .iter()
-            .filter(|(_, account)| account.deleted)
-            .map(|(address, _)| *address)
+            .filter(|r| r.value().deleted)
+            .map(|r| *r.key())
             .collect();
         
+        let mut deleted_count = 0;
         for address in addresses_to_remove {
-            accounts.remove(&address);
-            storage.remove(&address);
+            self.accounts.remove(&address);
+            self.storage.remove(&address);
             deleted_count += 1;
         }
         
@@ -615,12 +587,10 @@ impl AccountStateManager {
 
     /// 获取统计信息
     pub async fn get_stats(&self) -> AccountStateStats {
-        let accounts = self.accounts.read().await;
-        let storage = self.storage.read().await;
-        
         let mut stats = AccountStateStats::default();
         
-        for account in accounts.values() {
+        for entry in self.accounts.iter() {
+            let account = entry.value();
             stats.total_accounts += 1;
             
             if account.deleted {
@@ -637,8 +607,8 @@ impl AccountStateManager {
             }
         }
         
-        for account_storage in storage.values() {
-            stats.total_storage_items += account_storage.len() as u64;
+        for entry in self.storage.iter() {
+            stats.total_storage_items += entry.value().len() as u64;
         }
         
         stats
@@ -646,8 +616,6 @@ impl AccountStateManager {
 
     /// 记录状态变更
     async fn record_change(&self, change: StateChange) {
-        // 这里可以记录到日志或数据库中
-        // 对于生产环境，应该使用StateHistory管理器
         debug!("Recording state change: {:?}", change);
 
         // 发送到tracing系统作为日志
@@ -661,7 +629,6 @@ impl AccountStateManager {
             }
             StateChange::AccountDeleted { address, old_account } => {
                 info!("Account deleted: {:?}", hex::encode(address));
-                // old_account is available but not used in logging
                 let _ = old_account;
             }
             StateChange::BalanceChanged { address, old_balance, new_balance } => {
@@ -685,14 +652,14 @@ impl AccountStateManager {
         Ok(account.map(|a| a.balance).unwrap_or_else(|| BigUint::from(0u32)))
     }
 
-    /// Get accounts lock (for state root calculation and other advanced operations)
-    pub async fn accounts_lock(&self) -> Arc<RwLock<HashMap<Address, AccountState>>> {
-        Arc::clone(&self.accounts)
+    /// Get accounts map reference
+    pub fn accounts_map(&self) -> DashMap<Address, AccountState> {
+        self.accounts.clone()
     }
 
-    /// Get storage lock (for state root calculation and other advanced operations)
-    pub async fn storage_lock(&self) -> Arc<RwLock<HashMap<Address, HashMap<Vec<u8>, StorageItem>>>> {
-        Arc::clone(&self.storage)
+    /// Get storage map reference
+    pub fn storage_map(&self) -> DashMap<Address, HashMap<Vec<u8>, StorageItem>> {
+        self.storage.clone()
     }
 }
 
