@@ -1,447 +1,299 @@
-// VRF（可验证随机函数）模块
-// 
-// 实现基于 ECDSA 的可验证随机函数，用于 PoVF 共识中的随机数生成
+//! VRF (Verifiable Random Function) Module using schnorrkel (Ristretto255 + Merlin Transcript)
+//! 
+//! Implements VRF signing, verification, and domain-separated score/randomness derivation
+//! according to the Norn security and consensus specification.
 
-use anyhow::{Result, anyhow};
-use curve25519_dalek::{
-    ristretto::RistrettoPoint,
-    scalar::Scalar,
-};
-use rand::rngs::OsRng;
-use rand_core::RngCore;
-use sha2::{Digest, Sha512};
-use std::collections::HashMap;
-use tracing::{info, warn};
+use anyhow::{anyhow, Result};
+use merlin::Transcript;
+use norn_common::consensus_types::ValidatorRecord;
+use norn_common::types::{ChainId, Hash, ProtocolVersion, StakeSnapshotHash, ValidatorId, VrfPublicKey};
+use schnorrkel::vrf::{VRFInOut, VRFPreOut, VRFProof};
+use schnorrkel::{Keypair, PublicKey};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fmt;
 
-// 重新定义类型以避免依赖问题
-pub type Address = [u8; 20];
-pub type StakeAmount = u64;
-
-// 辅助函数：将地址转换为十六进制字符串
-fn address_to_hex(address: &Address) -> String {
-    hex::encode(address)
+/// Struct containing context fields for VRF domain binding
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VrfContext {
+    pub protocol_version: ProtocolVersion,
+    pub chain_id: ChainId,
+    pub epoch: u64,
+    pub height: u64,
+    pub round: u32,
+    pub parent_block_hash: Hash,
+    pub stake_snapshot_hash: StakeSnapshotHash,
+    pub validator_id: ValidatorId,
 }
 
-/// VRF 密钥对
-#[derive(Debug, Clone)]
+impl VrfContext {
+    pub fn build_transcript(&self) -> Transcript {
+        let mut t = Transcript::new(b"NORN_VRF_V2");
+        t.append_message(b"protocol_version", &self.protocol_version.0.to_be_bytes());
+        t.append_message(b"chain_id", &self.chain_id.0.0);
+        t.append_message(b"epoch", &self.epoch.to_be_bytes());
+        t.append_message(b"height", &self.height.to_be_bytes());
+        t.append_message(b"round", &self.round.to_be_bytes());
+        t.append_message(b"parent_block_hash", &self.parent_block_hash.0);
+        t.append_message(b"stake_snapshot_hash", &self.stake_snapshot_hash.0);
+        t.append_message(b"validator_id", &self.validator_id.0);
+        t
+    }
+}
+
+/// Helper function to build a generic transcript for ad-hoc messages
+pub fn build_message_transcript(message: &[u8]) -> Transcript {
+    let mut t = Transcript::new(b"NORN_VRF_V2_GENERIC");
+    t.append_message(b"message", message);
+    t
+}
+
+/// VRF Key Pair wrapping Schnorrkel Keypair
+#[derive(Clone)]
 pub struct VRFKeyPair {
-    /// 私钥
-    pub private_key: Scalar,
-    /// 公钥
-    pub public_key: RistrettoPoint,
+    keypair: Keypair,
+}
+
+impl fmt::Debug for VRFKeyPair {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "VRFKeyPair(public: {:?})", hex::encode(self.public_key_bytes()))
+    }
 }
 
 impl VRFKeyPair {
-    /// 生成新的 VRF 密钥对
+    /// Generate a new random VRF KeyPair
     pub fn generate() -> Self {
-        let mut csprng = OsRng;
-        let mut private_key_bytes = [0u8; 32];
-        csprng.fill_bytes(&mut private_key_bytes);
-        let private_key = Scalar::from_bytes_mod_order(private_key_bytes);
-        let public_key = RistrettoPoint::mul_base(&private_key);
-        
-        Self {
-            private_key,
-            public_key,
-        }
+        let keypair = Keypair::generate_with(&mut rand::thread_rng());
+        Self { keypair }
     }
 
-    /// 从种子生成密钥对
+    /// Generate VRF KeyPair from seed bytes
     pub fn from_seed(seed: &[u8]) -> Self {
+        use sha2::{Digest, Sha512};
         let mut hasher = Sha512::new();
+        hasher.update(b"NORN_VRF_SEED");
         hasher.update(seed);
         let hash = hasher.finalize();
-        
-        let mut private_key_bytes = [0u8; 32];
-        private_key_bytes.copy_from_slice(&hash[..32]);
-        let private_key = Scalar::from_bytes_mod_order(private_key_bytes);
-        let public_key = RistrettoPoint::mul_base(&private_key);
-        
-        Self {
-            private_key,
-            public_key,
-        }
+        let mini_secret = schnorrkel::MiniSecretKey::from_bytes(&hash[..32])
+            .expect("32 bytes is valid MiniSecretKey");
+        let secret = mini_secret.expand(schnorrkel::ExpansionMode::Ed25519);
+        let keypair = secret.to_keypair();
+        Self { keypair }
     }
 
-    /// 获取公钥的字节表示
+    /// Get 32-byte public key
     pub fn public_key_bytes(&self) -> [u8; 32] {
-        self.public_key.compress().to_bytes()
+        self.keypair.public.to_bytes()
     }
 
-    /// 获取私钥的字节表示
-    pub fn private_key_bytes(&self) -> [u8; 32] {
-        self.private_key.to_bytes()
+    /// Get VrfPublicKey wrapper
+    pub fn vrf_public_key(&self) -> VrfPublicKey {
+        VrfPublicKey(self.public_key_bytes())
+    }
+
+    /// Get 64-byte secret key representation
+    pub fn private_key_bytes(&self) -> [u8; 64] {
+        self.keypair.secret.to_bytes()
+    }
+
+    /// Sign transcript to produce VRF pre-out (32 bytes) and VRF proof (64 bytes)
+    pub fn vrf_sign(&self, transcript: Transcript) -> (VRFPreOutBytes, VRFProofBytes) {
+        let (inout, proof, _) = self.keypair.vrf_sign(transcript);
+        let preout_bytes = inout.output.to_bytes();
+        let proof_bytes = proof.to_bytes();
+        (VRFPreOutBytes(preout_bytes), VRFProofBytes(proof_bytes))
     }
 }
 
-/// VRF 输出
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct VRFOutput {
-    /// VRF 输出值（32字节）
-    pub output: [u8; 32],
-    /// 证明
-    pub proof: VRFProof,
-}
+/// 32-byte VRF PreOut bytes wrapper
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct VRFPreOutBytes(pub [u8; 32]);
 
-/// VRF 证明
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VRFProof {
-    /// 证明点
-    pub gamma: RistrettoPoint,
-    /// 挑战标量
-    pub challenge: Scalar,
-    /// 响应标量
-    pub response: Scalar,
-}
-
-impl serde::Serialize for VRFProof {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+impl Serialize for VRFPreOutBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer,
+        S: Serializer,
     {
-        // Serialize as hex-encoded bytes
-        let bytes = self.to_bytes();
-        serializer.serialize_str(&hex::encode(bytes))
+        serializer.serialize_str(&hex::encode(self.0))
     }
 }
 
-impl<'de> serde::Deserialize<'de> for VRFProof {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+impl<'de> Deserialize<'de> for VRFPreOutBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        VRFProof::from_bytes(&bytes).map_err(serde::de::Error::custom)
-    }
-}
-
-impl VRFProof {
-    /// 序列化证明
-    pub fn to_bytes(&self) -> [u8; 96] {
-        let mut bytes = [0u8; 96];
-        bytes[0..32].copy_from_slice(&self.gamma.compress().to_bytes());
-        bytes[32..64].copy_from_slice(&self.challenge.to_bytes());
-        bytes[64..96].copy_from_slice(&self.response.to_bytes());
-        bytes
-    }
-
-    /// 从字节反序列化证明
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() != 96 {
-            return Err(anyhow!("Invalid proof length"));
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom("Invalid VRFPreOutBytes length"));
         }
-
-        let gamma_bytes: [u8; 32] = bytes[0..32].try_into()
-            .map_err(|_| anyhow!("Invalid gamma bytes"))?;
-        let challenge_bytes: [u8; 32] = bytes[32..64].try_into()
-            .map_err(|_| anyhow!("Invalid challenge bytes"))?;
-        let response_bytes: [u8; 32] = bytes[64..96].try_into()
-            .map_err(|_| anyhow!("Invalid response bytes"))?;
-
-        let gamma_compressed = curve25519_dalek::ristretto::CompressedRistretto(gamma_bytes);
-        let gamma = gamma_compressed.decompress()
-            .ok_or_else(|| anyhow!("Invalid gamma point"))?;
-
-        let challenge = Scalar::from_bytes_mod_order(challenge_bytes);
-        let response = Scalar::from_bytes_mod_order(response_bytes);
-
-        Ok(Self {
-            gamma,
-            challenge,
-            response,
-        })
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(VRFPreOutBytes(arr))
     }
 }
 
-/// VRF 计算器
+/// 64-byte VRF Proof bytes wrapper
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VRFProofBytes(pub [u8; 64]);
+
+impl Default for VRFProofBytes {
+    fn default() -> Self {
+        Self([0u8; 64])
+    }
+}
+
+impl Serialize for VRFProofBytes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for VRFProofBytes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 64 {
+            return Err(serde::de::Error::custom("Invalid VRFProofBytes length"));
+        }
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&bytes);
+        Ok(VRFProofBytes(arr))
+    }
+}
+
+/// Serde-compatible complete VRF Output struct
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VRFOutputData {
+    pub preout: VRFPreOutBytes,
+    pub proof: VRFProofBytes,
+    pub output_bytes: [u8; 32],
+}
+
+/// Verify a VRF signature and derive VRFInOut
+pub fn verify_vrf(
+    pub_key_bytes: &[u8; 32],
+    transcript: Transcript,
+    preout_bytes: &VRFPreOutBytes,
+    proof_bytes: &VRFProofBytes,
+) -> Result<VRFInOut> {
+    let public_key = PublicKey::from_bytes(pub_key_bytes)
+        .map_err(|e| anyhow!("Invalid public key bytes: {:?}", e))?;
+    
+    let preout = VRFPreOut::from_bytes(&preout_bytes.0)
+        .map_err(|e| anyhow!("Invalid VRF preout bytes: {:?}", e))?;
+    let proof = VRFProof::from_bytes(&proof_bytes.0)
+        .map_err(|e| anyhow!("Invalid VRF proof bytes: {:?}", e))?;
+
+    // Note: vrf_verify uses non-malleable public key binding by default (NOT Malleable)
+    let (vrf_inout, _) = public_key
+        .vrf_verify(transcript, &preout, &proof)
+        .map_err(|e| anyhow!("VRF verification failed: {:?}", e))?;
+
+    Ok(vrf_inout)
+}
+
+/// Derive 256-bit score bytes for proposer selection using VRFInOut::make_bytes
+pub fn derive_vrf_score_bytes(vrf_inout: &VRFInOut) -> [u8; 32] {
+    vrf_inout.make_bytes::<[u8; 32]>(b"NORN_VRF_SCORE_V2")
+}
+
+/// Derive 256-bit randomness seed bytes using VRFInOut::make_bytes
+pub fn derive_vrf_randomness_bytes(vrf_inout: &VRFInOut) -> [u8; 32] {
+    vrf_inout.make_bytes::<[u8; 32]>(b"NORN_VRF_RANDOMNESS_V2")
+}
+
+/// High-level VRF Calculator
 pub struct VRFCalculator;
 
 impl VRFCalculator {
-    /// 计算 VRF 输出和证明
-    pub fn calculate(key_pair: &VRFKeyPair, message: &[u8]) -> Result<VRFOutput> {
-        // 1. 计算 H = H(message) - hash to curve
-        let h = Self::hash_to_curve(message)?;
+    pub fn calculate(key_pair: &VRFKeyPair, message: &[u8]) -> Result<VRFOutputData> {
+        let transcript = build_message_transcript(message);
+        let (preout, proof) = key_pair.vrf_sign(transcript.clone());
+        let vrf_inout = verify_vrf(&key_pair.public_key_bytes(), transcript, &preout, &proof)?;
+        let score_bytes = derive_vrf_score_bytes(&vrf_inout);
 
-        // 2. 计算 gamma = H * sk (VRF核心: 私钥对哈希点的标量乘法)
-        let gamma = h * key_pair.private_key;
-
-        // 3. 生成随机数 k
-        let mut csprng = OsRng;
-        let mut k_bytes = [0u8; 32];
-        csprng.fill_bytes(&mut k_bytes);
-        let k = Scalar::from_bytes_mod_order(k_bytes);
-
-        // 4. 计算 U = g^k 和 V = H^k (DLEQ proof)
-        let u = RistrettoPoint::mul_base(&k);
-        let v = h * k;
-
-        // 5. 计算挑战 c = H(g, H, pk, gamma, U, V)
-        let challenge = Self::compute_challenge(
-            &key_pair.public_key,
-            &h,
-            &gamma,
-            &u,
-        );
-
-        // 6. 计算响应 s = k - c * sk
-        let response = k - challenge * key_pair.private_key;
-
-        // 7. 计算 VRF 输出
-        let output = Self::derive_output(&gamma, &h);
-
-        let proof = VRFProof {
-            gamma,
-            challenge,
-            response,
-        };
-
-        Ok(VRFOutput { output, proof })
+        Ok(VRFOutputData {
+            preout,
+            proof,
+            output_bytes: score_bytes,
+        })
     }
 
-    /// 验证 VRF 输出和证明
+    pub fn calculate_with_context(key_pair: &VRFKeyPair, context: &VrfContext) -> Result<VRFOutputData> {
+        let transcript = context.build_transcript();
+        let (preout, proof) = key_pair.vrf_sign(transcript.clone());
+        let vrf_inout = verify_vrf(&key_pair.public_key_bytes(), transcript, &preout, &proof)?;
+        let score_bytes = derive_vrf_score_bytes(&vrf_inout);
+
+        Ok(VRFOutputData {
+            preout,
+            proof,
+            output_bytes: score_bytes,
+        })
+    }
+
     pub fn verify(
-        public_key: &RistrettoPoint,
+        pub_key_bytes: &[u8; 32],
         message: &[u8],
-        output: &VRFOutput,
+        output: &VRFOutputData,
     ) -> Result<bool> {
-        // 1. 计算 H = H(message)
-        let h = Self::hash_to_curve(message)?;
-
-        // 2. 使用DLEQ证明验证
-        // 验证 gamma = h * sk 使用 (challenge, response) 证明
-        // U' = g^s * pk^c (应该等于原始U)
-        // V' = H^s * gamma^c (应该等于原始V)
-        let u_prime = RistrettoPoint::mul_base(&output.proof.response) 
-            + *public_key * output.proof.challenge;
-
-        // 3. 重新计算挑战
-        let challenge_recomputed = Self::compute_challenge(
-            public_key,
-            &h,
-            &output.proof.gamma,
-            &u_prime,
-        );
-
-        // 4. 验证挑战
-        if challenge_recomputed != output.proof.challenge {
-            return Ok(false);
+        let transcript = build_message_transcript(message);
+        match verify_vrf(pub_key_bytes, transcript, &output.preout, &output.proof) {
+            Ok(vrf_inout) => {
+                let score_bytes = derive_vrf_score_bytes(&vrf_inout);
+                Ok(score_bytes == output.output_bytes)
+            }
+            Err(_) => Ok(false),
         }
-
-        // 5. 验证输出
-        let expected_output = Self::derive_output(&output.proof.gamma, &h);
-        
-        Ok(expected_output == output.output)
     }
 
-    /// 将消息哈希到椭圆曲线上
-    fn hash_to_curve(message: &[u8]) -> Result<RistrettoPoint> {
-        let mut hasher = Sha512::new();
-        hasher.update(b"VRF_HASH_TO_CURVE");
-        hasher.update(message);
-        let hash = hasher.finalize();
-
-        // 使用哈希值生成标量，然后映射到曲线
-        let mut scalar_bytes = [0u8; 32];
-        scalar_bytes.copy_from_slice(&hash[..32]);
-        let scalar = Scalar::from_bytes_mod_order(scalar_bytes);
-        Ok(RistrettoPoint::mul_base(&scalar))
-    }
-
-    /// 计算挑战
-    fn compute_challenge(
-        pk: &RistrettoPoint,
-        h: &RistrettoPoint,
-        gamma: &RistrettoPoint,
-        commitment: &RistrettoPoint,
-    ) -> Scalar {
-        let mut hasher = Sha512::new();
-        hasher.update(b"VRF_CHALLENGE");
-        hasher.update(pk.compress().to_bytes());
-        hasher.update(h.compress().to_bytes());
-        hasher.update(gamma.compress().to_bytes());
-        hasher.update(commitment.compress().to_bytes());
-        let hash = hasher.finalize();
-
-        let mut challenge_bytes = [0u8; 32];
-        challenge_bytes.copy_from_slice(&hash[..32]);
-        Scalar::from_bytes_mod_order(challenge_bytes)
-    }
-
-    /// 从 gamma 和 H 推导输出
-    fn derive_output(gamma: &RistrettoPoint, h: &RistrettoPoint) -> [u8; 32] {
-        let mut hasher = Sha512::new();
-        hasher.update(b"VRF_OUTPUT");
-        hasher.update(gamma.compress().as_bytes());
-        hasher.update(h.compress().as_bytes());
-        let hash = hasher.finalize();
-
-        let mut output = [0u8; 32];
-        output.copy_from_slice(&hash[..32]);
-        output
+    pub fn verify_with_context(
+        pub_key_bytes: &[u8; 32],
+        context: &VrfContext,
+        output: &VRFOutputData,
+    ) -> Result<bool> {
+        let transcript = context.build_transcript();
+        match verify_vrf(pub_key_bytes, transcript, &output.preout, &output.proof) {
+            Ok(vrf_inout) => {
+                let score_bytes = derive_vrf_score_bytes(&vrf_inout);
+                Ok(score_bytes == output.output_bytes)
+            }
+            Err(_) => Ok(false),
+        }
     }
 }
 
-/// VRF 选择器 - 用于基于权益的随机选择
+/// Lightweight selector registry storing ONLY VrfPublicKey and voting power
 pub struct VRFSelector {
-    /// 验证者权益映射
-    validators: HashMap<Address, StakeAmount>,
-    /// VRF 密钥映射
-    key_pairs: HashMap<Address, VRFKeyPair>,
+    validators: std::collections::BTreeMap<ValidatorId, (VrfPublicKey, u64)>,
 }
 
 impl VRFSelector {
-    /// 创建新的 VRF 选择器
     pub fn new() -> Self {
         Self {
-            validators: HashMap::new(),
-            key_pairs: HashMap::new(),
+            validators: std::collections::BTreeMap::new(),
         }
     }
 
-    /// 添加验证者
-    pub fn add_validator(&mut self, address: Address, stake: StakeAmount, key_pair: VRFKeyPair) {
-        self.validators.insert(address, stake);
-        self.key_pairs.insert(address, key_pair);
-        info!("添加验证者: {} (权益: {})", address_to_hex(&address), stake);
+    pub fn add_validator(&mut self, id: ValidatorId, vrf_pub_key: VrfPublicKey, voting_power: u64) {
+        self.validators.insert(id, (vrf_pub_key, voting_power));
     }
 
-    /// 移除验证者
-    pub fn remove_validator(&mut self, address: &Address) {
-        self.validators.remove(address);
-        self.key_pairs.remove(address);
-        info!("移除验证者: {}", address_to_hex(address));
+    pub fn get_validator(&self, id: &ValidatorId) -> Option<&(VrfPublicKey, u64)> {
+        self.validators.get(id)
     }
 
-    /// 选择提议者
-    pub fn select_proposer(&self, message: &[u8], round: u64) -> Result<(Address, VRFOutput)> {
-        if self.validators.is_empty() {
-            return Err(anyhow!("没有可用的验证者"));
-        }
-
-        // 计算总权益
-        let total_stake: StakeAmount = self.validators.values().sum();
-        if total_stake == 0 {
-            return Err(anyhow!("总权益为零"));
-        }
-
-        // 为每个验证者生成 VRF 输出
-        let mut candidates = Vec::new();
-        for (address, key_pair) in &self.key_pairs {
-            let vrf_message = Self::create_selection_message(message, round, address);
-            match VRFCalculator::calculate(key_pair, &vrf_message) {
-                Ok(output) => {
-                    let stake = self.validators.get(address).unwrap();
-                    candidates.push((*address, output, *stake));
-                }
-                Err(e) => {
-                    warn!("验证者 {} VRF 计算失败: {:?}", address_to_hex(&address), e);
-                }
-            }
-        }
-
-        if candidates.is_empty() {
-            return Err(anyhow!("没有有效的候选者"));
-        }
-
-        // 选择具有最低 VRF 输出的验证者（考虑权益权重）
-        let mut best_candidate = None;
-        let mut best_score = None;
-
-        for (address, output, stake) in candidates {
-            let score = Self::calculate_vrf_score(&output.output, stake, total_stake);
-            
-            match best_score {
-                None => {
-                    best_score = Some(score);
-                    best_candidate = Some((address, output));
-                }
-                Some(best) => {
-                    if score < best {
-                        best_score = Some(score);
-                        best_candidate = Some((address, output));
-                    }
-                }
-            }
-        }
-
-        best_candidate.ok_or_else(|| anyhow!("选择失败"))
+    pub fn total_voting_power(&self) -> u128 {
+        self.validators.values().fold(0u128, |acc, (_, weight)| acc.saturating_add(*weight as u128))
     }
 
-    /// 验证提议者选择
-    pub fn verify_selection(
-        &self,
-        proposer: Address,
-        message: &[u8],
-        round: u64,
-        output: &VRFOutput,
-    ) -> Result<bool> {
-        // 检查验证者是否存在
-        let public_key = match self.key_pairs.get(&proposer) {
-            Some(key_pair) => key_pair.public_key,
-            None => return Ok(false),
-        };
-
-        let stake = match self.validators.get(&proposer) {
-            Some(stake) => *stake,
-            None => return Ok(false),
-        };
-
-        // 验证 VRF
-        let vrf_message = Self::create_selection_message(message, round, &proposer);
-        let vrf_valid = VRFCalculator::verify(&public_key, &vrf_message, output)?;
-
-        if !vrf_valid {
-            return Ok(false);
-        }
-
-        // 验证选择是否有效（这里可以实现更复杂的验证逻辑）
-        let total_stake: StakeAmount = self.validators.values().sum();
-        let score = Self::calculate_vrf_score(&output.output, stake, total_stake);
-        
-        // 这里可以实现阈值检查等
-        Ok(true)
-    }
-
-    /// 创建选择消息
-    pub fn create_selection_message(message: &[u8], round: u64, address: &Address) -> Vec<u8> {
-        let mut vrf_message = Vec::new();
-        vrf_message.extend_from_slice(b"VRF_SELECTOR");
-        vrf_message.extend_from_slice(message);
-        vrf_message.extend_from_slice(&round.to_be_bytes());
-        vrf_message.extend_from_slice(address);
-        vrf_message
-    }
-
-    /// 计算 VRF 分数（考虑权益权重）
-    fn calculate_vrf_score(vrf_output: &[u8], stake: StakeAmount, total_stake: StakeAmount) -> f64 {
-        if total_stake == 0 {
-            return 1.0;
-        }
-
-        // 将 VRF 输出的前 8 字节作为 u64
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&vrf_output[..8]);
-        let vrf_value = u64::from_be_bytes(bytes);
-
-        // 归一化到 [0, 1)
-        let normalized_vrf = vrf_value as f64 / u64::MAX as f64;
-
-        // 应用权益权重：权益越高，有效分数越低
-        let stake_ratio = stake as f64 / total_stake as f64;
-        
-        // 使用对数函数来平衡权益影响
-        let stake_factor = 1.0 - (stake_ratio.ln() / (total_stake as f64).ln()).max(0.0);
-
-        normalized_vrf * stake_factor
-    }
-
-    /// 获取验证者列表
-    pub fn get_validators(&self) -> Vec<(Address, StakeAmount)> {
-        self.validators.iter().map(|(addr, stake)| (*addr, *stake)).collect()
-    }
-
-    /// 获取验证者数量
     pub fn validator_count(&self) -> usize {
         self.validators.len()
     }
@@ -459,131 +311,58 @@ mod tests {
 
     #[test]
     fn test_vrf_keypair_generation() {
-        let key_pair = VRFKeyPair::generate();
-        
-        // 验证公钥可以从私钥派生
-        let expected_public = RistrettoPoint::mul_base(&key_pair.private_key);
-        assert_eq!(key_pair.public_key, expected_public);
-        
-        // 验证字节表示长度
-        assert_eq!(key_pair.public_key_bytes().len(), 32);
-        assert_eq!(key_pair.private_key_bytes().len(), 32);
+        let keypair = VRFKeyPair::generate();
+        assert_eq!(keypair.public_key_bytes().len(), 32);
+        assert_eq!(keypair.private_key_bytes().len(), 64);
     }
 
     #[test]
     fn test_vrf_keypair_from_seed() {
-        let seed = b"test_seed_for_vrf";
-        let key_pair1 = VRFKeyPair::from_seed(seed);
-        let key_pair2 = VRFKeyPair::from_seed(seed);
-        
-        // 相同种子应该生成相同的密钥对
-        assert_eq!(key_pair1.private_key, key_pair2.private_key);
-        assert_eq!(key_pair1.public_key, key_pair2.public_key);
+        let seed = b"test_seed_for_vrf_schnorrkel";
+        let key1 = VRFKeyPair::from_seed(seed);
+        let key2 = VRFKeyPair::from_seed(seed);
+        assert_eq!(key1.public_key_bytes(), key2.public_key_bytes());
+        assert_eq!(key1.private_key_bytes(), key2.private_key_bytes());
     }
 
     #[test]
     fn test_vrf_calculate_and_verify() {
-        let key_pair = VRFKeyPair::generate();
-        let message = b"Hello, VRF!";
-        
-        // 计算 VRF
-        let output = VRFCalculator::calculate(&key_pair, message).unwrap();
-        
-        // 验证 VRF
-        let verified = VRFCalculator::verify(&key_pair.public_key, message, &output).unwrap();
-        assert!(verified);
-        
-        // 验证错误消息应该失败
+        let keypair = VRFKeyPair::generate();
+        let message = b"Hello VRF Schnorrkel!";
+
+        let output = VRFCalculator::calculate(&keypair, message).unwrap();
+        let valid = VRFCalculator::verify(&keypair.public_key_bytes(), message, &output).unwrap();
+        assert!(valid);
+
         let wrong_message = b"Wrong message";
-        let verified_wrong = VRFCalculator::verify(&key_pair.public_key, wrong_message, &output).unwrap();
-        assert!(!verified_wrong);
+        let invalid = VRFCalculator::verify(&keypair.public_key_bytes(), wrong_message, &output).unwrap();
+        assert!(!invalid);
     }
 
     #[test]
-    fn test_vrf_proof_serialization() {
-        let key_pair = VRFKeyPair::generate();
-        let message = b"Serialization test";
-        
-        let output = VRFCalculator::calculate(&key_pair, message).unwrap();
-        let proof_bytes = output.proof.to_bytes();
-        
-        // 反序列化
-        let proof_restored = VRFProof::from_bytes(&proof_bytes).unwrap();
-        
-        // 验证证明相同
-        assert_eq!(output.proof.gamma, proof_restored.gamma);
-        assert_eq!(output.proof.challenge, proof_restored.challenge);
-        assert_eq!(output.proof.response, proof_restored.response);
+    fn test_vrf_domain_separation_make_bytes() {
+        let keypair = VRFKeyPair::generate();
+        let transcript = build_message_transcript(b"test_domain");
+        let (preout, proof) = keypair.vrf_sign(transcript.clone());
+
+        let vrf_inout = verify_vrf(&keypair.public_key_bytes(), transcript, &preout, &proof).unwrap();
+
+        let score = derive_vrf_score_bytes(&vrf_inout);
+        let randomness = derive_vrf_randomness_bytes(&vrf_inout);
+
+        // NORN_VRF_SCORE_V2 and NORN_VRF_RANDOMNESS_V2 must yield different outputs
+        assert_ne!(score, randomness);
     }
 
     #[test]
-    fn test_vrf_selector() {
-        let mut selector = VRFSelector::new();
-        
-        // 添加验证者
-        let addr1 = Address::from([1u8; 20]);
-        let addr2 = Address::from([2u8; 20]);
-        let key1 = VRFKeyPair::generate();
-        let key2 = VRFKeyPair::generate();
-        
-        selector.add_validator(addr1, 1000, key1);
-        selector.add_validator(addr2, 2000, key2);
-        
-        assert_eq!(selector.validator_count(), 2);
-        
-        // 选择提议者
-        let message = b"selection_test";
-        let (proposer, output) = selector.select_proposer(message, 1).unwrap();
-        
-        // 验证选择
-        let verified = selector.verify_selection(proposer, message, 1, &output).unwrap();
-        assert!(verified);
-        
-        // 验证应该是 addr1 或 addr2 之一
-        assert!(proposer == addr1 || proposer == addr2);
-    }
+    fn test_vrf_tampered_proof_fails() {
+        let keypair = VRFKeyPair::generate();
+        let message = b"Tamper proof test";
+        let mut output = VRFCalculator::calculate(&keypair, message).unwrap();
 
-    #[test]
-    fn test_vrf_deterministic_output() {
-        let key_pair = VRFKeyPair::generate();
-        let message = b"Deterministic test";
-        
-        let output1 = VRFCalculator::calculate(&key_pair, message).unwrap();
-        let output2 = VRFCalculator::calculate(&key_pair, message).unwrap();
-        
-        // 相同密钥和消息应该产生相同的输出
-        assert_eq!(output1.output, output2.output);
-    }
-
-    #[test]
-    fn test_vrf_different_keys() {
-        let key1 = VRFKeyPair::generate();
-        let key2 = VRFKeyPair::generate();
-        let message = b"Same message";
-        
-        let output1 = VRFCalculator::calculate(&key1, message).unwrap();
-        let output2 = VRFCalculator::calculate(&key2, message).unwrap();
-        
-        // 不同密钥应该产生不同的输出
-        assert_ne!(output1.output, output2.output);
-    }
-
-    #[test]
-    fn test_vrf_score_calculation() {
-        let vrf_output = [0u8; 32]; // 最小输出
-        let stake = 1000;
-        let total_stake = 10000;
-        
-        let score = VRFSelector::calculate_vrf_score(&vrf_output, stake, total_stake);
-        
-        // 最小 VRF 输出应该产生很小的分数
-        assert!(score < 0.1);
-        
-        // 测试最大输出
-        let max_output = [0xFFu8; 32];
-        let max_score = VRFSelector::calculate_vrf_score(&max_output, stake, total_stake);
-        
-        // 最大输出应该产生较大的分数
-        assert!(max_score > score);
+        // Flip a byte in the proof
+        output.proof.0[0] ^= 0xFF;
+        let valid = VRFCalculator::verify(&keypair.public_key_bytes(), message, &output).unwrap();
+        assert!(!valid);
     }
 }

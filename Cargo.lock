@@ -1289,6 +1289,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "curve25519-dalek-ng"
+version = "4.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c359b7249347e46fb28804470d071c921156ad62b3eef5d34e2ba867533dec8"
+dependencies = [
+ "byteorder",
+ "digest 0.9.0",
+ "rand_core 0.6.4",
+ "subtle-ng",
+ "zeroize",
+]
+
+[[package]]
 name = "dashmap"
 version = "5.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1479,7 +1492,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519",
  "serde",
- "sha2",
+ "sha2 0.10.9",
  "subtle",
  "zeroize",
 ]
@@ -2804,7 +2817,7 @@ dependencies = [
  "elliptic-curve",
  "once_cell",
  "serdect",
- "sha2",
+ "sha2 0.10.9",
  "signature",
 ]
 
@@ -2986,7 +2999,7 @@ dependencies = [
  "quick-protobuf-codec",
  "rand 0.8.5",
  "regex",
- "sha2",
+ "sha2 0.10.9",
  "smallvec",
  "tracing",
  "void",
@@ -3027,7 +3040,7 @@ dependencies = [
  "multihash",
  "quick-protobuf",
  "rand 0.8.5",
- "sha2",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tracing",
  "zeroize",
@@ -3054,7 +3067,7 @@ dependencies = [
  "quick-protobuf",
  "quick-protobuf-codec",
  "rand 0.8.5",
- "sha2",
+ "sha2 0.10.9",
  "smallvec",
  "thiserror 1.0.69",
  "tracing",
@@ -3119,7 +3132,7 @@ dependencies = [
  "once_cell",
  "quick-protobuf",
  "rand 0.8.5",
- "sha2",
+ "sha2 0.10.9",
  "snow",
  "static_assertions",
  "thiserror 1.0.69",
@@ -3367,6 +3380,18 @@ name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
+
+[[package]]
+name = "merlin"
+version = "3.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58c38e2799fc0978b65dfff8023ec7843e2330bb462f19198840b34b6582397d"
+dependencies = [
+ "byteorder",
+ "keccak",
+ "rand_core 0.6.4",
+ "zeroize",
+]
 
 [[package]]
 name = "mime"
@@ -3621,6 +3646,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3663,7 +3689,7 @@ dependencies = [
  "rs_merkle",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 1.0.69",
  "tiny-keccak",
@@ -3681,14 +3707,16 @@ dependencies = [
  "curve25519-dalek",
  "hex",
  "k256",
+ "merlin",
  "norn-common",
  "num-bigint",
  "num-traits",
  "p256",
  "rand 0.8.5",
  "rand_core 0.6.4",
+ "schnorrkel",
  "serde",
- "sha2",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -3720,7 +3748,7 @@ dependencies = [
  "rlp",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "sled",
  "thiserror 1.0.69",
  "tokio",
@@ -3794,7 +3822,7 @@ dependencies = [
  "rlp",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.10.9",
  "spki",
  "tempfile",
  "tokio",
@@ -3802,6 +3830,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -3837,7 +3866,7 @@ dependencies = [
  "norn-common",
  "serde",
  "serde_bytes",
- "sha2",
+ "sha2 0.10.9",
  "sled",
  "tempfile",
  "thiserror 1.0.69",
@@ -4042,7 +4071,7 @@ dependencies = [
  "ecdsa",
  "elliptic-curve",
  "primeorder",
- "sha2",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -4204,7 +4233,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "602113b5b5e8621770cfd490cfd90b9f84ab29bd2b0e49ad83eb6d186cef2365"
 dependencies = [
  "pest",
- "sha2",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -4924,7 +4953,7 @@ dependencies = [
  "revm-primitives",
  "ripemd",
  "secp256k1",
- "sha2",
+ "sha2 0.10.9",
  "substrate-bn",
 ]
 
@@ -5029,7 +5058,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb09b49230ba22e8c676e7b75dfe2887dea8121f18b530ae0ba519ce442d2b21"
 dependencies = [
- "sha2",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -5273,6 +5302,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "schnorrkel"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "844b7645371e6ecdf61ff246ba1958c29e802881a749ae3fb1993675d210d28d"
+dependencies = [
+ "arrayref",
+ "arrayvec",
+ "curve25519-dalek-ng",
+ "merlin",
+ "rand_core 0.6.4",
+ "serde_bytes",
+ "sha2 0.9.9",
+ "subtle-ng",
+ "zeroize",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5481,6 +5527,19 @@ dependencies = [
 
 [[package]]
 name = "sha2"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d58a1e1bf39749807d89cf2d98ac2dfa0ff1cb3faa38fbb64dd88ac8013d800"
+dependencies = [
+ "block-buffer 0.9.0",
+ "cfg-if",
+ "cpufeatures",
+ "digest 0.9.0",
+ "opaque-debug",
+]
+
+[[package]]
+name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
@@ -5592,7 +5651,7 @@ dependencies = [
  "rand_core 0.6.4",
  "ring 0.17.14",
  "rustc_version 0.4.1",
- "sha2",
+ "sha2 0.10.9",
  "subtle",
 ]
 
@@ -5699,6 +5758,12 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "subtle-ng"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "734676eb262c623cec13c3155096e08d1f8f29adce39ba17948b18dad1e54142"
 
 [[package]]
 name = "syn"

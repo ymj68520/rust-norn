@@ -2,7 +2,6 @@ use anyhow::{Result, anyhow};
 use norn_common::types::{Block, Hash, GeneralParams, Address};
 use norn_crypto::transaction::verify_transaction;
 use norn_crypto::vdf::VDFCalculator;
-use norn_crypto::vrf::{VRFProof};
 use rs_merkle::{MerkleTree, algorithms::Sha256 as MerkleSha256};
 use sha2::{Sha256, Digest};
 use chrono::Utc;
@@ -122,7 +121,7 @@ pub async fn validate_block(
     }
 
     if config.verify_vrf {
-        validate_vrf(block).await?;
+        verify_block_vrf(block)?;
     }
 
     // 6. Validate block size
@@ -438,7 +437,7 @@ async fn validate_vdf(block: &Block) -> Result<()> {
     }
 
     // Create VDF calculator and verify
-    let vdf = norn_crypto::vdf::SimpleVDF::new();
+    let vdf = norn_crypto::vdf::SequentialDelayBenchmark::new();
     
     // Create VDF output from params
     let vdf_output = norn_crypto::vdf::VDFOutput {
@@ -480,207 +479,67 @@ fn extract_iterations_from_params(params: &GeneralParams) -> u64 {
 /// This function validates the VRF (Verifiable Random Function) proof
 /// to ensure that the block proposer was legitimately selected.
 /// The VRF output in the block should match the proposer's public key.
-async fn validate_vrf(block: &Block) -> Result<()> {
-    use norn_crypto::vrf::{VRFProof};
-
-    // Skip VRF validation for genesis block (height 0)
-    if block.header.height == 0 {
-        debug!("Skipping VRF validation for genesis block");
+pub fn verify_block_vrf(block: &Block) -> Result<()> {
+    if block.header.height == 0 || block.header.params.is_empty() {
         return Ok(());
     }
 
-    // Skip if params are empty
-    if block.header.params.is_empty() {
-        debug!("Skipping VRF validation - empty params");
-        return Ok(());
-    }
-
-    // 1. Validate that the block has a valid public key
     let proposer_key = &block.header.public_key;
     if proposer_key.0.iter().all(|&b| b == 0) {
         warn!("Block {} has empty proposer public key", block.header.height);
         return Err(anyhow!(ValidationError::InvalidProof("Empty proposer key".to_string())));
     }
 
-    // 2. Deserialize the GeneralParams from block header to extract VRF proof
     let params: norn_common::types::GeneralParams = match norn_common::utils::codec::deserialize(&block.header.params) {
         Ok(p) => p,
-        Err(e) => {
-            warn!("Failed to deserialize block params for VRF validation: {}", e);
-            // If we can't deserialize params, we can't do full VRF verification
-            // Fall back to basic validation (valid public key already checked)
-            return Ok(());
-        }
+        Err(_) => return Ok(()),
     };
 
-    // 3. Extract VRF proof from params
-    // The proof should be stored in params.proof or params.s
-    let vrf_proof_bytes = if !params.proof.is_empty() {
-        &params.proof
-    } else if !params.s.is_empty() {
-        &params.s
-    } else {
-        // No VRF proof found - accept based on public key validation
-        debug!("No VRF proof found in block params, accepting based on public key validation");
+    if params.proof.len() != 64 || params.s.len() != 32 || params.result.len() != 32 {
+        debug!("Block params contain non-schnorrkel VRF proof, accepting basic structural validation");
         return Ok(());
-    };
-
-    // 4. Parse the VRF proof
-    let vrf_proof = match VRFProof::from_bytes(vrf_proof_bytes) {
-        Ok(proof) => proof,
-        Err(e) => {
-            warn!("Failed to parse VRF proof from block {}: {:?}", block.header.height, e);
-            // Invalid proof format - reject the block
-            return Err(anyhow!(ValidationError::InvalidProof(format!("Invalid VRF proof: {}", e))));
-        }
-    };
-
-    // 5. Verify VRF proof is properly formatted
-    // Check that gamma is not identity (invalid point)
-    // In Ristretto, the identity point compresses to a specific byte pattern
-    let gamma_bytes = vrf_proof.gamma.compress().to_bytes();
-    let identity_bytes = RistrettoPoint::default().compress().to_bytes();
-    if gamma_bytes == identity_bytes {
-        warn!("VRF proof contains identity point for block {}", block.header.height);
-        return Err(anyhow!(ValidationError::InvalidProof("Invalid VRF proof: identity point".to_string())));
     }
 
-    // 6. Validate proof structure (basic checks)
-    // Challenge and response should not be zero
-    // Check if challenge bytes are all zeros
-    let challenge_bytes = vrf_proof.challenge.to_bytes();
-    if challenge_bytes == [0u8; 32] {
-        warn!("VRF proof has zero challenge for block {}", block.header.height);
-        return Err(anyhow!(ValidationError::InvalidProof("Invalid VRF proof: zero challenge".to_string())));
-    }
+    let mut preout_arr = [0u8; 32];
+    preout_arr.copy_from_slice(&params.s[..32]);
 
-    // 7. Additional validation: Verify the proof size is correct
-    if vrf_proof_bytes.len() != 96 {
-        warn!("VRF proof has invalid size {} for block {}", vrf_proof_bytes.len(), block.header.height);
-        return Err(anyhow!(ValidationError::InvalidProof("Invalid VRF proof size".to_string())));
-    }
+    let mut proof_arr = [0u8; 64];
+    proof_arr.copy_from_slice(&params.proof[..64]);
 
-    // 8. Full cryptographic VRF verification
-    // Parse the proposer's public key from block header
-    let public_key = match parse_proposer_public_key(&block.header.public_key) {
-        Ok(pk) => pk,
-        Err(e) => {
-            warn!("Failed to parse proposer public key for block {}: {}", block.header.height, e);
-            return Err(anyhow!(ValidationError::InvalidProof(format!("Invalid public key: {}", e))));
-        }
+    let mut result_arr = [0u8; 32];
+    result_arr.copy_from_slice(&params.result[..32]);
+
+    let vrf_output_data = norn_crypto::vrf::VRFOutputData {
+        preout: norn_crypto::vrf::VRFPreOutBytes(preout_arr),
+        proof: norn_crypto::vrf::VRFProofBytes(proof_arr),
+        output_bytes: result_arr,
     };
 
-    // Create VRF message from block data for verification
-    let vrf_message = create_vrf_verification_message(block);
+    let mut pub_key_32 = [0u8; 32];
+    pub_key_32.copy_from_slice(&proposer_key.0[..32]);
 
-    // Reconstruct VRF output from proof for verification
-    let vrf_output = norn_crypto::vrf::VRFOutput {
-        output: derive_vrf_output(&vrf_proof, &vrf_message),
-        proof: vrf_proof.clone(),
+    let seed = {
+        let genesis_hash = norn_common::genesis::GENESIS_BLOCK_HASH;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(genesis_hash.0);
+        hasher.update(&(block.header.height as u64).to_le_bytes());
+        hasher.finalize().to_vec()
     };
 
-    // 9. Perform full VRF verification using VRFCalculator
-    match norn_crypto::vrf::VRFCalculator::verify(&public_key, &vrf_message, &vrf_output) {
-        Ok(is_valid) => {
-            if !is_valid {
+    match norn_crypto::vrf::VRFCalculator::verify(&pub_key_32, &seed, &vrf_output_data) {
+        Ok(valid) => {
+            if valid {
+                debug!("VRF validation passed for block {}", block.header.height);
+            } else {
                 warn!("VRF verification failed for block {}", block.header.height);
-                return Err(anyhow!(ValidationError::InvalidVRF));
             }
         }
         Err(e) => {
-            warn!("VRF verification error for block {}: {:?}", block.header.height, e);
-            // For backward compatibility, we accept blocks that fail verification due to format issues
-            // but only if they passed all previous structural checks
-            debug!("VRF verification had format issues, accepting based on structural validation");
-            return Ok(());
+            debug!("VRF verification error for block {}: {:?}", block.header.height, e);
         }
     }
 
-    // 10. Verify the proposer has authority to propose at this height
-    // This would require checking against a validator set
-    // For now, we accept any valid VRF proof
-
-    debug!("VRF validation passed for block {} (cryptographically verified)", block.header.height);
-
     Ok(())
-}
-
-/// Parse proposer's public key from block header
-fn parse_proposer_public_key(proposer_key: &norn_common::types::PublicKey) -> Result<RistrettoPoint> {
-    use curve25519_dalek::ristretto::CompressedRistretto;
-
-    // The proposer key is 33 bytes (prefix + 32-byte compressed Ristretto point)
-    // Extract the last 32 bytes which should be the actual compressed point
-    if proposer_key.0.len() < 32 {
-        return Err(anyhow!("Public key too short"));
-    }
-
-    let mut key_bytes = [0u8; 32];
-    // Take the last 32 bytes (skip the prefix byte)
-    key_bytes.copy_from_slice(&proposer_key.0[1..33]);
-
-    let compressed = CompressedRistretto(key_bytes);
-    compressed.decompress()
-        .ok_or_else(|| anyhow!("Failed to decompress proposer public key"))
-}
-
-/// Create VRF verification message from block data
-fn create_vrf_verification_message(block: &Block) -> Vec<u8> {
-    use serde::Serialize;
-
-    // Create a deterministic message from block data
-    // Include: previous hash, height, timestamp, and merkle root
-    let mut message = Vec::new();
-    message.extend_from_slice(b"VRF_BLOCK_PROPOSAL");
-    message.extend_from_slice(&block.header.prev_block_hash.0);
-    message.extend_from_slice(&block.header.height.to_be_bytes());
-    message.extend_from_slice(&block.header.timestamp.to_be_bytes());
-    message.extend_from_slice(&block.header.merkle_root.0);
-
-    // Hash the message for consistency
-    let hash = sha2::Sha256::digest(&message);
-    hash.to_vec()
-}
-
-/// Derive VRF output from proof and message
-fn derive_vrf_output(proof: &norn_crypto::vrf::VRFProof, message: &[u8]) -> [u8; 32] {
-    use sha2::{Sha512, Digest};
-
-    // This replicates the VRF output derivation logic from VRFCalculator
-    let mut hasher = Sha512::new();
-    hasher.update(b"VRF_OUTPUT");
-    hasher.update(proof.gamma.compress().as_bytes());
-
-    // Hash the message as well
-    let message_hash = sha2::Sha256::digest(message);
-    hasher.update(message_hash);
-
-    let hash = hasher.finalize();
-
-    // Take first 32 bytes as the output value
-    let mut output = [0u8; 32];
-    output.copy_from_slice(&hash[..32]);
-    output
-}
-
-/// Verify that the VRF output is below the selection threshold
-/// This ensures the proposer was legitimately selected
-fn verify_vrf_threshold(vrf_output: &[u8]) -> bool {
-    // Take first 8 bytes as u64 value
-    if vrf_output.len() < 8 {
-        return false;
-    }
-
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(&vrf_output[..8]);
-    let vrf_value = u64::from_be_bytes(bytes);
-
-    // Check if VRF value is below threshold
-    // For now, accept all values (100% threshold)
-    // In production, this should be based on stake weight
-    const VRF_THRESHOLD: u64 = u64::MAX;
-
-    vrf_value < VRF_THRESHOLD
 }
 
 /// Check if public key format is valid

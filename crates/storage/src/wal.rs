@@ -267,10 +267,12 @@ impl WAL {
             file.write_all(&data)
                 .map_err(|e| NornError::Internal(format!("Failed to write WAL entry: {}", e)))?;
 
-            // Flush if configured
+            // Flush and sync to disk if configured
             if self.config.sync_on_write {
                 file.flush()
                     .map_err(|e| NornError::Internal(format!("Failed to flush WAL: {}", e)))?;
+                file.get_ref().sync_all()
+                    .map_err(|e| NornError::Internal(format!("Failed to sync_all WAL file: {}", e)))?;
             }
         }
 

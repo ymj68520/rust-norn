@@ -26,6 +26,7 @@ test_node_data/
 .idea/
 .vscode/
 .claude/
+.gemini/
 *.swp
 *.swo
 *.iml
@@ -147,4 +148,3 @@ package-lock.json
 !examples/*/README.md
 !deployments/testnet/*.md
 docs/ALERTING.md
-doc/

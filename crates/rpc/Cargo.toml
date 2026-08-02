@@ -31,6 +31,7 @@ chrono = { workspace = true }
 [dev-dependencies]
 norn-storage = { workspace = true }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.11"

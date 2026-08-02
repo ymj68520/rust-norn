@@ -1,6 +1,6 @@
 use moka::future::Cache;
 use norn_common::types::{Block, Hash, GeneralParams};
-use norn_crypto::vdf::{VDFCalculator, VDFOutput, get_calculator};
+use norn_crypto::vdf::{VDFCalculator, VDFOutput};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};

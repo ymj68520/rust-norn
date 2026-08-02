@@ -12,6 +12,7 @@ use crate::behaviour_builder::build_behaviour;
 pub enum NetworkCommand {
     BroadcastBlock(Vec<u8>),
     BroadcastTransaction(Vec<u8>),
+    BroadcastConsensus(Vec<u8>),
     StartListening,
 }
 

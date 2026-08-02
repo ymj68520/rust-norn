@@ -31,6 +31,7 @@ impl EventLoop {
         // Subscribe to topics
         let _ = self.swarm.behaviour_mut().gossipsub.subscribe(&self.topics.block);
         let _ = self.swarm.behaviour_mut().gossipsub.subscribe(&self.topics.transaction);
+        let _ = self.swarm.behaviour_mut().gossipsub.subscribe(&self.topics.consensus);
         
         loop {
             tokio::select! {
@@ -59,6 +60,11 @@ impl EventLoop {
                     error!("Broadcast transaction failed: {:?}", e);
                 }
             },
+            NetworkCommand::BroadcastConsensus(data) => {
+                if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(self.topics.consensus.clone(), data) {
+                    error!("Broadcast consensus failed: {:?}", e);
+                }
+            },
             NetworkCommand::StartListening => {
                 // Handled via external setup or if we want to start listener dynamically
             }
@@ -75,6 +81,8 @@ impl EventLoop {
                     let _ = self.event_tx.send(NetworkEvent::BlockReceived(message.data)).await;
                 } else if message.topic == self.topics.transaction.hash() {
                     let _ = self.event_tx.send(NetworkEvent::TransactionReceived(message.data)).await;
+                } else if message.topic == self.topics.consensus.hash() {
+                    let _ = self.event_tx.send(NetworkEvent::ConsensusMessageReceived(message.data)).await;
                 }
             },
             Some(libp2p::swarm::SwarmEvent::Behaviour(crate::behaviour::NornBehaviourEvent::Mdns(

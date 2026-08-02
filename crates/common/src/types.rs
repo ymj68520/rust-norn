@@ -108,14 +108,197 @@ pub struct PublicKey(pub [u8; PUBLIC_KEY_LENGTH]);
 
 
 impl Default for PublicKey {
-
     fn default() -> Self {
-
         Self([0u8; PUBLIC_KEY_LENGTH])
+    }
+}
 
+// --- Consensus Strong Types ---
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+pub struct ValidatorId(pub [u8; 32]);
+
+impl fmt::Debug for ValidatorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ValidatorId({})", hex::encode(self.0))
+    }
+}
+
+impl fmt::Display for ValidatorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(self.0))
+    }
+}
+
+impl Serialize for ValidatorId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for ValidatorId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let s = s.strip_prefix("0x").unwrap_or(&s);
+        let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom("Invalid ValidatorId length"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(ValidatorId(arr))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConsensusPublicKey(pub [u8; 33]);
+
+impl Default for ConsensusPublicKey {
+    fn default() -> Self {
+        Self([0u8; 33])
+    }
+}
+
+impl fmt::Debug for ConsensusPublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ConsensusPublicKey({})", hex::encode(self.0))
+    }
+}
+
+impl Serialize for ConsensusPublicKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for ConsensusPublicKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 33 {
+            return Err(serde::de::Error::custom("Invalid ConsensusPublicKey length"));
+        }
+        let mut arr = [0u8; 33];
+        arr.copy_from_slice(&bytes);
+        Ok(ConsensusPublicKey(arr))
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct VrfPublicKey(pub [u8; 32]);
+
+impl fmt::Debug for VrfPublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "VrfPublicKey({})", hex::encode(self.0))
+    }
+}
+
+impl Serialize for VrfPublicKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for VrfPublicKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom("Invalid VrfPublicKey length"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(VrfPublicKey(arr))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct StakeSnapshotHash(pub [u8; 32]);
+
+impl fmt::Display for StakeSnapshotHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(self.0))
+    }
+}
+
+impl Serialize for StakeSnapshotHash {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for StakeSnapshotHash {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let s = s.strip_prefix("0x").unwrap_or(&s);
+        let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
+        if bytes.len() != 32 {
+            return Err(serde::de::Error::custom("Invalid StakeSnapshotHash length"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(StakeSnapshotHash(arr))
+    }
+}
+
+pub mod hex_serde_fixed_64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
     }
 
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let s = s.strip_prefix("0x").unwrap_or(&s);
+        let decoded = hex::decode(s).map_err(serde::de::Error::custom)?;
+        if decoded.len() != 64 {
+            return Err(serde::de::Error::custom("Invalid length for [u8; 64]"));
+        }
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&decoded);
+        Ok(arr)
+    }
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
+pub struct ProtocolVersion(pub u16);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
+pub struct ChainId(pub Hash);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
+pub struct BlockId(pub Hash);
 
 
 
