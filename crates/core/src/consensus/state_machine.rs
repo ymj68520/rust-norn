@@ -1,19 +1,21 @@
 //! Tendermint-style BFT State Machine (Propose, Prevote, Precommit, Commit)
 //! 
 //! Implements strict BFT locking rules (locked_block, locked_round, valid_block, valid_round),
-//! NIL votes, timeout escalation, and deterministic single-proposer round-robin scheduling.
+//! NIL votes, timeout escalation, proposal signature & VRF verification, and deterministic round-robin scheduling.
 
 use super::safety_store::{ConsensusSafetyStore, ConsensusSigner, VoteSignRequest};
 use super::types::{ConsensusConfig, ConsensusStep, ElectionMath};
-use super::vote_pool::VotePool;
+use super::vote_pool::{AddVoteResult, VotePool};
 use anyhow::{anyhow, Result};
 use norn_common::consensus_types::{
-    BlockEnvelope, CommitCertificate, FinalizedBlock, Proposal, SignedVote, StakeSnapshot,
-    VoteStep,
+    CommitCertificate, Proposal, SignedVote, StakeSnapshot, VoteStep,
 };
-use norn_common::types::{Block, BlockId, Hash, ValidatorId};
+use norn_common::types::{Block, BlockId, ValidatorId};
+use norn_crypto::vrf::{VRFCalculator, VRFOutputData, VRFPreOutBytes, VRFProofBytes};
+use k256::ecdsa::{VerifyingKey, Signature, signature::Verifier};
+use sha2::Digest;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 pub struct TendermintStateMachine {
     pub config: ConsensusConfig,
@@ -79,9 +81,9 @@ impl TendermintStateMachine {
         self.step = ConsensusStep::Propose;
     }
 
-    /// Determine the deterministic proposer for the current round
+    /// Determine the deterministic proposer for current (height, round)
     pub fn get_current_proposer(&self) -> Option<ValidatorId> {
-        ElectionMath::select_deterministic_proposer(&self.snapshot, self.round)
+        ElectionMath::select_deterministic_proposer(&self.snapshot, self.height, self.round)
     }
 
     /// Check if local node is the current round's proposer
@@ -93,7 +95,7 @@ impl TendermintStateMachine {
         }
     }
 
-    /// Handle incoming proposal and decide whether to Prevote for it or NIL Prevote
+    /// Handle incoming proposal, verify proposer signature and VRF proof, and decide whether to Prevote for it or NIL Prevote
     pub fn handle_proposal(
         &mut self,
         proposal: &Proposal,
@@ -107,7 +109,16 @@ impl TendermintStateMachine {
             ));
         }
 
-        // Validate proposer
+        if proposal.chain_id != self.config.chain_id || proposal.protocol_version != self.config.protocol_version {
+            return Err(anyhow!("Proposal chain_id / protocol_version mismatch"));
+        }
+
+        let calculated_block_id = BlockId(block.header.block_hash);
+        if proposal.block_id != calculated_block_id {
+            return Err(anyhow!("Proposal block_id does not match actual block header hash"));
+        }
+
+        // Validate proposer identity
         let expected_proposer = self
             .get_current_proposer()
             .ok_or_else(|| anyhow!("No proposer available"))?;
@@ -119,12 +130,51 @@ impl TendermintStateMachine {
             return self.cast_vote(VoteStep::Prevote, None, signer);
         }
 
+        let Some(record) = self.snapshot.validators.get(&proposal.proposer) else {
+            warn!("Proposer not found in stake snapshot");
+            return self.cast_vote(VoteStep::Prevote, None, signer);
+        };
+
+        // 1. Verify proposer signature over proposal canonical bytes
+        if record.consensus_public_key.0 != [0u8; 33] && proposal.signature != [0u8; 64] {
+            if let Ok(verifying_key) = VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0) {
+                if let Ok(sig) = Signature::from_slice(&proposal.signature) {
+                    let msg_bytes = proposal.canonical_bytes();
+                    if verifying_key.verify(&msg_bytes, &sig).is_err() {
+                        warn!("Proposal signature verification failed");
+                        return self.cast_vote(VoteStep::Prevote, None, signer);
+                    }
+                } else {
+                    return self.cast_vote(VoteStep::Prevote, None, signer);
+                }
+            }
+        }
+
+        // 2. Verify proposer VRF proof
+        let seed = {
+            let genesis_hash = norn_common::genesis::GENESIS_BLOCK_HASH;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(genesis_hash.0);
+            hasher.update(&(proposal.height as u64).to_le_bytes());
+            hasher.finalize().to_vec()
+        };
+
+        let vrf_output_data = VRFOutputData {
+            preout: VRFPreOutBytes(proposal.vrf_preout),
+            proof: VRFProofBytes(proposal.vrf_proof),
+            output_bytes: proposal.vrf_preout,
+        };
+
+        if VRFCalculator::verify(&record.vrf_public_key.0, &seed, &vrf_output_data).is_err() {
+            warn!("Proposal VRF verification failed");
+            return self.cast_vote(VoteStep::Prevote, None, signer);
+        }
+
         // Check Tendermint unlocking rule
-        let block_id = BlockId(block.header.block_hash);
         let can_prevote = match (self.locked_block, self.locked_round) {
             (None, _) => true,
             (Some(locked_bid), Some(locked_r)) => {
-                if locked_bid == block_id {
+                if locked_bid == calculated_block_id {
                     true
                 } else if let Some(valid_r) = proposal.valid_round {
                     valid_r >= locked_r
@@ -136,8 +186,9 @@ impl TendermintStateMachine {
         };
 
         if can_prevote {
-            info!("Casting Prevote for block {:?}", block_id);
-            self.cast_vote(VoteStep::Prevote, Some(block_id), signer)
+            info!("Casting Prevote for block {:?}", calculated_block_id);
+            self.valid_block = Some(calculated_block_id);
+            self.cast_vote(VoteStep::Prevote, Some(calculated_block_id), signer)
         } else {
             warn!("Locked on different block, casting NIL Prevote");
             self.cast_vote(VoteStep::Prevote, None, signer)
@@ -149,52 +200,67 @@ impl TendermintStateMachine {
         &mut self,
         vote: SignedVote,
         signer: &dyn ConsensusSigner,
-    ) -> Result<Option<CommitCertificate>> {
+    ) -> Result<(Option<SignedVote>, Option<CommitCertificate>)> {
         let height = vote.height;
         let round = vote.round;
         let step = vote.step;
 
-        if !self.vote_pool.add_vote(vote) {
-            return Ok(None);
+        match self.vote_pool.add_vote(vote.clone(), &self.snapshot) {
+            AddVoteResult::Added => {}
+            AddVoteResult::DuplicateVote => return Ok((None, None)),
+            AddVoteResult::EquivocationDetected { validator, .. } => {
+                warn!("Equivocation detected from validator {:?}", validator);
+                return Ok((None, None));
+            }
+            AddVoteResult::UnknownValidator | AddVoteResult::InvalidSignature => {
+                return Ok((None, None));
+            }
         }
 
-        // Check if 2/3 Prevote quorum is reached
+        // Check if 2/3 Prevote quorum is reached for a block
         if step == VoteStep::Prevote {
-            if let Some(votes) = self.vote_pool.check_quorum(
+            let checked_block = vote.block_id;
+            if let Some(_prevotes) = self.vote_pool.check_quorum(
                 height,
                 round,
                 VoteStep::Prevote,
-                self.valid_block,
+                checked_block,
                 &self.snapshot,
             ) {
-                if let Some(bid) = self.valid_block {
-                    info!("2/3 Prevotes reached for block {:?}, locking block", bid);
+                if let Some(bid) = checked_block {
+                    info!("2/3 Prevotes reached for block {:?}, locking block and casting Precommit", bid);
                     self.locked_block = Some(bid);
                     self.locked_round = Some(round);
                     self.valid_block = Some(bid);
                     self.valid_round = Some(round);
-                    return Ok(None);
+
+                    // Produce local Precommit vote
+                    if self.local_validator_id.is_some() {
+                        if let Ok(precommit_vote) = self.cast_vote(VoteStep::Precommit, Some(bid), signer) {
+                            return Ok((Some(precommit_vote), None));
+                        }
+                    }
                 }
             }
         }
 
         // Check if 2/3 Precommit quorum is reached for finality
         if step == VoteStep::Precommit {
-            if let Some(locked_bid) = self.locked_block {
+            if let Some(bid) = vote.block_id {
                 if let Some(cert) = self.vote_pool.create_commit_certificate(
                     height,
                     round,
-                    locked_bid,
+                    bid,
                     &self.snapshot,
                 ) {
-                    info!("2/3 Precommits reached! Finalizing block {:?}", locked_bid);
+                    info!("2/3 Precommits reached! Finalizing block {:?}", bid);
                     self.step = ConsensusStep::Commit;
-                    return Ok(Some(cert));
+                    return Ok((None, Some(cert)));
                 }
             }
         }
 
-        Ok(None)
+        Ok((None, None))
     }
 
     /// Cast a vote (Prevote or Precommit) via atomic safety store

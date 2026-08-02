@@ -24,6 +24,31 @@ pub struct Proposal {
     pub vrf_preout: [u8; 32],
     #[serde(with = "crate::types::hex_serde_fixed_64")]
     pub vrf_proof: [u8; 64],
+    #[serde(with = "crate::types::hex_serde_fixed_64")]
+    pub signature: [u8; 64],
+}
+
+impl Proposal {
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"NORN_BFT_V1_PROPOSAL");
+        bytes.extend_from_slice(&self.protocol_version.0.to_be_bytes());
+        bytes.extend_from_slice(&self.chain_id.0.0);
+        bytes.extend_from_slice(&self.epoch.to_be_bytes());
+        bytes.extend_from_slice(&self.height.to_be_bytes());
+        bytes.extend_from_slice(&self.round.to_be_bytes());
+        if let Some(vr) = self.valid_round {
+            bytes.push(1);
+            bytes.extend_from_slice(&vr.to_be_bytes());
+        } else {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&self.block_id.0.0);
+        bytes.extend_from_slice(&self.proposer.0);
+        bytes.extend_from_slice(&self.vrf_preout);
+        bytes.extend_from_slice(&self.vrf_proof);
+        bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

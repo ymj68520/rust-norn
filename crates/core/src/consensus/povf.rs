@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConsensusMessage {
@@ -58,20 +58,20 @@ impl PoVFEngine {
         &self,
         vote: SignedVote,
         signer: &dyn ConsensusSigner,
-    ) -> Result<Option<FinalizedBlock>> {
+    ) -> Result<(Option<SignedVote>, Option<CommitCertificate>)> {
         let mut sm = self.state_machine.write().await;
-        if let Some(commit_cert) = sm
+        let res = sm
             .handle_vote(vote, signer)
-            .map_err(|e| NornError::ConsensusError(e.to_string()))?
-        {
+            .map_err(|e| NornError::ConsensusError(e.to_string()))?;
+
+        if let (_, Some(ref cert)) = res {
             info!(
                 "BFT Consensus reached CommitCertificate for height {} round {}",
-                commit_cert.height, commit_cert.round
+                cert.height, cert.round
             );
-            drop(sm);
-            return Ok(None);
         }
-        Ok(None)
+
+        Ok(res)
     }
 
     pub async fn finalize_block(&self, block: Block, commit: CommitCertificate) -> Result<()> {
