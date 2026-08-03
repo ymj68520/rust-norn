@@ -35,7 +35,8 @@ libFuzzer target against the same `decode_and_validate` entry point.
   verifies a Genesis consensus key, low-S signature, nonce, and bound PeerId;
 - `propagation_source` is never treated as the original consensus publisher:
   context-valid relayed messages reach the V2 cryptographic validator, while a
-  FullNode may originate only `BlockRequest` and `FinalityRequest` messages;
+  FullNode may originate only V2 synchronization requests/responses
+  (`BlockRequest`, `BlockResponse`, `FinalityRequest`, and `FinalityResponse`);
 - the transport rejects new peer identities after the protocol connection
   ceiling is reached, and bounded ingress queues may drop gossip without
   blocking the network event loop;
@@ -55,16 +56,24 @@ libFuzzer target against the same `decode_and_validate` entry point.
   and parent context before application;
 - an internal Action error without a oneshot reply is observable and puts the
   driver into fail-stop instead of being silently dropped;
-- only the idempotent `BroadcastCommit` enqueue path may return a typed
-  retryable Action error; retry is bounded to three attempts with exponential
-  backoff, while unknown errors and retry exhaustion fail-stop;
+- only idempotent `BroadcastCommit` and `BroadcastVote` enqueue paths may
+  return a typed retryable Action error; Commit retries are bounded to three
+  retries and Vote retries to eight retries, both with exponential backoff,
+  while unknown errors and retry exhaustion fail-stop;
 - V2 candidate proposal, block, and derived randomness are admitted as one
   bounded cache entry; byte, per-height, per-proposer, future-height,
   future-round, and TTL limits are enforced from protocol parameters or a
   versioned protocol invariant;
+- candidates referenced by `valid_block`, `locked_block`, or pending finality
+  are pinned against TTL/capacity eviction; a missing required dependency
+  fails closed, and a late prevote Polka never signs a second precommit after a
+  durable NIL precommit;
 - a conflicting candidate for the same `(height, block_id)` is rejected,
   identical replay is idempotent, and candidates through finalized height are
   removed;
+- after durable finality, the node requests the next canonical finality record
+  to repair a missed Commit gossip; stale proposal worker results are discarded
+  when the live height/round has advanced;
 - four independent configurations derive the same snapshot hash and proposer
   sequence;
 - the full workspace test suite is green.

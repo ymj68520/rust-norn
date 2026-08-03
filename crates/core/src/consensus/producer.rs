@@ -513,6 +513,12 @@ impl BlockProducer {
             .as_ref()
             .expect("V2 production checked consensus engine above");
 
+        if !engine.reconcile_v2_candidate_retention().await {
+            return Err(anyhow!(
+                "consensus state references a V2 candidate that is not retained"
+            ));
+        }
+
         // Tendermint re-proposes the exact block that reached a valid-round
         // polka.  Generating a fresh block here would change its block ID
         // while carrying the old certificate, which is an invalid proposal

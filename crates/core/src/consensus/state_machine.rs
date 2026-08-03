@@ -1023,26 +1023,38 @@ impl TendermintStateMachine {
                     };
 
                     // A validator's lock is a consequence of a durable
-                    // Precommit intent, not of merely observing a Polka. If
-                    // WAL persistence or signing fails, leave every lock and
-                    // step untouched so the same request can be retried.
-                    let precommit_vote = if self.local_validator_id.is_some() {
-                        Some(self.cast_vote(VoteStep::Precommit, Some(bid), signer)?)
-                    } else {
-                        None
-                    };
-                    self.locked_block = Some(bid);
-                    self.locked_round = Some(round);
-                    self.valid_block = Some(bid);
-                    self.valid_round = Some(round);
-                    self.valid_round_certificate = Some(certificate);
-                    self.step = ConsensusStep::PrecommitWait;
+                    // Precommit intent, not of merely observing a Polka. A
+                    // late Polka may arrive after this validator has already
+                    // timed out and durably signed NIL Precommit. In that
+                    // case the state is already in PrecommitWait and signing
+                    // a block precommit would be equivocation. Continue to
+                    // retain the certificate for validation, but never emit a
+                    // second local precommit for the same height/round.
+                    if matches!(
+                        self.step,
+                        ConsensusStep::NewHeight
+                            | ConsensusStep::NewRound
+                            | ConsensusStep::Propose
+                            | ConsensusStep::PrevoteWait
+                    ) {
+                        let precommit_vote = if self.local_validator_id.is_some() {
+                            Some(self.cast_vote(VoteStep::Precommit, Some(bid), signer)?)
+                        } else {
+                            None
+                        };
+                        self.locked_block = Some(bid);
+                        self.locked_round = Some(round);
+                        self.valid_block = Some(bid);
+                        self.valid_round = Some(round);
+                        self.valid_round_certificate = Some(certificate);
+                        self.step = ConsensusStep::PrecommitWait;
 
-                    // The locks above are committed only after the local
-                    // precommit intent has been durably signed and
-                    // acknowledged by SafetyStore.
-                    if let Some(precommit_vote) = precommit_vote {
-                        return Ok((Some(precommit_vote), None));
+                        // The locks above are committed only after the local
+                        // precommit intent has been durably signed and
+                        // acknowledged by SafetyStore.
+                        if let Some(precommit_vote) = precommit_vote {
+                            return Ok((Some(precommit_vote), None));
+                        }
                     }
                 }
             }

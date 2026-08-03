@@ -18,7 +18,7 @@ use norn_common::consensus_types::{
 use norn_common::error::{NornError, Result};
 use norn_common::genesis::ProtocolResourceLimits;
 use norn_common::types::{Block, BlockHeader, BlockId, BlockV2, Hash, ValidatorId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -57,6 +57,17 @@ impl From<&ProtocolResourceLimits> for V2CandidateCacheLimits {
     }
 }
 
+/// Retention classes are driven by consensus dependencies, not by local
+/// cache pressure.  A pinned candidate may only be released when the
+/// corresponding finalized height or state-machine dependency is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateRetention {
+    Normal,
+    ValidRoundPinned,
+    LockedPinned,
+    PendingFinalityPinned,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct V2CandidateEntry {
     proposal: Proposal,
@@ -64,6 +75,7 @@ struct V2CandidateEntry {
     derived_randomness: Hash,
     inserted_at: Instant,
     encoded_bytes: usize,
+    retention: CandidateRetention,
 }
 
 /// A single bounded cache keeps proposal, block, and derived randomness
@@ -73,6 +85,7 @@ struct V2CandidateEntry {
 pub struct V2CandidateCache {
     limits: V2CandidateCacheLimits,
     entries: HashMap<(u64, BlockId), V2CandidateEntry>,
+    pending_finality: HashSet<(u64, BlockId)>,
     total_bytes: usize,
 }
 
@@ -81,6 +94,7 @@ impl V2CandidateCache {
         Self {
             limits,
             entries: HashMap::new(),
+            pending_finality: HashSet::new(),
             total_bytes: 0,
         }
     }
@@ -96,6 +110,7 @@ impl V2CandidateCache {
 
     fn remove_key(&mut self, key: &(u64, BlockId)) -> bool {
         if let Some(entry) = self.entries.remove(key) {
+            self.pending_finality.remove(key);
             self.total_bytes = self.total_bytes.saturating_sub(entry.encoded_bytes);
             true
         } else {
@@ -109,7 +124,9 @@ impl V2CandidateCache {
             .entries
             .iter()
             .filter_map(|(key, entry)| {
-                (now.saturating_duration_since(entry.inserted_at) >= ttl).then_some(*key)
+                (entry.retention == CandidateRetention::Normal
+                    && now.saturating_duration_since(entry.inserted_at) >= ttl)
+                    .then_some(*key)
             })
             .collect::<Vec<_>>();
         for key in expired {
@@ -123,7 +140,9 @@ impl V2CandidateCache {
     ) -> Option<(u64, BlockId)> {
         self.entries
             .iter()
-            .filter(|(key, entry)| predicate(key, entry))
+            .filter(|(key, entry)| {
+                entry.retention == CandidateRetention::Normal && predicate(key, entry)
+            })
             .min_by(|(left_key, left), (right_key, right)| {
                 left.inserted_at
                     .cmp(&right.inserted_at)
@@ -194,6 +213,12 @@ impl V2CandidateCache {
             };
             self.remove_key(&oldest);
         }
+        if self.count_at_height(proposal.height) >= self.limits.max_items_per_height
+            || self.count_for_proposer(proposal.height, proposal.proposer)
+                >= self.limits.max_items_per_proposer
+        {
+            return false;
+        }
         while self.total_bytes.saturating_add(encoded_bytes) > self.limits.max_total_bytes {
             let Some(oldest) = self.oldest_key(|_, _| true) else {
                 break;
@@ -212,9 +237,62 @@ impl V2CandidateCache {
                 derived_randomness,
                 inserted_at: now,
                 encoded_bytes,
+                retention: CandidateRetention::Normal,
             },
         );
         true
+    }
+
+    /// Pin a candidate needed by a finalized commit.  A missing candidate is
+    /// a safety/liveness fault and must be handled by the caller rather than
+    /// silently replacing it with a new block.
+    pub fn pin_pending_finality(&mut self, height: u64, block_id: BlockId) -> bool {
+        let key = (height, block_id);
+        if let Some(entry) = self.entries.get_mut(&key) {
+            self.pending_finality.insert(key);
+            entry.retention = CandidateRetention::PendingFinalityPinned;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn unpin_pending_finality(&mut self, height: u64, block_id: BlockId) {
+        self.pending_finality.remove(&(height, block_id));
+        if let Some(entry) = self.entries.get_mut(&(height, block_id)) {
+            entry.retention = CandidateRetention::Normal;
+        }
+    }
+
+    /// Reconcile cache retention with the durable live consensus state.  The
+    /// required valid/locked candidates must already be present; returning
+    /// false makes the caller fail-stop instead of allowing a later
+    /// valid-round re-proposal to fail after the dependency was evicted.
+    pub fn reconcile_state(
+        &mut self,
+        height: u64,
+        valid_block: Option<BlockId>,
+        locked_block: Option<BlockId>,
+    ) -> bool {
+        let required = [valid_block, locked_block]
+            .into_iter()
+            .flatten()
+            .all(|block_id| self.entries.contains_key(&(height, block_id)));
+        for ((entry_height, block_id), entry) in &mut self.entries {
+            if *entry_height != height {
+                continue;
+            }
+            entry.retention = if self.pending_finality.contains(&(*entry_height, *block_id)) {
+                CandidateRetention::PendingFinalityPinned
+            } else if locked_block == Some(*block_id) {
+                CandidateRetention::LockedPinned
+            } else if valid_block == Some(*block_id) {
+                CandidateRetention::ValidRoundPinned
+            } else {
+                CandidateRetention::Normal
+            };
+        }
+        required
     }
 
     pub fn get(&mut self, height: u64, block_id: BlockId) -> Option<ValidatedCandidate> {
@@ -246,6 +324,12 @@ impl V2CandidateCache {
 
     pub fn total_bytes(&self) -> usize {
         self.total_bytes
+    }
+
+    pub fn retention(&self, height: u64, block_id: BlockId) -> Option<CandidateRetention> {
+        self.entries
+            .get(&(height, block_id))
+            .map(|entry| entry.retention)
     }
 }
 
@@ -453,6 +537,14 @@ impl PoVFEngine {
             let sm = self.state_machine.read().await;
             (sm.height, sm.round)
         };
+        // A validation result can outlive the driver context that created it
+        // (for example, a commit may advance the state machine while a
+        // proposal worker is still completing).  Never feed such a stale
+        // proposal back into the state machine; it is safe to discard because
+        // finalized state and the current round are authoritative.
+        if proposal.height != current_height || proposal.round != current_round {
+            return Ok(None);
+        }
         if !self.candidate_cache_v2.write().await.insert(
             proposal.clone(),
             block.clone(),
@@ -577,6 +669,36 @@ impl PoVFEngine {
             current_height,
             current_round,
         )
+    }
+
+    /// Reconcile valid-round and lock dependencies before any cache access
+    /// can evict ordinary candidates. A missing required candidate is
+    /// reported so the caller can fail-stop rather than continue with a
+    /// state-machine reference that cannot be re-proposed or finalized.
+    pub async fn reconcile_v2_candidate_retention(&self) -> bool {
+        let (height, valid_block, locked_block) = {
+            let sm = self.state_machine.read().await;
+            (sm.height, sm.valid_block, sm.locked_block)
+        };
+        self.candidate_cache_v2
+            .write()
+            .await
+            .reconcile_state(height, valid_block, locked_block)
+    }
+
+    pub async fn pin_v2_candidate_for_finality(&self, height: u64, block_id: BlockId) -> bool {
+        self.candidate_cache_v2
+            .write()
+            .await
+            .pin_pending_finality(height, block_id)
+    }
+
+    pub async fn unpin_v2_candidate_for_finality(&self, height: u64, block_id: BlockId) -> bool {
+        self.candidate_cache_v2
+            .write()
+            .await
+            .unpin_pending_finality(height, block_id);
+        self.reconcile_v2_candidate_retention().await
     }
 
     pub async fn has_v2_candidate(&self, height: u64, block_id: BlockId) -> bool {
@@ -1099,6 +1221,38 @@ mod tests {
         assert!(cache.get(3, proposal.block_id).is_some());
         cache.remove_through_height(3);
         assert!(cache.get(3, proposal.block_id).is_none());
+    }
+
+    #[test]
+    fn pinned_v2_candidates_survive_ttl_and_capacity_pressure() {
+        let mut cache = V2CandidateCache::new(V2CandidateCacheLimits {
+            max_total_bytes: 1_000_000,
+            max_items_per_height: 1,
+            max_items_per_proposer: 1,
+            max_future_height: 1,
+            max_future_round: 1,
+            ttl: Duration::ZERO,
+        });
+        let pinned = cache_proposal(1, 0, 1, 1);
+        assert!(cache.insert(pinned.clone(), BlockV2::default(), Hash([4; 32]), 1, 0));
+        assert!(cache.pin_pending_finality(1, pinned.block_id));
+        assert_eq!(
+            cache.retention(1, pinned.block_id),
+            Some(CandidateRetention::PendingFinalityPinned)
+        );
+        assert!(cache.get(1, pinned.block_id).is_some());
+
+        assert!(!cache.insert(
+            cache_proposal(1, 0, 2, 2),
+            BlockV2::default(),
+            Hash([5; 32]),
+            1,
+            0
+        ));
+        assert!(cache.get(1, pinned.block_id).is_some());
+
+        cache.unpin_pending_finality(1, pinned.block_id);
+        assert!(cache.get(1, pinned.block_id).is_none());
     }
 
     #[tokio::test]

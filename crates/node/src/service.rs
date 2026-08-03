@@ -98,6 +98,7 @@ struct FinalityContext {
     resource_limits: ProtocolResourceLimits,
     evm_executor: Arc<EVMExecutor>,
     activation_lock: Arc<tokio::sync::Mutex<()>>,
+    network: Arc<NetworkService>,
 }
 
 enum FinalityPersistenceError {
@@ -176,6 +177,15 @@ impl FinalityContext {
                 })?;
                 (persisted, state_writes, checkpoint)
             } else {
+                if !self
+                    .consensus
+                    .pin_v2_candidate_for_finality(commit.height, commit.block_id)
+                    .await
+                {
+                    return Err(anyhow!(
+                        "finality candidate is not retained for pending finality"
+                    ));
+                }
                 let finalized = self.consensus.finalize_block_v2(commit).await?;
                 let execution = self
                     .consensus
@@ -270,7 +280,51 @@ impl FinalityContext {
             prepared.finalized.block.header.height,
             commit_status
         );
+        // A validator can miss the Commit gossip while it is reconnecting or
+        // while the gossipsub subscription is converging.  Once this node has
+        // durably advanced its canonical tip, request the next certificate so
+        // the ordered finality stream can repair that gap without waiting for
+        // another peer-authentication event.
+        self.request_next_finality().await;
         Ok(())
+    }
+
+    async fn request_next_finality(&self) {
+        let Ok(Some(tip)) = self.finality_store.recover_canonical_tip().await else {
+            return;
+        };
+        let Ok(height) = tip.next_height() else {
+            warn!(
+                "Cannot request next V2 finality after height {}",
+                tip.height
+            );
+            return;
+        };
+        let envelope = ConsensusEnvelope {
+            wire_version: self.chain_context.wire_version,
+            protocol_version: self.chain_context.protocol_version,
+            chain_id: self.chain_context.chain_id,
+            genesis_hash: self.chain_context.genesis_hash,
+            payload: ConsensusMessage::FinalityRequest { height },
+        };
+        let Ok(bytes) = bincode::serialize(&envelope) else {
+            warn!(
+                "Failed to encode next V2 finality request at height {}",
+                height
+            );
+            return;
+        };
+        if let Err(error) = self
+            .network
+            .command_tx
+            .send(NetworkCommand::BroadcastConsensus(bytes))
+            .await
+        {
+            warn!(
+                "Failed to enqueue next V2 finality request at height {}: {}",
+                height, error
+            );
+        }
     }
 
     async fn activate_prepared(&self, prepared: &PreparedFinality) -> Result<()> {
@@ -486,6 +540,16 @@ impl NodeConsensusActionExecutor {
             })
             .await
     }
+
+    async fn reconcile_candidate_retention(&self) -> Result<()> {
+        if self.consensus.reconcile_v2_candidate_retention().await {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "consensus state references a V2 candidate that is not retained"
+            ))
+        }
+    }
 }
 
 #[async_trait]
@@ -684,6 +748,7 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                             .consensus
                             .handle_vote(vote.clone(), signer.as_ref())
                             .await?;
+                        self.reconcile_candidate_retention().await?;
                         handle
                             .submit(ConsensusDriverEvent::VotePersisted(vote))
                             .await?;
@@ -693,6 +758,7 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                                 .consensus
                                 .handle_vote(precommit.clone(), signer.as_ref())
                                 .await?;
+                            self.reconcile_candidate_retention().await?;
                             handle
                                 .submit(ConsensusDriverEvent::VotePersisted(precommit))
                                 .await?;
@@ -735,6 +801,7 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                 };
                 let (follow_up, certificate) =
                     self.consensus.handle_vote(vote, signer.as_ref()).await?;
+                self.reconcile_candidate_retention().await?;
                 info!(
                     "Consensus driver applied vote; follow_up_precommit={} certificate={}",
                     follow_up.is_some(),
@@ -747,6 +814,7 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                         .consensus
                         .handle_vote(precommit.clone(), signer.as_ref())
                         .await?;
+                    self.reconcile_candidate_retention().await?;
                     handle
                         .submit(ConsensusDriverEvent::VotePersisted(precommit))
                         .await?;
@@ -797,12 +865,22 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                     }
                 };
                 let finality_context = self.finality_context.clone();
+                let commit_for_pin = commit.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let result = match finality_context.prepare_commit(commit).await {
                         Ok(result) => result,
                         Err(error) => FinalityPreparationResult::Rejected(error.to_string()),
                     };
+                    if matches!(&result, FinalityPreparationResult::Rejected(_)) {
+                        let _ = finality_context
+                            .consensus
+                            .unpin_v2_candidate_for_finality(
+                                commit_for_pin.height,
+                                commit_for_pin.block_id,
+                            )
+                            .await;
+                    }
                     let _ = handle
                         .submit(ConsensusDriverEvent::FinalityPreparationCompleted {
                             request_id,
@@ -872,6 +950,25 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                     if state_machine.height != token.height || state_machine.round != token.round {
                         return Ok(());
                     }
+                    let timeout_is_current = match token.step {
+                        TimeoutStep::Propose => matches!(
+                            state_machine.step,
+                            norn_core::consensus::types::ConsensusStep::NewHeight
+                                | norn_core::consensus::types::ConsensusStep::NewRound
+                                | norn_core::consensus::types::ConsensusStep::Propose
+                        ),
+                        TimeoutStep::PrevoteWait => {
+                            state_machine.step
+                                == norn_core::consensus::types::ConsensusStep::PrevoteWait
+                        }
+                        TimeoutStep::PrecommitWait => {
+                            state_machine.step
+                                == norn_core::consensus::types::ConsensusStep::PrecommitWait
+                        }
+                    };
+                    if !timeout_is_current {
+                        return Ok(());
+                    }
                     match token.step {
                         TimeoutStep::Propose => {
                             Some(state_machine.on_timeout_propose(signer.as_ref())?)
@@ -909,30 +1006,25 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                     genesis_hash: self.chain_context.genesis_hash,
                     payload: ConsensusMessage::Vote(vote.clone()),
                 };
-                let accepted = match bincode::serialize(&envelope) {
-                    Ok(bytes) => self
-                        .network
-                        .command_tx
-                        .send(NetworkCommand::BroadcastConsensus(bytes))
-                        .await
-                        .is_ok(),
-                    Err(_) => false,
-                };
-                if accepted {
-                    handle
-                        .submit(ConsensusDriverEvent::VoteBroadcastResult { vote, accepted })
-                        .await?;
-                } else {
-                    let retry_handle = handle.clone();
-                    tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                        let _ = retry_handle
-                            .submit(ConsensusDriverEvent::VoteBroadcastResult {
-                                vote,
-                                accepted: false,
-                            })
-                            .await;
-                    });
+                let bytes = bincode::serialize(&envelope)
+                    .map_err(|error| anyhow!("failed to encode Vote: {error}"))?;
+                match self
+                    .network
+                    .command_tx
+                    .try_send(NetworkCommand::BroadcastConsensus(bytes))
+                {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        return Err(anyhow!(RetryableConsensusActionError::with_max_retries(
+                            "Vote broadcast command channel is temporarily full",
+                            8,
+                        )));
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        return Err(anyhow!(
+                            "Vote broadcast command channel is closed; network service stopped"
+                        ));
+                    }
                 }
             }
             ConsensusDriverAction::ScheduleTimeout(token) => {
@@ -1299,6 +1391,7 @@ impl NornNode {
             resource_limits: genesis_config.resource_limits.clone(),
             evm_executor: evm_executor.clone(),
             activation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            network: network.clone(),
         });
         let pending_commits = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let consensus_executor = Arc::new(NodeConsensusActionExecutor {
@@ -1651,6 +1744,10 @@ impl NornNode {
             .get_validated_candidate(height, block_id)
             .await
         {
+            info!(
+                "Responding to V2 block request at height {} from validated candidate",
+                height
+            );
             self.respond_with_v2_block(proposal, block).await;
             return;
         }
@@ -1660,6 +1757,10 @@ impl NornNode {
         // proposal, including its VRF proof and proposal context.
         match self.finality_store.recover_finalized_v2(height).await {
             Ok(Some(finalized)) if finalized.commit.block_id == block_id => {
+                info!(
+                    "Responding to V2 block request at height {} from durable finality",
+                    height
+                );
                 self.respond_with_v2_block(finalized.proposal, finalized.block)
                     .await;
             }
@@ -1774,11 +1875,13 @@ impl NornNode {
                                                     error!("Consensus driver stopped; entering node fail-stop");
                                                     break;
                                                 }
-                                            }
+                                }
                                              ConsensusMessage::BlockRequest { height, block_id } => {
+                                                 info!("Received V2 block request at height {}", height);
                                                  self.respond_to_v2_block_request(height, block_id).await;
                                              }
                                              ConsensusMessage::BlockResponse { proposal, block } => {
+                                                  info!("Received V2 block response at height {}", proposal.height);
                                                   if let Err(error) = self
                                                       .consensus_driver
                                                       .dispatch(ConsensusDriverEvent::NetworkProposal {

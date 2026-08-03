@@ -24,18 +24,29 @@ const HIGH_PRIORITY_BUDGET: usize = 32;
 const MAX_ACTION_RETRIES: usize = 3;
 const ACTION_RETRY_BASE: Duration = Duration::from_millis(50);
 
-/// An action may opt into bounded retry only when the action is idempotent.
-/// Unknown errors remain fatal and stop the single consensus driver.
+/// An action may opt into bounded retry only when the action is idempotent
+/// (currently Commit/Vote broadcast). Unknown errors remain fatal and stop
+/// the single consensus driver.
 #[derive(Debug)]
 pub struct RetryableConsensusActionError {
     reason: String,
+    max_retries: usize,
 }
 
 impl RetryableConsensusActionError {
     pub fn new(reason: impl Into<String>) -> Self {
+        Self::with_max_retries(reason, MAX_ACTION_RETRIES)
+    }
+
+    pub fn with_max_retries(reason: impl Into<String>, max_retries: usize) -> Self {
         Self {
             reason: reason.into(),
+            max_retries,
         }
+    }
+
+    fn max_retries(&self) -> usize {
+        self.max_retries
     }
 }
 
@@ -179,10 +190,6 @@ pub enum ConsensusDriverEvent {
     /// A vote has passed the SafetyStore WAL/signing acknowledgement.
     VotePersisted(SignedVote),
     VoteDurablySigned(SignedVote),
-    VoteBroadcastResult {
-        vote: SignedVote,
-        accepted: bool,
-    },
     /// FinalityStore has completed the durable transaction.
     FinalityPersisted(CommitCertificate),
     FinalityDurable(CommitCertificate),
@@ -352,25 +359,25 @@ impl ConsensusDriver {
                                     .await
                                 {
                                     Ok(()) => break,
-                                    Err(error)
-                                        if error
-                                            .downcast_ref::<RetryableConsensusActionError>()
-                                            .is_some()
-                                            && retries < MAX_ACTION_RETRIES =>
-                                    {
-                                        retries += 1;
-                                        let delay = action_retry_delay(retries);
-                                        warn!(
-                                            attempt = retries,
-                                            max_retries = MAX_ACTION_RETRIES,
-                                            delay_ms = delay.as_millis() as u64,
-                                            "retrying idempotent consensus action after transient failure"
-                                        );
-                                        tokio::time::sleep(delay).await;
-                                    }
                                     Err(error) => {
-                                        execution_error = Some(error);
-                                        break 'actions;
+                                        let retry_limit = error
+                                            .downcast_ref::<RetryableConsensusActionError>()
+                                            .map(RetryableConsensusActionError::max_retries)
+                                            .unwrap_or(0);
+                                        if retries < retry_limit {
+                                            retries += 1;
+                                            let delay = action_retry_delay(retries);
+                                            warn!(
+                                                attempt = retries,
+                                                max_retries = retry_limit,
+                                                delay_ms = delay.as_millis() as u64,
+                                                "retrying idempotent consensus action after transient failure"
+                                            );
+                                            tokio::time::sleep(delay).await;
+                                        } else {
+                                            execution_error = Some(error);
+                                            break 'actions;
+                                        }
                                     }
                                 }
                             }
@@ -769,15 +776,6 @@ async fn process_event(
         | ConsensusDriverEvent::VoteDurablySigned(vote) => {
             vec![ConsensusDriverAction::BroadcastVote(vote)]
         }
-        ConsensusDriverEvent::VoteBroadcastResult { vote, accepted } => {
-            if accepted {
-                Vec::new()
-            } else {
-                // The exact already-signed vote is retried; no replacement
-                // signing request is ever generated for this slot.
-                vec![ConsensusDriverAction::BroadcastVote(vote)]
-            }
-        }
         ConsensusDriverEvent::FinalityPersisted(commit)
         | ConsensusDriverEvent::FinalityDurable(commit) => {
             invalidate_after_finality(state, commit.height);
@@ -1160,6 +1158,7 @@ mod tests {
 
     struct RetryingExecutor {
         attempts: Arc<AtomicUsize>,
+        failures: usize,
     }
 
     #[async_trait]
@@ -1170,7 +1169,7 @@ mod tests {
             _handle: ConsensusDriverHandle,
         ) -> Result<()> {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
-            if attempt < 2 {
+            if attempt < self.failures {
                 return Err(anyhow!(RetryableConsensusActionError::new(
                     "injected transient broadcast failure"
                 )));
@@ -1301,6 +1300,7 @@ mod tests {
             8,
             Arc::new(RetryingExecutor {
                 attempts: attempts.clone(),
+                failures: 2,
             }),
         )
         .unwrap();
@@ -1318,6 +1318,33 @@ mod tests {
             .dispatch(ConsensusDriverEvent::Shutdown)
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn retryable_action_failure_is_bounded_and_stops_driver() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let driver = ConsensusDriver::start_with_executor(
+            8,
+            Arc::new(RetryingExecutor {
+                attempts: attempts.clone(),
+                failures: usize::MAX,
+            }),
+        )
+        .unwrap();
+        driver
+            .handle()
+            .submit(ConsensusDriverEvent::NetworkProposal {
+                proposal: proposal(1, 0, 1),
+                block: BlockV2::default(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+        assert!(driver
+            .dispatch(ConsensusDriverEvent::Shutdown)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

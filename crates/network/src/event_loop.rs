@@ -909,16 +909,19 @@ impl EventLoop {
     }
 }
 
-/// A FullNode may request finalized V2 data, but it cannot originate a
-/// proposal, vote, certificate, or response. Incoming consensus messages are
-/// deliberately not filtered by this local-role check: gossipsub does not
-/// expose the original publisher to a relay, so the node must perform the
-/// cryptographic admission checks instead.
+/// A FullNode may originate V2 synchronization requests and responses, but it
+/// cannot originate a proposal, vote, or certificate. Incoming consensus
+/// messages are deliberately not filtered by this local-role check: gossipsub
+/// does not expose the original publisher to a relay, so the node must perform
+/// the cryptographic admission checks instead.
 fn local_consensus_broadcast_allowed(role: PeerRole, payload: &ConsensusMessage) -> bool {
     role == PeerRole::Validator
         || matches!(
             payload,
-            ConsensusMessage::BlockRequest { .. } | ConsensusMessage::FinalityRequest { .. }
+            ConsensusMessage::BlockRequest { .. }
+                | ConsensusMessage::BlockResponse { .. }
+                | ConsensusMessage::FinalityRequest { .. }
+                | ConsensusMessage::FinalityResponse { .. }
         )
 }
 
