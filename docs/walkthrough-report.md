@@ -2,9 +2,9 @@
 
 ## 1. 范围与结论
 
-本报告以提交 `b65343c` 为已提交基线，覆盖后续 V2 P0/P1 修复、网络恢复增强、依赖安全升级、最终性恢复硬化和最终验证。
+本报告以提交 `b65343c` 为前一轮基线，记录已合入的 `046d240` 以及本轮针对审查意见的未提交 P0 修复。
 
-结论：Candidate V2 的当前 P0/P1 主路径和恢复硬化已完成，核心工作区测试门禁通过；项目仍不标记为 `production-ready`。正式上线前仍需完成治理交易接入、独立安全审计、长期故障演练、部署 runbook 和 release review。
+结论：Candidate V2 的主路径和恢复硬化已有实质性实现，但本轮审查暴露的异步结果隔离与 Action 错误可观测性刚完成修复，仍需逐阶段审查和完整门禁复验；项目不标记为 `production-ready`。正式上线前仍需完成治理交易接入、独立安全审计、长期故障演练、部署 runbook 和 release review。
 
 ## 2. 端到端执行路径
 
@@ -48,7 +48,8 @@ flowchart TD
 - epoch snapshot、ValidatorChange、jailing、slashing 和延迟生效规则在状态机层确定性执行；pending changes 与 next snapshot 随 finalized record 同批持久化，并在重启时恢复。
 - 当前尚未把 `ValidatorChange` 接入 `TransactionV2`/system-governance admission；现有 queue API 不能单独宣称治理交易已经上线。
 - Prevote、Precommit、NIL、锁定/解锁、valid round 和 timeout 规则固定并有状态机测试。
-- `ConsensusDriver` 使用单写入队列和 stale timeout token；ConsensusAction 采用 Intent/Ack 语义，避免签名失败或 WAL 失败时错误推进状态。
+- `ConsensusDriver` 使用单写入队列和 generation/height/round/snapshot/parent context token；真实 round 变化、上下文变化和旧 worker completion 会被丢弃。
+- `ConsensusAction` 采用 Intent/Ack 语义；带 reply 的 Action 错误会返回调用方，无 reply 的内部 Action 错误会记录并 fail-stop，不再静默丢失。具体 Action 的有限重试策略仍需后续补齐。
 
 ### 网络与节点角色
 
@@ -82,36 +83,38 @@ flowchart TD
 
 ## 5. 验证结果
 
-以下门禁已通过：
+本轮已通过的定向门禁：
 
 ```text
-cargo check --workspace --locked
 cargo fmt --all -- --check
-git diff --check
 cargo test --workspace --locked -j 1
-cargo test -p norn-network --lib --locked
+cargo test -p norn-core --lib consensus::driver --locked
 cargo test -p norn --test four_process_v2_bft --locked
+git diff --check
 ```
 
-完整 workspace clippy 目前仍受既有 warning 阻断，不能作为已通过门禁；
+本轮修改后的完整 workspace 测试已复验通过；完整 workspace clippy 目前仍受既有 warning 阻断，不能作为已通过门禁；
 `cargo audit` 仍报告 `hickory-proto 0.25.2` 的 2 个 advisory 和 13 个维护性/健壮性 warning。
 
 最终结果包括：
 
-- workspace 测试全部通过，无失败；
-- core 246 个 library tests 通过；
-- common 40 个 tests 通过；
+- workspace 测试本轮全部通过，无失败；ConsensusDriver 定向测试 10 个通过；
 - 四进程 Validator/FullNode BFT 测试通过，覆盖十个高度、proposer kill/restart、恢复和网络隔离；
-- 网络 crate 最终 18 个测试通过，另有独立进程认证测试通过；
+- stale worker completion 已覆盖 generation、真实 round 变化、snapshot 和 parent context；内部无 reply Action failure 已覆盖 fail-stop 行为；
 - 编译无错误；仍需处理既有 unused、deprecated、unexpected-cfg 等 warning，
   才能关闭 `-D warnings` clippy 门禁。
 
 ## 6. 最终状态
 
 ```text
-Implementation: P0/P1 main path and durable recovery hardening complete; governance admission pending
+ConsensusDriver and timeout path: substantially completed
+Durable finality recovery: substantially completed
+Stale async-result isolation: implemented and covered by targeted/four-process tests
+Consensus action failure propagation: fail-stop implemented; explicit Action retry policy remains
+Validator authorization: complete for static Genesis set
+Governance admission and dynamic authorization: pending
 Verification gates: workspace tests/fmt/diff passed; clippy and audit remain open
 Cargo audit: 2 hickory advisories + 13 warnings remain
 Production status: Candidate only
-Commit status: this report and current changes are included in the current main commit
+Commit status: current P0 follow-up changes are uncommitted
 ```

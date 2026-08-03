@@ -958,8 +958,7 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                     .await
                     .map_err(|error| anyhow!("failed to enqueue Commit: {error}"))?;
             }
-            ConsensusDriverAction::CancelTimeout(_)
-            | ConsensusDriverAction::BuildLocalProposal { .. } => {}
+            ConsensusDriverAction::CancelTimeout(_) => {}
         }
         Ok(())
     }

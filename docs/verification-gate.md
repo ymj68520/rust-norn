@@ -7,11 +7,16 @@ production-ready until every gate below is reproducible on a clean workspace.
 
 ```text
 cargo fmt --all -- --check
-cargo test --workspace -j 1
+cargo check --workspace --locked
+cargo test --workspace --locked -j 1
 cargo test -p norn-network --lib service::tests::stage7_authenticates_valid_peers_and_rejects_wrong_role_and_context -- --nocapture
 cargo test -p norn-network --test stage7_process_test -- --nocapture
 cargo test -p norn-core --lib finality -- --nocapture
+cargo test -p norn-core --lib consensus::driver --locked -- --nocapture
 cargo test -p norn-core --test four_node_bft_test -- --nocapture
+cargo test -p norn --test four_process_v2_bft --locked -- --nocapture
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo audit --no-fetch --no-yanked
 git diff --check
 ```
 
@@ -44,6 +49,12 @@ libFuzzer target against the same `decode_and_validate` entry point.
   instead of being derived from process memory;
 - restart recovery replays the exact durable vote, certificate, and overlay
   write-set;
+- a worker completion that arrives after a real timeout/round change is
+  discarded even if the request entry was not cleared by the test harness;
+- worker completions are rechecked against generation, height, round, snapshot,
+  and parent context before application;
+- an internal Action error without a oneshot reply is observable and puts the
+  driver into fail-stop instead of being silently dropped;
 - four independent configurations derive the same snapshot hash and proposer
   sequence;
 - the full workspace test suite is green.

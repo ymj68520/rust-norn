@@ -13,10 +13,11 @@ use async_trait::async_trait;
 use norn_common::consensus_types::{
     CommitCertificate, FinalizedBlockV2, Proposal, SignedVote, StakeSnapshot,
 };
-use norn_common::types::{BlockId, BlockV2, Hash, StakeSnapshotHash};
+use norn_common::types::{BlockV2, Hash, StakeSnapshotHash};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::error;
 
 const HIGH_PRIORITY_BUDGET: usize = 32;
 
@@ -102,13 +103,6 @@ pub enum ConsensusDriverEvent {
     },
     NetworkVote(SignedVote),
     NetworkCommit(CommitCertificate),
-    /// Compatibility event for callers that have not yet supplied the full
-    /// locally built proposal.  It only creates a build action and cannot
-    /// mutate consensus state by itself.
-    LocalProposalReady {
-        height: u64,
-        block_id: BlockId,
-    },
     /// Begin a fresh Tendermint round. The producer, startup recovery path,
     /// or timeout executor supplies the protocol-selected deadline; the
     /// driver owns replacing any older timer and advancing its generation.
@@ -209,10 +203,6 @@ pub enum ConsensusDriverAction {
     BroadcastVote(SignedVote),
     ScheduleTimeout(TimeoutToken),
     CancelTimeout(TimeoutToken),
-    BuildLocalProposal {
-        height: u64,
-        block_id: BlockId,
-    },
     BroadcastCommit(CommitCertificate),
 }
 
@@ -277,6 +267,10 @@ struct DriverState {
     active_timeout: Option<TimeoutToken>,
     generation: u64,
     next_request_id: u64,
+    active_height: Option<u64>,
+    active_round: Option<u32>,
+    active_parent_block_hash: Option<Hash>,
+    active_snapshot_hash: Option<StakeSnapshotHash>,
     pending: HashMap<ValidationRequestId, ConsensusContextToken>,
     pending_finality: HashMap<ValidationRequestId, ConsensusContextToken>,
 }
@@ -323,10 +317,19 @@ impl ConsensusDriver {
                                 break;
                             }
                         }
+                        if let Some(error) = execution_error {
+                            let message = error.to_string();
+                            if let Some(reply) = request.reply {
+                                let _ = reply.send(Err(anyhow!(message.clone())));
+                            }
+                            error!(
+                                "ConsensusDriver action execution failed; entering fail-stop: {}",
+                                message
+                            );
+                            break;
+                        }
                         if let Some(reply) = request.reply {
-                            let result =
-                                execution_error.map_or_else(|| Ok(actions), |error| Err(error));
-                            let _ = reply.send(result);
+                            let _ = reply.send(Ok(actions));
                         }
                     }
                     Err(error) => {
@@ -441,7 +444,7 @@ fn vote_context(state: &DriverState, vote: &SignedVote) -> ConsensusContextToken
         height: vote.height,
         round: vote.round,
         generation: state.generation,
-        parent_block_hash: Hash::default(),
+        parent_block_hash: state.active_parent_block_hash.unwrap_or_default(),
         stake_snapshot_hash: vote.stake_snapshot_hash,
     }
 }
@@ -451,7 +454,7 @@ fn commit_context(state: &DriverState, commit: &CommitCertificate) -> ConsensusC
         height: commit.height,
         round: commit.round,
         generation: state.generation,
-        parent_block_hash: Hash::default(),
+        parent_block_hash: state.active_parent_block_hash.unwrap_or_default(),
         stake_snapshot_hash: commit.stake_snapshot_hash,
     }
 }
@@ -463,7 +466,15 @@ fn replace_timeout(
     step: TimeoutStep,
     deadline: tokio::time::Instant,
 ) -> Vec<ConsensusDriverAction> {
+    if state.active_height != Some(height) {
+        state.active_parent_block_hash = None;
+        state.active_snapshot_hash = None;
+    }
+    state.active_height = Some(height);
+    state.active_round = Some(round);
     state.generation = state.generation.saturating_add(1);
+    state.pending.clear();
+    state.pending_finality.clear();
     let token = TimeoutToken {
         height,
         round,
@@ -479,6 +490,64 @@ fn replace_timeout(
     actions
 }
 
+fn register_context(state: &mut DriverState, context: &ConsensusContextToken) -> bool {
+    if let Some(height) = state.active_height {
+        if height != context.height || state.active_round != Some(context.round) {
+            return false;
+        }
+    } else {
+        state.active_height = Some(context.height);
+        state.active_round = Some(context.round);
+    }
+
+    if let Some(snapshot_hash) = state.active_snapshot_hash {
+        if snapshot_hash != context.stake_snapshot_hash {
+            return false;
+        }
+    } else {
+        state.active_snapshot_hash = Some(context.stake_snapshot_hash);
+    }
+
+    if let Some(parent_block_hash) = state.active_parent_block_hash {
+        if parent_block_hash != context.parent_block_hash {
+            return false;
+        }
+    } else if context.parent_block_hash != Hash::default() {
+        state.active_parent_block_hash = Some(context.parent_block_hash);
+    }
+    true
+}
+
+fn context_is_current(state: &DriverState, context: &ConsensusContextToken) -> bool {
+    context.generation == state.generation
+        && state.active_height == Some(context.height)
+        && state.active_round == Some(context.round)
+        && state.active_snapshot_hash.map_or(true, |snapshot_hash| {
+            snapshot_hash == context.stake_snapshot_hash
+        })
+        && state
+            .active_parent_block_hash
+            .map_or(true, |parent_block_hash| {
+                parent_block_hash == context.parent_block_hash
+            })
+}
+
+fn invalidate_after_finality(state: &mut DriverState, finalized_height: u64) {
+    state.generation = state.generation.saturating_add(1);
+    state.pending.clear();
+    state.pending_finality.clear();
+    let next_height = finalized_height.saturating_add(1);
+    if state
+        .active_height
+        .map_or(true, |active_height| active_height <= finalized_height)
+    {
+        state.active_height = Some(next_height);
+        state.active_round = Some(0);
+        state.active_parent_block_hash = None;
+        state.active_snapshot_hash = None;
+    }
+}
+
 async fn process_event(
     state: &mut DriverState,
     event: ConsensusDriverEvent,
@@ -488,6 +557,9 @@ async fn process_event(
         | ConsensusDriverEvent::LocalProposalBuilt { proposal, block } => {
             let request_id = next_request_id(state);
             let context = proposal_context(state, &proposal);
+            if !register_context(state, &context) {
+                return Ok(Vec::new());
+            }
             state.pending.insert(request_id, context);
             vec![ConsensusDriverAction::ValidateProposal {
                 request_id,
@@ -499,6 +571,9 @@ async fn process_event(
         ConsensusDriverEvent::NetworkVote(vote) => {
             let request_id = next_request_id(state);
             let context = vote_context(state, &vote);
+            if !register_context(state, &context) {
+                return Ok(Vec::new());
+            }
             state.pending.insert(request_id, context);
             vec![ConsensusDriverAction::ValidateVote {
                 request_id,
@@ -509,23 +584,15 @@ async fn process_event(
         ConsensusDriverEvent::NetworkCommit(commit) => {
             let request_id = next_request_id(state);
             let context = commit_context(state, &commit);
+            if !register_context(state, &context) {
+                return Ok(Vec::new());
+            }
             state.pending.insert(request_id, context);
             vec![ConsensusDriverAction::ValidateCommit {
                 request_id,
                 context,
                 commit,
             }]
-        }
-        ConsensusDriverEvent::LocalProposalReady { height, block_id } => {
-            let mut actions = vec![ConsensusDriverAction::BuildLocalProposal { height, block_id }];
-            actions.extend(replace_timeout(
-                state,
-                height,
-                0,
-                TimeoutStep::Propose,
-                tokio::time::Instant::now(),
-            ));
-            actions
         }
         ConsensusDriverEvent::RoundStarted {
             height,
@@ -554,7 +621,9 @@ async fn process_event(
             context,
             result,
         } => {
-            if state.pending.remove(&request_id) != Some(context) {
+            if state.pending.remove(&request_id) != Some(context)
+                || !context_is_current(state, &context)
+            {
                 return Ok(Vec::new());
             }
             match result {
@@ -574,7 +643,9 @@ async fn process_event(
             vote,
             result,
         } => {
-            if state.pending.remove(&request_id) != Some(context) {
+            if state.pending.remove(&request_id) != Some(context)
+                || !context_is_current(state, &context)
+            {
                 return Ok(Vec::new());
             }
             match result {
@@ -594,7 +665,9 @@ async fn process_event(
             commit,
             result,
         } => {
-            if state.pending.remove(&request_id) != Some(context) {
+            if state.pending.remove(&request_id) != Some(context)
+                || !context_is_current(state, &context)
+            {
                 return Ok(Vec::new());
             }
             match result {
@@ -614,7 +687,9 @@ async fn process_event(
             context,
             result,
         } => {
-            if state.pending_finality.remove(&request_id) != Some(context) {
+            if state.pending_finality.remove(&request_id) != Some(context)
+                || !context_is_current(state, &context)
+            {
                 return Ok(Vec::new());
             }
             match result {
@@ -626,6 +701,7 @@ async fn process_event(
                     }]
                 }
                 FinalityPreparationResult::AlreadyDurable(commit) => {
+                    invalidate_after_finality(state, commit.height);
                     vec![ConsensusDriverAction::BroadcastCommit(commit)]
                 }
                 FinalityPreparationResult::Rejected(_) => Vec::new(),
@@ -646,6 +722,7 @@ async fn process_event(
         }
         ConsensusDriverEvent::FinalityPersisted(commit)
         | ConsensusDriverEvent::FinalityDurable(commit) => {
+            invalidate_after_finality(state, commit.height);
             let mut actions = Vec::with_capacity(2);
             if let Some(previous) = state.active_timeout.take() {
                 actions.push(ConsensusDriverAction::CancelTimeout(previous));
@@ -670,6 +747,7 @@ async fn process_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use norn_common::types::BlockId;
     use std::sync::Mutex;
     use tokio::sync::Notify;
 
@@ -726,6 +804,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_worker_result_is_ignored_after_real_round_change() {
+        let driver = ConsensusDriver::start(8).unwrap();
+        let p = proposal(1, 0, 1);
+        let actions = driver
+            .dispatch(ConsensusDriverEvent::NetworkProposal {
+                proposal: p.clone(),
+                block: BlockV2::default(),
+            })
+            .await
+            .unwrap();
+        let (request_id, context) = match &actions[0] {
+            ConsensusDriverAction::ValidateProposal {
+                request_id,
+                context,
+                ..
+            } => (*request_id, *context),
+            other => panic!("unexpected action: {other:?}"),
+        };
+
+        let round_actions = driver
+            .dispatch(ConsensusDriverEvent::RoundStarted {
+                height: 1,
+                round: 1,
+                deadline: tokio::time::Instant::now(),
+            })
+            .await
+            .unwrap();
+        assert!(round_actions.iter().any(|action| matches!(
+            action,
+            ConsensusDriverAction::ScheduleTimeout(TimeoutToken { round: 1, .. })
+        )));
+
+        let stale = driver
+            .dispatch(ConsensusDriverEvent::ProposalValidationCompleted {
+                request_id,
+                context,
+                result: ProposalValidationResult::Accepted(ValidatedCandidate {
+                    proposal: p,
+                    block: BlockV2::default(),
+                    derived_randomness: Hash([4; 32]),
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(stale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_rechecks_generation_even_if_pending_entry_survives() {
+        let mut state = DriverState::default();
+        let p = proposal(1, 0, 1);
+        let actions = process_event(
+            &mut state,
+            ConsensusDriverEvent::NetworkProposal {
+                proposal: p.clone(),
+                block: BlockV2::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let (request_id, context) = match &actions[0] {
+            ConsensusDriverAction::ValidateProposal {
+                request_id,
+                context,
+                ..
+            } => (*request_id, *context),
+            other => panic!("unexpected action: {other:?}"),
+        };
+        state.generation = state.generation.saturating_add(1);
+
+        let stale = process_event(
+            &mut state,
+            ConsensusDriverEvent::ProposalValidationCompleted {
+                request_id,
+                context,
+                result: ProposalValidationResult::Accepted(ValidatedCandidate {
+                    proposal: p,
+                    block: BlockV2::default(),
+                    derived_randomness: Hash([5; 32]),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(stale.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_rechecks_snapshot_and_parent_even_if_pending_entry_survives() {
+        let mut state = DriverState::default();
+        let first = proposal(1, 0, 1);
+        let second = proposal(1, 0, 2);
+        let first_actions = process_event(
+            &mut state,
+            ConsensusDriverEvent::NetworkProposal {
+                proposal: first.clone(),
+                block: BlockV2::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let (first_request_id, first_context) = match &first_actions[0] {
+            ConsensusDriverAction::ValidateProposal {
+                request_id,
+                context,
+                ..
+            } => (*request_id, *context),
+            other => panic!("unexpected action: {other:?}"),
+        };
+
+        let second_actions = process_event(
+            &mut state,
+            ConsensusDriverEvent::NetworkProposal {
+                proposal: second.clone(),
+                block: BlockV2::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let (second_request_id, second_context) = match &second_actions[0] {
+            ConsensusDriverAction::ValidateProposal {
+                request_id,
+                context,
+                ..
+            } => (*request_id, *context),
+            other => panic!("unexpected action: {other:?}"),
+        };
+
+        state.active_snapshot_hash = Some(StakeSnapshotHash([6; 32]));
+        let stale_snapshot = process_event(
+            &mut state,
+            ConsensusDriverEvent::ProposalValidationCompleted {
+                request_id: first_request_id,
+                context: first_context,
+                result: ProposalValidationResult::Accepted(ValidatedCandidate {
+                    proposal: first,
+                    block: BlockV2::default(),
+                    derived_randomness: Hash([4; 32]),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(stale_snapshot.is_empty());
+
+        state.active_parent_block_hash = Some(Hash([5; 32]));
+        let stale_parent = process_event(
+            &mut state,
+            ConsensusDriverEvent::ProposalValidationCompleted {
+                request_id: second_request_id,
+                context: second_context,
+                result: ProposalValidationResult::Accepted(ValidatedCandidate {
+                    proposal: second,
+                    block: BlockV2::default(),
+                    derived_randomness: Hash([4; 32]),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(stale_parent.is_empty());
+    }
+
+    #[tokio::test]
     async fn network_flood_cannot_consume_internal_queue_capacity() {
         let driver = ConsensusDriver::start(1).unwrap();
         let p = proposal(1, 0, 1);
@@ -748,25 +990,6 @@ mod tests {
             .await
             .unwrap();
         assert!(actions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn local_ready_uses_propose_timer_not_vote_step() {
-        let driver = ConsensusDriver::start(8).unwrap();
-        let actions = driver
-            .dispatch(ConsensusDriverEvent::LocalProposalReady {
-                height: 1,
-                block_id: BlockId(Hash([1; 32])),
-            })
-            .await
-            .unwrap();
-        assert!(actions.iter().any(|action| matches!(
-            action,
-            ConsensusDriverAction::ScheduleTimeout(TimeoutToken {
-                step: TimeoutStep::Propose,
-                ..
-            })
-        )));
     }
 
     #[tokio::test]
@@ -872,6 +1095,22 @@ mod tests {
         release: Arc<Notify>,
     }
 
+    struct FailingExecutor {
+        failed: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl ConsensusActionExecutor for FailingExecutor {
+        async fn execute(
+            &self,
+            _action: ConsensusDriverAction,
+            _handle: ConsensusDriverHandle,
+        ) -> Result<()> {
+            self.failed.notify_one();
+            Err(anyhow!("injected action failure"))
+        }
+    }
+
     #[async_trait]
     impl ConsensusActionExecutor for BlockingExecutor {
         async fn execute(
@@ -942,6 +1181,37 @@ mod tests {
         .unwrap()
         .unwrap();
         release.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn internal_action_failure_stops_driver_instead_of_being_dropped() {
+        let failed = Arc::new(Notify::new());
+        let driver = ConsensusDriver::start_with_executor(
+            8,
+            Arc::new(FailingExecutor {
+                failed: failed.clone(),
+            }),
+        )
+        .unwrap();
+        let notification = failed.notified();
+        driver
+            .handle()
+            .submit(ConsensusDriverEvent::NetworkProposal {
+                proposal: proposal(1, 0, 1),
+                block: BlockV2::default(),
+            })
+            .await
+            .unwrap();
+        notification.await;
+        tokio::task::yield_now().await;
+
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            driver.dispatch(ConsensusDriverEvent::Shutdown),
+        )
+        .await
+        .expect("driver shutdown request must resolve after fail-stop");
+        assert!(stopped.is_err());
     }
 
     #[tokio::test]
