@@ -16,10 +16,45 @@ use norn_common::consensus_types::{
 use norn_common::types::{BlockV2, Hash, StakeSnapshotHash};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::error;
+use tracing::{error, warn};
 
 const HIGH_PRIORITY_BUDGET: usize = 32;
+const MAX_ACTION_RETRIES: usize = 3;
+const ACTION_RETRY_BASE: Duration = Duration::from_millis(50);
+
+/// An action may opt into bounded retry only when the action is idempotent.
+/// Unknown errors remain fatal and stop the single consensus driver.
+#[derive(Debug)]
+pub struct RetryableConsensusActionError {
+    reason: String,
+}
+
+impl RetryableConsensusActionError {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for RetryableConsensusActionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "retryable consensus action failure: {}",
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for RetryableConsensusActionError {}
+
+fn action_retry_delay(retry_number: usize) -> Duration {
+    let multiplier = 1u32 << retry_number.saturating_sub(1).min(5);
+    ACTION_RETRY_BASE.saturating_mul(multiplier)
+}
 
 /// Timer phases are intentionally independent from vote phases.  A timer is
 /// about waiting for a state transition; it is not itself a vote.
@@ -309,12 +344,35 @@ impl ConsensusDriver {
                 match result {
                     Ok(actions) => {
                         let mut execution_error = None;
-                        for action in actions.iter().cloned() {
-                            if let Err(error) =
-                                executor.execute(action, worker_handle.clone()).await
-                            {
-                                execution_error = Some(error);
-                                break;
+                        'actions: for action in actions.iter().cloned() {
+                            let mut retries = 0usize;
+                            loop {
+                                match executor
+                                    .execute(action.clone(), worker_handle.clone())
+                                    .await
+                                {
+                                    Ok(()) => break,
+                                    Err(error)
+                                        if error
+                                            .downcast_ref::<RetryableConsensusActionError>()
+                                            .is_some()
+                                            && retries < MAX_ACTION_RETRIES =>
+                                    {
+                                        retries += 1;
+                                        let delay = action_retry_delay(retries);
+                                        warn!(
+                                            attempt = retries,
+                                            max_retries = MAX_ACTION_RETRIES,
+                                            delay_ms = delay.as_millis() as u64,
+                                            "retrying idempotent consensus action after transient failure"
+                                        );
+                                        tokio::time::sleep(delay).await;
+                                    }
+                                    Err(error) => {
+                                        execution_error = Some(error);
+                                        break 'actions;
+                                    }
+                                }
                             }
                         }
                         if let Some(error) = execution_error {
@@ -748,6 +806,7 @@ async fn process_event(
 mod tests {
     use super::*;
     use norn_common::types::BlockId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tokio::sync::Notify;
 
@@ -1099,6 +1158,27 @@ mod tests {
         failed: Arc<Notify>,
     }
 
+    struct RetryingExecutor {
+        attempts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ConsensusActionExecutor for RetryingExecutor {
+        async fn execute(
+            &self,
+            _action: ConsensusDriverAction,
+            _handle: ConsensusDriverHandle,
+        ) -> Result<()> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt < 2 {
+                return Err(anyhow!(RetryableConsensusActionError::new(
+                    "injected transient broadcast failure"
+                )));
+            }
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl ConsensusActionExecutor for FailingExecutor {
         async fn execute(
@@ -1212,6 +1292,32 @@ mod tests {
         .await
         .expect("driver shutdown request must resolve after fail-stop");
         assert!(stopped.is_err());
+    }
+
+    #[tokio::test]
+    async fn retryable_action_failure_is_retried_then_succeeds() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let driver = ConsensusDriver::start_with_executor(
+            8,
+            Arc::new(RetryingExecutor {
+                attempts: attempts.clone(),
+            }),
+        )
+        .unwrap();
+        driver
+            .handle()
+            .submit(ConsensusDriverEvent::NetworkProposal {
+                proposal: proposal(1, 0, 1),
+                block: BlockV2::default(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        assert!(driver
+            .dispatch(ConsensusDriverEvent::Shutdown)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

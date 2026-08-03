@@ -14,7 +14,7 @@ use norn_core::blockchain::Blockchain;
 use norn_core::consensus::driver::{
     CommitValidationResult, ConsensusActionExecutor, ConsensusDriver, ConsensusDriverAction,
     ConsensusDriverEvent, ConsensusDriverHandle, FinalityPreparationResult, PreparedFinality,
-    ProposalValidationResult, TimeoutStep, VoteValidationResult,
+    ProposalValidationResult, RetryableConsensusActionError, TimeoutStep, VoteValidationResult,
 };
 use norn_core::consensus::povf::PoVFEngine;
 use norn_core::consensus::producer::{BlockProducer, BlockProducerConfig};
@@ -956,7 +956,11 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                     .command_tx
                     .send(NetworkCommand::BroadcastConsensus(bytes))
                     .await
-                    .map_err(|error| anyhow!("failed to enqueue Commit: {error}"))?;
+                    .map_err(|error| {
+                        anyhow!(RetryableConsensusActionError::new(format!(
+                            "failed to enqueue Commit: {error}"
+                        )))
+                    })?;
             }
             ConsensusDriverAction::CancelTimeout(_) => {}
         }
@@ -1095,12 +1099,13 @@ impl NornNode {
             )
             .await?;
 
-        let consensus = Arc::new(PoVFEngine::new_with_parent_randomness(
+        let consensus = Arc::new(PoVFEngine::new_with_parent_randomness_and_limits(
             consensus_config,
             genesis_snapshot.clone(),
             genesis_config.initial_randomness,
             persistent_safety_store,
             local_validator_id,
+            genesis_config.resource_limits.clone(),
         ));
         {
             let sm = consensus.state_machine.read().await;

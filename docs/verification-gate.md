@@ -55,6 +55,16 @@ libFuzzer target against the same `decode_and_validate` entry point.
   and parent context before application;
 - an internal Action error without a oneshot reply is observable and puts the
   driver into fail-stop instead of being silently dropped;
+- only the idempotent `BroadcastCommit` enqueue path may return a typed
+  retryable Action error; retry is bounded to three attempts with exponential
+  backoff, while unknown errors and retry exhaustion fail-stop;
+- V2 candidate proposal, block, and derived randomness are admitted as one
+  bounded cache entry; byte, per-height, per-proposer, future-height,
+  future-round, and TTL limits are enforced from protocol parameters or a
+  versioned protocol invariant;
+- a conflicting candidate for the same `(height, block_id)` is rejected,
+  identical replay is idempotent, and candidates through finalized height are
+  removed;
 - four independent configurations derive the same snapshot hash and proposer
   sequence;
 - the full workspace test suite is green.

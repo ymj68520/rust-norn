@@ -2,9 +2,9 @@
 
 ## 1. 范围与结论
 
-本报告以提交 `b65343c` 为前一轮基线，记录已合入的 `046d240` 以及本轮针对审查意见的未提交 P0 修复。
+本报告以提交 `1c03ce2` 为前一轮基线，记录本轮针对审查意见的候选缓存和 ConsensusAction 可靠性修复。
 
-结论：Candidate V2 的主路径和恢复硬化已有实质性实现，但本轮审查暴露的异步结果隔离与 Action 错误可观测性刚完成修复，仍需逐阶段审查和完整门禁复验；项目不标记为 `production-ready`。正式上线前仍需完成治理交易接入、独立安全审计、长期故障演练、部署 runbook 和 release review。
+结论：Candidate V2 的主路径、恢复硬化、异步结果隔离、候选缓存边界和 Action 错误处理已有实质性实现，仍需逐阶段审查和完整门禁复验；项目不标记为 `production-ready`。正式上线前仍需完成治理交易接入、动态网络授权、独立安全审计、长期故障演练、部署 runbook 和 release review。
 
 ## 2. 端到端执行路径
 
@@ -49,7 +49,15 @@ flowchart TD
 - 当前尚未把 `ValidatorChange` 接入 `TransactionV2`/system-governance admission；现有 queue API 不能单独宣称治理交易已经上线。
 - Prevote、Precommit、NIL、锁定/解锁、valid round 和 timeout 规则固定并有状态机测试。
 - `ConsensusDriver` 使用单写入队列和 generation/height/round/snapshot/parent context token；真实 round 变化、上下文变化和旧 worker completion 会被丢弃。
-- `ConsensusAction` 采用 Intent/Ack 语义；带 reply 的 Action 错误会返回调用方，无 reply 的内部 Action 错误会记录并 fail-stop，不再静默丢失。具体 Action 的有限重试策略仍需后续补齐。
+- `ConsensusAction` 采用 Intent/Ack 语义；带 reply 的 Action 错误会返回调用方，无 reply 的内部 Action 错误会记录并 fail-stop，不再静默丢失。
+- 仅节点的幂等 `BroadcastCommit` 网络入队错误允许有限重试，最多 3 次、50/100/200ms 指数退避；未知错误和重试耗尽均 fail-stop。其他 Action 不得伪装成可重试操作。
+
+### 候选缓存与资源上限
+
+- 三张可失配的 V2 HashMap 已合并为一个 `V2CandidateCache`，proposal、block 和派生 randomness 作为不可分割条目管理。
+- 缓存总字节数、每高度条目数、每 proposer 条目数、future height/round 窗口和 TTL 均有界；总字节数及窗口从 Genesis `ProtocolResourceLimits` 派生，TTL 是当前协议实现固定的版本化常量。
+- 现有条目重复提交幂等；同一 `(height, block_id)` 的内容冲突拒绝；按插入时间和 block ID 确定性淘汰；finalized height 后的候选统一清理。
+- 这些限制用于防止完整执行验证和候选保留成为 DoS 入口，不改变共识投票或证书规则。
 
 ### 网络与节点角色
 
@@ -93,12 +101,13 @@ cargo test -p norn --test four_process_v2_bft --locked
 git diff --check
 ```
 
-本轮修改后的完整 workspace 测试已复验通过；完整 workspace clippy 目前仍受既有 warning 阻断，不能作为已通过门禁；
+本轮修改后的完整 workspace 测试、四进程测试和定向 cache/driver 测试均已在当前工作树复验通过；完整 workspace clippy 目前仍受既有 warning 阻断，不能作为已通过门禁；
 `cargo audit` 仍报告 `hickory-proto 0.25.2` 的 2 个 advisory 和 13 个维护性/健壮性 warning。
 
 最终结果包括：
 
-- workspace 测试本轮全部通过，无失败；ConsensusDriver 定向测试 10 个通过；
+- `cargo test --workspace --locked -j 1` 通过；本轮运行包含四进程 BFT、252 个 `norn-core` 单元测试、40 个 `norn-common` 测试及其余 workspace targets，无失败；
+- ConsensusDriver 定向测试 11 个通过，V2 candidate cache 定向测试 3 个通过；
 - 四进程 Validator/FullNode BFT 测试通过，覆盖十个高度、proposer kill/restart、恢复和网络隔离；
 - stale worker completion 已覆盖 generation、真实 round 变化、snapshot 和 parent context；内部无 reply Action failure 已覆盖 fail-stop 行为；
 - 编译无错误；仍需处理既有 unused、deprecated、unexpected-cfg 等 warning，
@@ -107,14 +116,15 @@ git diff --check
 ## 6. 最终状态
 
 ```text
-ConsensusDriver and timeout path: substantially completed
+ConsensusDriver and timeout path: substantially completed; bounded retry added
 Durable finality recovery: substantially completed
 Stale async-result isolation: implemented and covered by targeted/four-process tests
-Consensus action failure propagation: fail-stop implemented; explicit Action retry policy remains
+Consensus action failure propagation: fail-stop plus bounded idempotent retry implemented
+V2 candidate retention: unified bounded cache with Genesis-derived resource limits
 Validator authorization: complete for static Genesis set
-Governance admission and dynamic authorization: pending
+Governance admission and dynamic authorization: pending; authorization policy not yet specified
 Verification gates: workspace tests/fmt/diff passed; clippy and audit remain open
 Cargo audit: 2 hickory advisories + 13 warnings remain
 Production status: Candidate only
-Commit status: current P0 follow-up changes are uncommitted
+Commit status: current P1 follow-up changes are uncommitted
 ```

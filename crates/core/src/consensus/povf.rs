@@ -20,15 +20,239 @@ use norn_common::genesis::ProtocolResourceLimits;
 use norn_common::types::{Block, BlockHeader, BlockId, BlockV2, Hash, ValidatorId};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::info;
+use tracing::{info, warn};
+
+const V2_CANDIDATE_TTL: Duration = Duration::from_secs(60);
+
+/// Protocol-derived bounds for the in-memory V2 candidate cache. The cache is
+/// not consensus state, but its admission policy must still be identical for
+/// every node and must not be a node-local unbounded setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V2CandidateCacheLimits {
+    pub max_total_bytes: usize,
+    pub max_items_per_height: usize,
+    pub max_items_per_proposer: usize,
+    pub max_future_height: u64,
+    pub max_future_round: u32,
+    pub ttl: Duration,
+}
+
+impl From<&ProtocolResourceLimits> for V2CandidateCacheLimits {
+    fn from(limits: &ProtocolResourceLimits) -> Self {
+        let max_total_bytes = limits
+            .max_block_bytes
+            .saturating_mul(4)
+            .try_into()
+            .unwrap_or(usize::MAX);
+        Self {
+            max_total_bytes,
+            max_items_per_height: limits.max_certificate_members.max(1) as usize,
+            max_items_per_proposer: limits.max_future_round.saturating_add(1) as usize,
+            max_future_height: limits.max_future_height,
+            max_future_round: limits.max_future_round,
+            ttl: V2_CANDIDATE_TTL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct V2CandidateEntry {
+    proposal: Proposal,
+    block: BlockV2,
+    derived_randomness: Hash,
+    inserted_at: Instant,
+    encoded_bytes: usize,
+}
+
+/// A single bounded cache keeps proposal, block, and derived randomness
+/// inseparable. This prevents the old three-HashMap design from retaining
+/// mismatched entries or bypassing a shared byte/TTL limit.
+#[derive(Debug)]
+pub struct V2CandidateCache {
+    limits: V2CandidateCacheLimits,
+    entries: HashMap<(u64, BlockId), V2CandidateEntry>,
+    total_bytes: usize,
+}
+
+impl V2CandidateCache {
+    pub fn new(limits: V2CandidateCacheLimits) -> Self {
+        Self {
+            limits,
+            entries: HashMap::new(),
+            total_bytes: 0,
+        }
+    }
+
+    fn encoded_size(proposal: &Proposal, block: &BlockV2) -> Option<usize> {
+        let proposal_size = bincode::serialized_size(proposal).ok()?;
+        let block_size = bincode::serialized_size(block).ok()?;
+        proposal_size
+            .checked_add(block_size)
+            .and_then(|size| size.checked_add(std::mem::size_of::<Hash>() as u64))
+            .and_then(|size| usize::try_from(size).ok())
+    }
+
+    fn remove_key(&mut self, key: &(u64, BlockId)) -> bool {
+        if let Some(entry) = self.entries.remove(key) {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.encoded_bytes);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn prune_expired(&mut self, now: Instant) {
+        let ttl = self.limits.ttl;
+        let expired = self
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                (now.saturating_duration_since(entry.inserted_at) >= ttl).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        for key in expired {
+            self.remove_key(&key);
+        }
+    }
+
+    fn oldest_key(
+        &self,
+        predicate: impl Fn(&(u64, BlockId), &V2CandidateEntry) -> bool,
+    ) -> Option<(u64, BlockId)> {
+        self.entries
+            .iter()
+            .filter(|(key, entry)| predicate(key, entry))
+            .min_by(|(left_key, left), (right_key, right)| {
+                left.inserted_at
+                    .cmp(&right.inserted_at)
+                    .then_with(|| left_key.0.cmp(&right_key.0))
+                    .then_with(|| left_key.1 .0 .0.cmp(&right_key.1 .0 .0))
+            })
+            .map(|(key, _)| *key)
+    }
+
+    fn count_at_height(&self, height: u64) -> usize {
+        self.entries
+            .keys()
+            .filter(|(entry_height, _)| *entry_height == height)
+            .count()
+    }
+
+    fn count_for_proposer(&self, height: u64, proposer: ValidatorId) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.proposal.height == height && entry.proposal.proposer == proposer)
+            .count()
+    }
+
+    /// Admit a candidate after enforcing future windows, TTL, per-height,
+    /// per-proposer and total-byte limits. Existing identical entries are
+    /// idempotent; conflicting content for one block ID is rejected.
+    pub fn insert(
+        &mut self,
+        proposal: Proposal,
+        block: BlockV2,
+        derived_randomness: Hash,
+        current_height: u64,
+        current_round: u32,
+    ) -> bool {
+        let now = Instant::now();
+        self.prune_expired(now);
+        let key = (proposal.height, proposal.block_id);
+        if let Some(existing) = self.entries.get(&key) {
+            return existing.proposal == proposal
+                && existing.block == block
+                && existing.derived_randomness == derived_randomness;
+        }
+        if proposal.height > current_height.saturating_add(self.limits.max_future_height)
+            || proposal.round > current_round.saturating_add(self.limits.max_future_round)
+        {
+            return false;
+        }
+        let Some(encoded_bytes) = Self::encoded_size(&proposal, &block) else {
+            return false;
+        };
+        if encoded_bytes > self.limits.max_total_bytes {
+            return false;
+        }
+
+        while self.count_at_height(proposal.height) >= self.limits.max_items_per_height {
+            let Some(oldest) = self.oldest_key(|(height, _), _| *height == proposal.height) else {
+                break;
+            };
+            self.remove_key(&oldest);
+        }
+        while self.count_for_proposer(proposal.height, proposal.proposer)
+            >= self.limits.max_items_per_proposer
+        {
+            let Some(oldest) = self.oldest_key(|(height, _), entry| {
+                *height == proposal.height && entry.proposal.proposer == proposal.proposer
+            }) else {
+                break;
+            };
+            self.remove_key(&oldest);
+        }
+        while self.total_bytes.saturating_add(encoded_bytes) > self.limits.max_total_bytes {
+            let Some(oldest) = self.oldest_key(|_, _| true) else {
+                break;
+            };
+            self.remove_key(&oldest);
+        }
+        if self.total_bytes.saturating_add(encoded_bytes) > self.limits.max_total_bytes {
+            return false;
+        }
+        self.total_bytes = self.total_bytes.saturating_add(encoded_bytes);
+        self.entries.insert(
+            key,
+            V2CandidateEntry {
+                proposal,
+                block,
+                derived_randomness,
+                inserted_at: now,
+                encoded_bytes,
+            },
+        );
+        true
+    }
+
+    pub fn get(&mut self, height: u64, block_id: BlockId) -> Option<ValidatedCandidate> {
+        self.prune_expired(Instant::now());
+        self.entries
+            .get(&(height, block_id))
+            .map(|entry| ValidatedCandidate {
+                proposal: entry.proposal.clone(),
+                block: entry.block.clone(),
+                derived_randomness: entry.derived_randomness,
+            })
+    }
+
+    pub fn remove_through_height(&mut self, finalized_height: u64) {
+        let keys = self
+            .entries
+            .keys()
+            .filter(|(height, _)| *height <= finalized_height)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.remove_key(&key);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+}
 
 pub struct PoVFEngine {
     pub state_machine: Arc<RwLock<TendermintStateMachine>>,
     pub candidate_blocks: Arc<RwLock<HashMap<(u64, BlockId), Block>>>,
-    pub candidate_blocks_v2: Arc<RwLock<HashMap<(u64, BlockId), BlockV2>>>,
-    pub candidate_proposals_v2: Arc<RwLock<HashMap<(u64, BlockId), Proposal>>>,
-    pub candidate_randomness_v2: Arc<RwLock<HashMap<(u64, BlockId), Hash>>>,
+    pub candidate_cache_v2: Arc<RwLock<V2CandidateCache>>,
     pub finalized_blocks: Arc<RwLock<HashMap<Hash, FinalizedBlock>>>,
     pub finalized_blocks_v2: Arc<RwLock<HashMap<Hash, FinalizedBlockV2>>>,
     pub current_height: Arc<RwLock<u64>>,
@@ -64,6 +288,24 @@ impl PoVFEngine {
         safety_store: Arc<dyn ConsensusSafetyStore>,
         local_validator_id: Option<ValidatorId>,
     ) -> Self {
+        Self::new_with_parent_randomness_and_limits(
+            config,
+            snapshot,
+            parent_randomness,
+            safety_store,
+            local_validator_id,
+            ProtocolResourceLimits::default(),
+        )
+    }
+
+    pub fn new_with_parent_randomness_and_limits(
+        config: ConsensusConfig,
+        snapshot: StakeSnapshot,
+        parent_randomness: Hash,
+        safety_store: Arc<dyn ConsensusSafetyStore>,
+        local_validator_id: Option<ValidatorId>,
+        resource_limits: ProtocolResourceLimits,
+    ) -> Self {
         let state_machine = TendermintStateMachine::new(
             config,
             snapshot,
@@ -74,9 +316,9 @@ impl PoVFEngine {
         Self {
             state_machine: Arc::new(RwLock::new(state_machine)),
             candidate_blocks: Arc::new(RwLock::new(HashMap::new())),
-            candidate_blocks_v2: Arc::new(RwLock::new(HashMap::new())),
-            candidate_proposals_v2: Arc::new(RwLock::new(HashMap::new())),
-            candidate_randomness_v2: Arc::new(RwLock::new(HashMap::new())),
+            candidate_cache_v2: Arc::new(RwLock::new(V2CandidateCache::new(
+                V2CandidateCacheLimits::from(&resource_limits),
+            ))),
             finalized_blocks: Arc::new(RwLock::new(HashMap::new())),
             finalized_blocks_v2: Arc::new(RwLock::new(HashMap::new())),
             current_height: Arc::new(RwLock::new(1)),
@@ -171,38 +413,24 @@ impl PoVFEngine {
         // state enter the PrevoteWait phase.
         sm.step = crate::consensus::types::ConsensusStep::PrevoteWait;
 
-        let calculated_bid = BlockId(block.header.block_hash);
-        if let Some(randomness) = verified_vrf.map(|output| Hash(output.randomness)) {
-            let key = (proposal.height, calculated_bid);
-            let mut proposals = self.candidate_proposals_v2.write().await;
-            if let Some(existing) = proposals.get(&key) {
-                if existing != &proposal {
-                    return Err(NornError::ConsensusError(
-                        "conflicting V2 proposals for the same block ID".into(),
-                    ));
-                }
-            } else {
-                proposals.insert(key, proposal.clone());
-            }
-            self.candidate_randomness_v2
-                .write()
-                .await
-                .insert(key, randomness);
-        }
-        {
-            let mut candidates = self.candidate_blocks_v2.write().await;
-            if candidates.len() >= 32 {
-                candidates.retain(|(h, _), _| *h >= proposal.height);
-                self.candidate_proposals_v2
-                    .write()
-                    .await
-                    .retain(|(h, _), _| *h >= proposal.height);
-                self.candidate_randomness_v2
-                    .write()
-                    .await
-                    .retain(|(h, _), _| *h >= proposal.height);
-            }
-            candidates.insert((proposal.height, calculated_bid), block);
+        let current_height = sm.height;
+        let current_round = sm.round;
+        let derived_randomness = verified_vrf
+            .map(|output| Hash(output.randomness))
+            .ok_or_else(|| {
+                NornError::ConsensusError("V2 proposal is missing derived randomness".into())
+            })?;
+        drop(sm);
+        if !self.candidate_cache_v2.write().await.insert(
+            proposal,
+            block,
+            derived_randomness,
+            current_height,
+            current_round,
+        ) {
+            return Err(NornError::ConsensusError(
+                "V2 candidate exceeds bounded cache policy".into(),
+            ));
         }
         Ok(Some(vote))
     }
@@ -221,6 +449,24 @@ impl PoVFEngine {
             block,
             derived_randomness,
         } = candidate;
+        let (current_height, current_round) = {
+            let sm = self.state_machine.read().await;
+            (sm.height, sm.round)
+        };
+        if !self.candidate_cache_v2.write().await.insert(
+            proposal.clone(),
+            block.clone(),
+            derived_randomness,
+            current_height,
+            current_round,
+        ) {
+            warn!(
+                height = proposal.height,
+                round = proposal.round,
+                "dropping validated V2 proposal because the candidate cache is full or outside the future window"
+            );
+            return Ok(None);
+        }
         let mut sm = self.state_machine.write().await;
         // A proposal can arrive after this validator has already cast its
         // timeout NIL prevote.  It remains useful as a candidate for a later
@@ -228,43 +474,23 @@ impl PoVFEngine {
         // height/round.  The safety WAL rejects that equivocation; ignoring
         // the late vote here also avoids turning ordinary network delay into
         // a consensus-driver error.
-        let (vote, verified_vrf) = if matches!(
+        let vote = if matches!(
             sm.step,
             crate::consensus::types::ConsensusStep::NewHeight
                 | crate::consensus::types::ConsensusStep::Propose
         ) {
-            let (vote, verified_vrf) = sm
+            let (vote, _) = sm
                 .handle_proposal_v2_with_vrf(&proposal, &block, signer)
                 .map_err(|e| NornError::ConsensusError(e.to_string()))?;
             // The local prevote has been durably acknowledged by the
             // safety store before this transition is made.
             sm.step = crate::consensus::types::ConsensusStep::PrevoteWait;
-            (Some(vote), verified_vrf)
+            Some(vote)
         } else {
-            (None, None)
+            None
         };
         drop(sm);
 
-        let calculated_bid = BlockId(block.header.block_hash);
-        let key = (proposal.height, calculated_bid);
-        let randomness = verified_vrf
-            .map(|output| Hash(output.randomness))
-            .unwrap_or(derived_randomness);
-        let mut proposals = self.candidate_proposals_v2.write().await;
-        if let Some(existing) = proposals.get(&key) {
-            if existing != &proposal {
-                return Err(NornError::ConsensusError(
-                    "conflicting V2 proposals for the same block ID".into(),
-                ));
-            }
-        } else {
-            proposals.insert(key, proposal.clone());
-        }
-        self.candidate_randomness_v2
-            .write()
-            .await
-            .insert(key, randomness);
-        self.candidate_blocks_v2.write().await.insert(key, block);
         Ok(vote)
     }
 
@@ -339,27 +565,26 @@ impl PoVFEngine {
         })
     }
 
-    pub async fn remember_validated_candidate(&self, candidate: &ValidatedCandidate) {
-        let key = (candidate.proposal.height, candidate.proposal.block_id);
-        self.candidate_proposals_v2
-            .write()
-            .await
-            .insert(key, candidate.proposal.clone());
-        self.candidate_randomness_v2
-            .write()
-            .await
-            .insert(key, candidate.derived_randomness);
-        self.candidate_blocks_v2
-            .write()
-            .await
-            .insert(key, candidate.block.clone());
+    pub async fn remember_validated_candidate(&self, candidate: &ValidatedCandidate) -> bool {
+        let (current_height, current_round) = {
+            let sm = self.state_machine.read().await;
+            (sm.height, sm.round)
+        };
+        self.candidate_cache_v2.write().await.insert(
+            candidate.proposal.clone(),
+            candidate.block.clone(),
+            candidate.derived_randomness,
+            current_height,
+            current_round,
+        )
     }
 
     pub async fn has_v2_candidate(&self, height: u64, block_id: BlockId) -> bool {
-        self.candidate_blocks_v2
-            .read()
+        self.candidate_cache_v2
+            .write()
             .await
-            .contains_key(&(height, block_id))
+            .get(height, block_id)
+            .is_some()
     }
 
     /// Return a validated proposal/block pair for a peer that missed the
@@ -370,15 +595,11 @@ impl PoVFEngine {
         height: u64,
         block_id: BlockId,
     ) -> Option<(Proposal, BlockV2)> {
-        let key = (height, block_id);
-        let proposal = self
-            .candidate_proposals_v2
-            .read()
+        self.candidate_cache_v2
+            .write()
             .await
-            .get(&key)
-            .cloned()?;
-        let block = self.candidate_blocks_v2.read().await.get(&key).cloned()?;
-        Some((proposal, block))
+            .get(height, block_id)
+            .map(|candidate| (candidate.proposal, candidate.block))
     }
 
     /// Re-execute a finalized candidate against the current finalized parent
@@ -687,30 +908,22 @@ impl PoVFEngine {
             ));
         }
 
-        let block = {
-            let candidates = self.candidate_blocks_v2.read().await;
-            candidates
-                .get(&(commit.height, commit.block_id))
-                .cloned()
-                .ok_or_else(|| {
-                    NornError::ConsensusError(format!(
-                        "V2 candidate block missing for height {} block {:?}",
-                        commit.height, commit.block_id
-                    ))
-                })?
-        };
-
-        let proposal = self
-            .candidate_proposals_v2
-            .read()
+        let candidate = self
+            .candidate_cache_v2
+            .write()
             .await
-            .get(&(commit.height, commit.block_id))
-            .cloned()
+            .get(commit.height, commit.block_id)
             .ok_or_else(|| {
-                NornError::ConsensusError(
-                    "V2 finalized block is missing its verified proposal VRF".into(),
-                )
+                NornError::ConsensusError(format!(
+                    "V2 candidate missing for height {} block {:?}",
+                    commit.height, commit.block_id
+                ))
             })?;
+        let ValidatedCandidate {
+            proposal,
+            block,
+            derived_randomness: next_randomness,
+        } = candidate;
 
         let (snapshot, pending_validator_changes) = {
             let sm = self.state_machine.read().await;
@@ -729,17 +942,6 @@ impl PoVFEngine {
         }
         self.verify_commit_certificate_v2(&block, &commit, &snapshot)?;
 
-        let next_randomness = self
-            .candidate_randomness_v2
-            .read()
-            .await
-            .get(&(commit.height, commit.block_id))
-            .copied()
-            .ok_or_else(|| {
-                NornError::ConsensusError(
-                    "V2 finalized block is missing its derived proposal randomness".into(),
-                )
-            })?;
         let mut consensus_state =
             FinalizedConsensusState::from_v2(&block, &commit, next_randomness)?;
         consensus_state.pending_validator_changes = pending_validator_changes;
@@ -772,18 +974,10 @@ impl PoVFEngine {
                 finalized_blocks.insert(hash, finalized.clone());
             }
         }
-        self.candidate_blocks_v2
+        self.candidate_cache_v2
             .write()
             .await
-            .retain(|(height, _), _| *height > finalized.block.header.height as u64);
-        self.candidate_proposals_v2
-            .write()
-            .await
-            .retain(|(height, _), _| *height > finalized.block.header.height as u64);
-        self.candidate_randomness_v2
-            .write()
-            .await
-            .retain(|(height, _), _| *height > finalized.block.header.height as u64);
+            .remove_through_height(finalized.block.header.height as u64);
         Ok(())
     }
 
@@ -823,6 +1017,89 @@ impl PoVFEngine {
 mod tests {
     use super::*;
     use crate::consensus::safety_store::MemorySafetyStore;
+
+    fn cache_proposal(height: u64, round: u32, block_id: u8, proposer: u8) -> Proposal {
+        Proposal {
+            protocol_version: Default::default(),
+            chain_id: Default::default(),
+            epoch: 1,
+            height,
+            round,
+            valid_round: None,
+            valid_round_certificate: None,
+            block_id: BlockId(Hash([block_id; 32])),
+            parent_block_hash: Hash([9; 32]),
+            stake_snapshot_hash: Default::default(),
+            proposer: ValidatorId([proposer; 32]),
+            vrf_preout: [1; 32],
+            vrf_proof: [2; 64],
+            signature: [3; 64],
+        }
+    }
+
+    #[test]
+    fn v2_candidate_cache_enforces_context_and_shared_bounds() {
+        let mut cache = V2CandidateCache::new(V2CandidateCacheLimits {
+            max_total_bytes: 1_000_000,
+            max_items_per_height: 2,
+            max_items_per_proposer: 1,
+            max_future_height: 0,
+            max_future_round: 0,
+            ttl: Duration::from_secs(60),
+        });
+        let first = cache_proposal(1, 0, 1, 1);
+        let second = cache_proposal(1, 0, 2, 2);
+        let replacement = cache_proposal(1, 0, 3, 1);
+        assert!(cache.insert(first.clone(), BlockV2::default(), Hash([4; 32]), 1, 0));
+        assert!(cache.insert(second, BlockV2::default(), Hash([5; 32]), 1, 0));
+        assert!(cache.insert(replacement, BlockV2::default(), Hash([6; 32]), 1, 0));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.total_bytes() <= 1_000_000);
+        assert!(cache.get(1, first.block_id).is_none());
+        assert!(!cache.insert(
+            cache_proposal(2, 0, 4, 3),
+            BlockV2::default(),
+            Hash([7; 32]),
+            1,
+            0
+        ));
+        assert!(!cache.insert(
+            cache_proposal(1, 1, 5, 3),
+            BlockV2::default(),
+            Hash([8; 32]),
+            1,
+            0
+        ));
+    }
+
+    #[test]
+    fn v2_candidate_cache_expires_entries_and_cleans_finalized_heights() {
+        let mut cache = V2CandidateCache::new(V2CandidateCacheLimits {
+            max_total_bytes: 1_000_000,
+            max_items_per_height: 4,
+            max_items_per_proposer: 4,
+            max_future_height: 2,
+            max_future_round: 2,
+            ttl: Duration::ZERO,
+        });
+        let proposal = cache_proposal(1, 0, 1, 1);
+        assert!(cache.insert(proposal.clone(), BlockV2::default(), Hash([4; 32]), 1, 0));
+        assert!(cache.get(1, proposal.block_id).is_none());
+
+        let mut cache = V2CandidateCache::new(V2CandidateCacheLimits {
+            max_total_bytes: 1_000_000,
+            max_items_per_height: 4,
+            max_items_per_proposer: 4,
+            max_future_height: 2,
+            max_future_round: 2,
+            ttl: Duration::from_secs(60),
+        });
+        let proposal = cache_proposal(3, 0, 2, 1);
+        assert!(cache.insert(proposal.clone(), BlockV2::default(), Hash([5; 32]), 1, 0));
+        assert!(cache.get(3, proposal.block_id).is_some());
+        cache.remove_through_height(3);
+        assert!(cache.get(3, proposal.block_id).is_none());
+    }
 
     #[tokio::test]
     async fn test_povf_engine_creation() {

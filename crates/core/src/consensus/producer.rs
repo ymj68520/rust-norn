@@ -529,11 +529,11 @@ impl BlockProducer {
         };
         let block = if let Some(valid_block_id) = valid_block {
             let candidate = engine
-                .candidate_blocks_v2
-                .read()
+                .candidate_cache_v2
+                .write()
                 .await
-                .get(&(height, valid_block_id))
-                .cloned()
+                .get(height, valid_block_id)
+                .map(|candidate| candidate.block)
                 .ok_or_else(|| {
                     anyhow!(
                         "valid-round block {:?} is not available for safe re-proposal",
