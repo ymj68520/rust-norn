@@ -203,6 +203,8 @@ mod tests {
                 consensus_public_key: ConsensusPublicKey(consensus_bytes),
                 vrf_public_key: VrfPublicKey(vrf_bytes),
                 voting_power: 1,
+                jailed_until_epoch: None,
+                slashed: false,
             }],
         )
         .unwrap();
@@ -234,6 +236,8 @@ mod tests {
                 consensus_public_key: ConsensusPublicKey(consensus_bytes),
                 vrf_public_key: VrfPublicKey(vrf_bytes),
                 voting_power: u64::from(index),
+                jailed_until_epoch: None,
+                slashed: false,
             });
         }
 

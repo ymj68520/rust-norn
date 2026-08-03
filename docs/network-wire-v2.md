@@ -24,11 +24,17 @@ its consensus messages are forwarded to the node, and only an authenticated
 `Validator` may originate consensus traffic. A mismatched handshake, role,
 or unknown wire payload is rejected without entering consensus.
 
+The legacy `ConsensusMessage::Proposal` variant remains decodable only for
+offline compatibility tests and migration tooling; the live V2 event loop
+drops it with `UnsupportedProtocolVersion` before it reaches a node service.
+
 Outbound bootstrap addresses and explicit Dial commands must include
 `/p2p/<PeerId>`. Addresses without an explicit peer identity are rejected;
 this prevents a successful TCP connection from being mistaken for an
 authenticated consensus peer. After a reconnect the handshake is published
 again and the prior authentication entry is removed on connection close.
+Configured bootstrap peers are retried with a bounded one-peer-at-a-time dial
+state after disconnects, so a restarted validator can rejoin the topology.
 
 Consensus bytes are checked against a hard 2 MiB wire ceiling before bincode
 decoding. Handshakes are limited to 1 KiB, block messages to 8 MiB, and
@@ -51,3 +57,9 @@ membership and quorum remain separate validation stages; durable overlay
 application remains part of atomic finality. EVM/contract-shaped V2
 transactions currently fail closed until their deterministic overlay executor
 is implemented; they are never treated as native transfers.
+
+Finality recovery is ordered by the canonical finalized tip. Validators and
+FullNodes request the next missing `FinalityResponse` after startup or
+re-authentication, verify the proposal/block/certificate, and apply it through
+the same durable, idempotent finality path before requesting the following
+height. A FullNode never signs or produces a consensus vote.

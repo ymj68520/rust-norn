@@ -34,6 +34,10 @@ pub struct ConsensusConfig {
     pub chain_id: ChainId,
     pub epoch: u64,
     pub epoch_length: u64,
+    pub validator_update_delay: u64,
+    pub unbonding_delay: u64,
+    pub key_rotation_delay: u64,
+    pub slashing_activation_delay: u64,
     pub timeout_propose_ms: u64,
     pub timeout_prevote_ms: u64,
     pub timeout_precommit_ms: u64,
@@ -51,6 +55,10 @@ impl Default for ConsensusConfig {
             chain_id: ChainId(Hash([1u8; 32])),
             epoch: 1,
             epoch_length: 1000,
+            validator_update_delay: 1,
+            unbonding_delay: 1,
+            key_rotation_delay: 1,
+            slashing_activation_delay: 1,
             timeout_propose_ms: 3000,
             timeout_prevote_ms: 2000,
             timeout_precommit_ms: 2000,
@@ -142,6 +150,9 @@ impl ElectionMath {
 
         let mut accumulated: u128 = 0;
         for (validator_id, record) in &snapshot.validators {
+            if !record.is_active_at(snapshot.epoch) {
+                continue;
+            }
             accumulated += record.voting_power as u128;
             if target_weight < accumulated {
                 return Some(*validator_id);

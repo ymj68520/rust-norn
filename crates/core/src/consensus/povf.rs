@@ -3,6 +3,7 @@
 use super::safety_store::{ConsensusSafetyStore, ConsensusSigner};
 use super::state_machine::TendermintStateMachine;
 use super::types::ConsensusConfig;
+use super::vote_pool::{AddVoteResult, VotePool};
 use crate::evm::CodeStorage;
 use crate::execution::{
     calculate_v2_execution_data_hash, execute_v2_block, V2BlockExecution, V2ExecutionContext,
@@ -31,6 +32,13 @@ pub struct PoVFEngine {
     pub finalized_blocks: Arc<RwLock<HashMap<Hash, FinalizedBlock>>>,
     pub finalized_blocks_v2: Arc<RwLock<HashMap<Hash, FinalizedBlockV2>>>,
     pub current_height: Arc<RwLock<u64>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedCandidate {
+    pub proposal: Proposal,
+    pub block: BlockV2,
+    pub derived_randomness: Hash,
 }
 
 impl PoVFEngine {
@@ -195,6 +203,119 @@ impl PoVFEngine {
         Ok(Some(vote))
     }
 
+    /// Validate a V2 proposal without requiring a local signer and without
+    /// changing consensus state. FullNodes use this exact validator; a
+    /// validator subsequently calls the voting path after this succeeds.
+    pub async fn verify_proposal_v2(
+        &self,
+        proposal: Proposal,
+        block: BlockV2,
+        state_manager: &AccountStateManager,
+        limits: &ProtocolResourceLimits,
+        context: &ChainContext,
+        code_storage: &Arc<CodeStorage>,
+    ) -> Result<ValidatedCandidate> {
+        if block.header.block_hash != block.header.calculate_hash()? {
+            return Err(NornError::ConsensusError(
+                "V2 proposal header hash mismatch".into(),
+            ));
+        }
+        if block.header.merkle_root != BlockV2::calculate_merkle_root(&block.transactions)? {
+            return Err(NornError::ConsensusError(
+                "V2 proposal Merkle root mismatch".into(),
+            ));
+        }
+        block.validate_structure(context, limits)?;
+        let evm_context = V2ExecutionContext {
+            block_number: block.header.height.max(0) as u64,
+            block_timestamp: block.header.timestamp.max(0) as u64,
+            block_coinbase: norn_common::types::Address(
+                block.header.proposer.0[..20]
+                    .try_into()
+                    .map_err(|_| NornError::ConsensusError("invalid proposer ID".into()))?,
+            ),
+            block_gas_limit: limits.max_block_gas,
+            code_storage: code_storage.clone(),
+        };
+        let execution = execute_v2_block(
+            state_manager,
+            &block.transactions,
+            limits,
+            Some(&evm_context),
+        )
+        .await
+        .map_err(|e| NornError::ConsensusError(format!("V2 execution rejected: {e}")))?;
+        let projected_state_root = execution
+            .overlay
+            .projected_state_root(state_manager)
+            .await
+            .map_err(|e| NornError::ConsensusError(format!("V2 state projection failed: {e}")))?;
+        if projected_state_root != block.header.state_root {
+            return Err(NornError::ConsensusError(
+                "V2 proposal state_root does not match deterministic execution".into(),
+            ));
+        }
+        if calculate_v2_execution_data_hash(&execution.results) != block.header.consensus_data_hash
+        {
+            return Err(NornError::ConsensusError(
+                "V2 proposal execution commitment does not match deterministic execution".into(),
+            ));
+        }
+        let verified_vrf = self
+            .state_machine
+            .read()
+            .await
+            .validate_proposal_v2_without_vote(&proposal, &block)
+            .map_err(|error| NornError::ConsensusError(error.to_string()))?;
+        Ok(ValidatedCandidate {
+            proposal,
+            block,
+            derived_randomness: Hash(verified_vrf.randomness),
+        })
+    }
+
+    pub async fn remember_validated_candidate(&self, candidate: &ValidatedCandidate) {
+        let key = (candidate.proposal.height, candidate.proposal.block_id);
+        self.candidate_proposals_v2
+            .write()
+            .await
+            .insert(key, candidate.proposal.clone());
+        self.candidate_randomness_v2
+            .write()
+            .await
+            .insert(key, candidate.derived_randomness);
+        self.candidate_blocks_v2
+            .write()
+            .await
+            .insert(key, candidate.block.clone());
+    }
+
+    pub async fn has_v2_candidate(&self, height: u64, block_id: BlockId) -> bool {
+        self.candidate_blocks_v2
+            .read()
+            .await
+            .contains_key(&(height, block_id))
+    }
+
+    /// Return a validated proposal/block pair for a peer that missed the
+    /// original proposal. Only candidates that passed the pure V2 validator
+    /// are exposed; callers never serve an unvalidated in-memory block.
+    pub async fn get_validated_candidate(
+        &self,
+        height: u64,
+        block_id: BlockId,
+    ) -> Option<(Proposal, BlockV2)> {
+        let key = (height, block_id);
+        let proposal = self
+            .candidate_proposals_v2
+            .read()
+            .await
+            .get(&key)
+            .cloned()?;
+        let block = self.candidate_blocks_v2.read().await.get(&key).cloned()?;
+        Some((proposal, block))
+    }
+
     /// Re-execute a finalized candidate against the current finalized parent
     /// without mutating live state. The returned overlay is the exact write
     /// set that the finality driver persists and applies after the DB batch is
@@ -273,6 +394,31 @@ impl PoVFEngine {
         }
 
         Ok(res)
+    }
+
+    /// Verify a network vote without requiring a local signer or mutating the
+    /// live vote pool. This is the FullNode verify-only path.
+    pub async fn verify_vote(&self, vote: &SignedVote) -> Result<()> {
+        let sm = self.state_machine.read().await;
+        if vote.protocol_version != sm.config.protocol_version
+            || vote.chain_id != sm.config.chain_id
+            || vote.epoch
+                != sm
+                    .config
+                    .epoch_for_height(vote.height)
+                    .map_err(|error| NornError::ConsensusError(error.to_string()))?
+        {
+            return Err(NornError::ConsensusError(
+                "vote context does not match the active chain".into(),
+            ));
+        }
+        let mut pool = VotePool::new();
+        match pool.add_vote(vote.clone(), &sm.snapshot) {
+            AddVoteResult::Added => Ok(()),
+            other => Err(NornError::ConsensusError(format!(
+                "vote verification failed: {other:?}"
+            ))),
+        }
     }
 
     /// Verify a CommitCertificate before applying block
@@ -429,10 +575,7 @@ impl PoVFEngine {
                 })?
         };
 
-        let snapshot = {
-            let sm = self.state_machine.read().await;
-            sm.snapshot.clone()
-        };
+        let snapshot = { self.state_machine.read().await.snapshot.clone() };
 
         self.verify_commit_certificate(&block, &commit, &snapshot)?;
 
@@ -492,7 +635,7 @@ impl PoVFEngine {
                 })?
         };
 
-        let _proposal = self
+        let proposal = self
             .candidate_proposals_v2
             .read()
             .await
@@ -504,9 +647,9 @@ impl PoVFEngine {
                 )
             })?;
 
-        let snapshot = {
+        let (snapshot, pending_validator_changes) = {
             let sm = self.state_machine.read().await;
-            sm.snapshot.clone()
+            (sm.snapshot.clone(), sm.pending_validator_changes.clone())
         };
         let max_certificate_members = self
             .state_machine
@@ -532,40 +675,51 @@ impl PoVFEngine {
                     "V2 finalized block is missing its derived proposal randomness".into(),
                 )
             })?;
-        let consensus_state = FinalizedConsensusState::from_v2(&block, &commit, next_randomness)?;
+        let mut consensus_state =
+            FinalizedConsensusState::from_v2(&block, &commit, next_randomness)?;
+        consensus_state.pending_validator_changes = pending_validator_changes;
 
-        let hash = block.header.block_hash;
         let finalized = FinalizedBlockV2 {
+            proposal,
             block,
             commit,
             consensus_state,
         };
+        Ok(finalized)
+    }
+
+    /// Publish a verified finalized payload to in-memory caches only after its
+    /// canonical state/block/finality batch has been flushed durably.
+    pub async fn record_finalized_v2_after_durable(
+        &self,
+        finalized: &FinalizedBlockV2,
+    ) -> Result<()> {
+        let hash = finalized.block.header.block_hash;
         {
             let mut finalized_blocks = self.finalized_blocks_v2.write().await;
             if let Some(existing) = finalized_blocks.get(&hash) {
-                if existing.commit == finalized.commit {
-                    return Ok(existing.clone());
+                if existing.commit != finalized.commit {
+                    return Err(NornError::ConsensusError(
+                        "V2 block was already finalized with a different certificate".into(),
+                    ));
                 }
-                return Err(NornError::ConsensusError(
-                    "V2 block was already finalized concurrently with a different certificate"
-                        .into(),
-                ));
+            } else {
+                finalized_blocks.insert(hash, finalized.clone());
             }
-            finalized_blocks.insert(hash, finalized.clone());
         }
         self.candidate_blocks_v2
             .write()
             .await
-            .retain(|(height, _), _| *height >= finalized.block.header.height as u64);
+            .retain(|(height, _), _| *height > finalized.block.header.height as u64);
         self.candidate_proposals_v2
             .write()
             .await
-            .retain(|(height, _), _| *height >= finalized.block.header.height as u64);
+            .retain(|(height, _), _| *height > finalized.block.header.height as u64);
         self.candidate_randomness_v2
             .write()
             .await
-            .retain(|(height, _), _| *height >= finalized.block.header.height as u64);
-        Ok(finalized)
+            .retain(|(height, _), _| *height > finalized.block.header.height as u64);
+        Ok(())
     }
 
     /// Apply the finalized consensus transition after the finality/storage

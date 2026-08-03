@@ -14,4 +14,4 @@ rpc_address = "0.0.0.0:7545"  # Will make Ethereum RPC available on port 8545 (7
 # P2P network configuration
 listen_address = "/ip4/0.0.0.0/tcp/40101"
 bootstrap_peers = []
-mdns = true  # Enable mDNS for local peer discovery
+mdns = false  # V2 requires explicit bootstrap peers

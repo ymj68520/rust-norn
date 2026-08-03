@@ -4,6 +4,7 @@ use serde::Deserialize;
 pub struct NetworkConfig {
     pub listen_address: String, // e.g., "/ip4/0.0.0.0/tcp/0"
     pub bootstrap_peers: Vec<String>,
+    /// Retained for configuration compatibility; V2 requires this to be false.
     pub mdns: bool,
 }
 
@@ -12,7 +13,7 @@ impl Default for NetworkConfig {
         Self {
             listen_address: "/ip4/0.0.0.0/tcp/0".to_string(),
             bootstrap_peers: vec![],
-            mdns: true,
+            mdns: false,
         }
     }
 }

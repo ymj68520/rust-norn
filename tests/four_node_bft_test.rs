@@ -78,6 +78,8 @@ async fn test_four_node_bft_consensus_and_finality() {
             consensus_public_key: consensus_pub_key,
             vrf_public_key,
             voting_power: 10,
+            jailed_until_epoch: None,
+            slashed: false,
         });
     }
 
@@ -186,6 +188,10 @@ async fn test_four_node_bft_consensus_and_finality() {
             chain_id: chain_id.clone(),
             epoch: 1,
             epoch_length: 100,
+            validator_update_delay: 1,
+            unbonding_delay: 1,
+            key_rotation_delay: 1,
+            slashing_activation_delay: 1,
             timeout_propose_ms: 3000,
             timeout_prevote_ms: 2000,
             timeout_precommit_ms: 2000,

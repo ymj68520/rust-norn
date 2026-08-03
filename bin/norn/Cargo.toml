@@ -13,3 +13,4 @@ config = { workspace = true }
 norn-node = { workspace = true }
 libp2p = { workspace = true }
 norn-common = { workspace = true }
+serde_json = { workspace = true }

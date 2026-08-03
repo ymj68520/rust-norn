@@ -4,6 +4,7 @@
 
 use crate::evm::{EVMError, EVMResult};
 use norn_common::types::{Address, Hash};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +21,12 @@ pub struct CodeStorage {
 
     /// Code hash to addresses mapping (one code can be deployed to multiple addresses)
     code_to_addresses: Arc<RwLock<HashMap<Hash, Vec<Address>>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeStorageCheckpoint {
+    pub codes: Vec<(Hash, Vec<u8>)>,
+    pub address_to_code: Vec<(Address, Hash)>,
 }
 
 impl CodeStorage {
@@ -184,6 +191,48 @@ impl CodeStorage {
     pub async fn get_addresses_with_code(&self, code_hash: &Hash) -> EVMResult<Vec<Address>> {
         let code_to_addrs = self.code_to_addresses.read().await;
         Ok(code_to_addrs.get(code_hash).cloned().unwrap_or_default())
+    }
+
+    pub async fn checkpoint(&self) -> CodeStorageCheckpoint {
+        let mut codes = self
+            .codes
+            .read()
+            .await
+            .iter()
+            .map(|(hash, code)| (*hash, code.clone()))
+            .collect::<Vec<_>>();
+        codes.sort_by_key(|(hash, _)| hash.0);
+        let mut address_to_code = self
+            .address_to_code
+            .read()
+            .await
+            .iter()
+            .map(|(address, hash)| (*address, *hash))
+            .collect::<Vec<_>>();
+        address_to_code.sort_by_key(|(address, _)| address.0);
+        CodeStorageCheckpoint {
+            codes,
+            address_to_code,
+        }
+    }
+
+    pub async fn restore_checkpoint(&self, checkpoint: &CodeStorageCheckpoint) -> EVMResult<()> {
+        let mut codes = self.codes.write().await;
+        codes.clear();
+        codes.extend(checkpoint.codes.iter().cloned());
+        drop(codes);
+
+        let mut address_to_code = self.address_to_code.write().await;
+        address_to_code.clear();
+        address_to_code.extend(checkpoint.address_to_code.iter().cloned());
+        drop(address_to_code);
+
+        let mut code_to_addresses = self.code_to_addresses.write().await;
+        code_to_addresses.clear();
+        for (address, hash) in &checkpoint.address_to_code {
+            code_to_addresses.entry(*hash).or_default().push(*address);
+        }
+        Ok(())
     }
 }
 

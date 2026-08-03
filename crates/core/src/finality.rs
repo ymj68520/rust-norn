@@ -1,21 +1,35 @@
 //! Atomic, idempotent persistence for finalized protocol-v2 blocks.
 
+use crate::execution::overlay::{CanonicalStateCheckpoint, OverlayWrite};
 use anyhow::{anyhow, bail, Result};
-use norn_common::consensus_types::{FinalizeTransactionId, FinalizedBlockV2};
+use norn_common::consensus_types::{
+    CanonicalFinalizedTip, FinalizeTransactionId, FinalizedBlockV2, Proposal, StakeSnapshot,
+};
 use norn_common::traits::DBInterface;
-use norn_common::types::{BlockId, Hash, TransactionId};
+use norn_common::types::{Block, BlockId, BlockV2, Hash, StakeSnapshotHash, TransactionId};
 use std::collections::HashSet;
 use std::sync::Arc;
 
 const HEIGHT_PREFIX: &[u8] = b"finality/v2/by-height/";
 const RECORD_PREFIX: &[u8] = b"finality/v2/record/";
-const BLOCK_PREFIX: &[u8] = b"block/v2/by-hash/";
+const BLOCK_PREFIX: &[u8] = b"finality/v2/block/";
 const CERTIFICATE_PREFIX: &[u8] = b"finality/v2/certificate/";
-const CONSENSUS_STATE_PREFIX: &[u8] = b"consensus/v2/finalized-state/";
 const STATE_WRITE_COUNT_PREFIX: &[u8] = b"state/v2/write-count/";
 const STATE_WRITE_PREFIX: &[u8] = b"state/v2/write/";
 const TRANSACTION_PREFIX: &[u8] = b"finality/v2/transaction/";
-const TIP_KEY: &[u8] = b"consensus/v2/finalized-tip";
+const TIP_KEY: &[u8] = b"finality/v2/tip";
+const LEGACY_TIP_KEY: &[u8] = b"consensus/v2/finalized-tip";
+const STATE_ROOT_KEY: &[u8] = b"state/v2/root";
+const STATE_ROOT_PREFIX: &[u8] = b"state/v2/root/";
+const STATE_CHECKPOINT_KEY: &[u8] = b"state/v2/checkpoint";
+const STATE_CHECKPOINT_PREFIX: &[u8] = b"state/v2/checkpoint/";
+const CONSENSUS_STATE_KEY: &[u8] = b"finality/v2/consensus-state";
+const STATE_ACCOUNT_PREFIX: &[u8] = b"state/v2/account/";
+const STATE_STORAGE_PREFIX: &[u8] = b"state/v2/storage/";
+const STATE_CODE_PREFIX: &[u8] = b"state/v2/code/";
+const STATE_TOMBSTONE: &[u8] = b"NORN_STATE_TOMBSTONE_V2";
+const SNAPSHOT_PREFIX: &[u8] = b"finality/v2/snapshot/";
+const PENDING_PROPOSAL_PREFIX: &[u8] = b"consensus/v2/pending-proposal/";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalityCommitResult {
@@ -30,6 +44,85 @@ pub struct FinalityStore {
 impl FinalityStore {
     pub fn new(db: Arc<dyn DBInterface>) -> Self {
         Self { db }
+    }
+
+    /// Initialize the canonical V2 tip for a fresh database. Existing state is
+    /// never guessed or rewritten: it must decode as the new tip schema.
+    pub async fn initialize_genesis_tip(
+        &self,
+        genesis: &Block,
+        active_snapshot_hash: StakeSnapshotHash,
+        next_randomness: Hash,
+    ) -> Result<CanonicalFinalizedTip> {
+        if self.db.get(LEGACY_TIP_KEY).await?.is_some() {
+            bail!(
+                "legacy finalized tip schema is present; explicit migration is required before V2 startup"
+            );
+        }
+        if let Some(bytes) = self.db.get(TIP_KEY).await? {
+            return decode(&bytes, "canonical finalized tip");
+        }
+        let tip =
+            CanonicalFinalizedTip::from_genesis(genesis, active_snapshot_hash, next_randomness)?;
+        self.db
+            .batch_insert(&[TIP_KEY.to_vec()], &[encode(&tip)?])
+            .await?;
+        Ok(tip)
+    }
+
+    pub async fn recover_canonical_tip(&self) -> Result<Option<CanonicalFinalizedTip>> {
+        self.db
+            .get(TIP_KEY)
+            .await?
+            .map(|bytes| decode(&bytes, "canonical finalized tip"))
+            .transpose()
+    }
+
+    pub async fn recover_snapshot(&self, epoch: u64) -> Result<Option<StakeSnapshot>> {
+        self.db
+            .get(&snapshot_key(epoch))
+            .await?
+            .map(|bytes| decode(&bytes, "finalized validator snapshot"))
+            .transpose()
+    }
+
+    /// Persist the exact V2 proposal/block pair before its local vote is
+    /// signed. This lets a restarted validator recover the proposal that its
+    /// safety WAL already authorized instead of constructing a different block
+    /// for the same height/round.
+    pub async fn persist_pending_proposal(
+        &self,
+        proposal: &Proposal,
+        block: &BlockV2,
+    ) -> Result<()> {
+        if proposal.height != block.header.height as u64
+            || proposal.round != block.header.round
+            || proposal.block_id != BlockId(block.header.block_hash)
+        {
+            bail!("pending V2 proposal does not match its block identity");
+        }
+        let key = pending_proposal_key(proposal.height, proposal.round);
+        self.db
+            .batch_insert(&[key], &[encode(&(proposal, block))?])
+            .await
+    }
+
+    pub async fn recover_pending_proposal(
+        &self,
+        height: u64,
+        round: u32,
+    ) -> Result<Option<(Proposal, BlockV2)>> {
+        self.db
+            .get(&pending_proposal_key(height, round))
+            .await?
+            .map(|bytes| decode(&bytes, "pending V2 proposal"))
+            .transpose()
+    }
+
+    pub async fn clear_pending_proposal(&self, height: u64, round: u32) -> Result<()> {
+        self.db
+            .batch_delete(&[pending_proposal_key(height, round)])
+            .await
     }
 
     /// Commit a finalized block and all of its finality markers atomically.
@@ -50,6 +143,36 @@ impl FinalityStore {
         &self,
         finalized: &FinalizedBlockV2,
         state_write_values: &[Vec<u8>],
+    ) -> Result<FinalityCommitResult> {
+        self.commit_finalized_transaction_with_state_and_checkpoint(
+            finalized,
+            state_write_values,
+            None,
+        )
+        .await
+    }
+
+    pub async fn commit_finalized_transaction_with_state_and_checkpoint(
+        &self,
+        finalized: &FinalizedBlockV2,
+        state_write_values: &[Vec<u8>],
+        checkpoint: Option<&CanonicalStateCheckpoint>,
+    ) -> Result<FinalityCommitResult> {
+        self.commit_finalized_transaction_with_state_and_checkpoint_and_snapshot(
+            finalized,
+            state_write_values,
+            checkpoint,
+            None,
+        )
+        .await
+    }
+
+    pub async fn commit_finalized_transaction_with_state_and_checkpoint_and_snapshot(
+        &self,
+        finalized: &FinalizedBlockV2,
+        state_write_values: &[Vec<u8>],
+        checkpoint: Option<&CanonicalStateCheckpoint>,
+        next_snapshot: Option<&StakeSnapshot>,
     ) -> Result<FinalityCommitResult> {
         let id = FinalizeTransactionId::from_v2(finalized);
         if finalized.block.header.height < 0
@@ -81,14 +204,41 @@ impl FinalityStore {
                 );
             }
 
-            let required =
-                self.required_keys(finalized, &transaction_ids, &id, state_write_values.len());
+            let required = self.required_keys(
+                finalized,
+                &transaction_ids,
+                &id,
+                state_write_values.len(),
+                checkpoint.is_some(),
+            )?;
             let present = self.read_presence(&required).await?;
             if !present.iter().all(|present| *present) {
                 bail!("finalized transaction has an incomplete durable marker set");
             }
             self.verify_state_writes(id.height, state_write_values)
                 .await?;
+            if let Some(checkpoint) = checkpoint {
+                self.verify_checkpoint(id.height, checkpoint).await?;
+            }
+            if let Some(snapshot) = next_snapshot {
+                let stored_snapshot = self
+                    .recover_snapshot(snapshot.epoch)
+                    .await?
+                    .ok_or_else(|| anyhow!("durable next validator snapshot is missing"))?;
+                if stored_snapshot != *snapshot {
+                    bail!("durable next validator snapshot conflicts with retry");
+                }
+            }
+            let expected_tip =
+                CanonicalFinalizedTip::from_finalized_with_next_snapshot(finalized, next_snapshot)
+                    .map_err(|error| anyhow!(error.to_string()))?;
+            let actual_tip = self
+                .recover_canonical_tip()
+                .await?
+                .ok_or_else(|| anyhow!("canonical finalized tip disappeared"))?;
+            if actual_tip != expected_tip {
+                bail!("canonical finalized tip conflicts with durable finality record");
+            }
             let persisted: FinalizedBlockV2 = decode(
                 &self
                     .db
@@ -101,6 +251,30 @@ impl FinalityStore {
                 bail!("finalized transaction payload conflicts with durable record");
             }
             return Ok(FinalityCommitResult::AlreadyCommitted);
+        }
+
+        let current_tip = self
+            .recover_canonical_tip()
+            .await?
+            .ok_or_else(|| anyhow!("canonical finalized tip is not initialized"))?;
+        let expected_height = current_tip
+            .next_height()
+            .map_err(|error| anyhow!(error.to_string()))?;
+        if id.height != expected_height {
+            bail!(
+                "finalized height {} is not the direct successor of canonical tip {}",
+                id.height,
+                current_tip.height
+            );
+        }
+        if finalized.block.header.prev_block_hash != current_tip.block_id.0 {
+            bail!("finalized block does not point to the canonical finalized tip");
+        }
+        if finalized.block.header.parent_randomness != current_tip.next_randomness {
+            bail!("finalized block parent randomness does not match canonical tip");
+        }
+        if (finalized.block.header.epoch as u64) < current_tip.epoch {
+            bail!("finalized block epoch regresses canonical tip epoch");
         }
 
         for transaction_id in &transaction_ids {
@@ -124,13 +298,18 @@ impl FinalityStore {
         let encoded_certificate = encode(&finalized.commit)?;
         let encoded_consensus_state = encode(&finalized.consensus_state)?;
         let encoded_state_write_count = encode(&state_write_values.len())?;
+        let canonical_entries = if let Some(checkpoint) = checkpoint {
+            canonical_state_entries(checkpoint, state_write_values)?
+        } else {
+            Vec::new()
+        };
 
         let mut keys = vec![
             height_key,
             record_key(finalized.block.header.block_hash),
             block_key(finalized.block.header.block_hash),
-            certificate_key(id.certificate_hash),
-            consensus_state_key(id.height),
+            certificate_key(id.height),
+            CONSENSUS_STATE_KEY.to_vec(),
             state_write_count_key(id.height),
         ];
         let mut values = vec![
@@ -149,15 +328,29 @@ impl FinalityStore {
             keys.push(transaction_key(transaction_id));
             values.push(encoded_id.clone());
         }
-        keys.push(TIP_KEY.to_vec());
-        values.push(encoded_id);
-
-        if let Some(tip_bytes) = self.db.get(TIP_KEY).await? {
-            let tip: FinalizeTransactionId = decode(&tip_bytes, "finalized tip")?;
-            if tip.height > id.height {
-                bail!("cannot finalize a height below the durable finalized tip");
-            }
+        for (key, value) in canonical_entries {
+            keys.push(key);
+            values.push(value);
         }
+        if let Some(checkpoint) = checkpoint {
+            keys.push(STATE_ROOT_KEY.to_vec());
+            values.push(encode(&checkpoint.state_root)?);
+            keys.push(state_root_key(id.height));
+            values.push(encode(&checkpoint.state_root)?);
+            keys.push(STATE_CHECKPOINT_KEY.to_vec());
+            values.push(encode(checkpoint)?);
+            keys.push(checkpoint_key(id.height));
+            values.push(encode(checkpoint)?);
+        }
+        if let Some(snapshot) = next_snapshot {
+            keys.push(snapshot_key(snapshot.epoch));
+            values.push(encode(snapshot)?);
+        }
+        let new_tip =
+            CanonicalFinalizedTip::from_finalized_with_next_snapshot(finalized, next_snapshot)
+                .map_err(|error| anyhow!(error.to_string()))?;
+        keys.push(TIP_KEY.to_vec());
+        values.push(encode(&new_tip)?);
 
         self.db.batch_insert(&keys, &values).await?;
         Ok(FinalityCommitResult::Applied)
@@ -177,6 +370,22 @@ impl FinalityStore {
         &self,
         height: u64,
     ) -> Result<Option<(FinalizedBlockV2, Vec<Vec<u8>>)>> {
+        Ok(self
+            .recover_finalized_v2_with_state_and_checkpoint(height)
+            .await?
+            .map(|(finalized, writes, _)| (finalized, writes)))
+    }
+
+    pub async fn recover_finalized_v2_with_state_and_checkpoint(
+        &self,
+        height: u64,
+    ) -> Result<
+        Option<(
+            FinalizedBlockV2,
+            Vec<Vec<u8>>,
+            Option<CanonicalStateCheckpoint>,
+        )>,
+    > {
         let Some(id_bytes) = self.db.get(&height_key(height)).await? else {
             return Ok(None);
         };
@@ -205,7 +414,32 @@ impl FinalityStore {
                 .ok_or_else(|| anyhow!("finalized state write count is missing"))?,
             "state write count",
         )?;
-        let required = self.required_keys(&finalized, &transaction_ids, &id, state_write_count);
+        let checkpoint: Option<CanonicalStateCheckpoint> = self
+            .db
+            .get(&checkpoint_key(id.height))
+            .await?
+            .map(|bytes| decode(&bytes, "canonical state checkpoint"))
+            .transpose()?;
+        if let Some(ref checkpoint) = checkpoint {
+            let stored_root: Hash = decode(
+                &self
+                    .db
+                    .get(&state_root_key(id.height))
+                    .await?
+                    .ok_or_else(|| anyhow!("canonical state root is missing"))?,
+                "canonical state root",
+            )?;
+            if stored_root != checkpoint.state_root {
+                bail!("canonical state root does not match its checkpoint");
+            }
+        }
+        let required = self.required_keys(
+            &finalized,
+            &transaction_ids,
+            &id,
+            state_write_count,
+            checkpoint.is_some(),
+        )?;
         if !self
             .read_presence(&required)
             .await?
@@ -223,25 +457,44 @@ impl FinalityStore {
                     .ok_or_else(|| anyhow!("finalized state write is missing"))?,
             );
         }
-        Ok(Some((finalized, state_writes)))
+        if let Some(ref checkpoint) = checkpoint {
+            if checkpoint.state_root != finalized.block.header.state_root {
+                bail!("canonical state checkpoint root does not match finalized block");
+            }
+        }
+        Ok(Some((finalized, state_writes, checkpoint)))
     }
 
     pub async fn recover_finalized_tip(&self) -> Result<Option<FinalizedBlockV2>> {
-        let Some(tip_bytes) = self.db.get(TIP_KEY).await? else {
+        let Some(tip) = self.recover_canonical_tip().await? else {
             return Ok(None);
         };
-        let tip: FinalizeTransactionId = decode(&tip_bytes, "finalized tip")?;
         self.recover_finalized_v2(tip.height).await
     }
 
     pub async fn recover_finalized_tip_with_state(
         &self,
     ) -> Result<Option<(FinalizedBlockV2, Vec<Vec<u8>>)>> {
-        let Some(tip_bytes) = self.db.get(TIP_KEY).await? else {
+        let Some(tip) = self.recover_canonical_tip().await? else {
             return Ok(None);
         };
-        let tip: FinalizeTransactionId = decode(&tip_bytes, "finalized tip")?;
         self.recover_finalized_v2_with_state(tip.height).await
+    }
+
+    pub async fn recover_finalized_tip_with_state_and_checkpoint(
+        &self,
+    ) -> Result<
+        Option<(
+            FinalizedBlockV2,
+            Vec<Vec<u8>>,
+            Option<CanonicalStateCheckpoint>,
+        )>,
+    > {
+        let Some(tip) = self.recover_canonical_tip().await? else {
+            return Ok(None);
+        };
+        self.recover_finalized_v2_with_state_and_checkpoint(tip.height)
+            .await
     }
 
     fn required_keys(
@@ -250,19 +503,54 @@ impl FinalityStore {
         transaction_ids: &[TransactionId],
         id: &FinalizeTransactionId,
         state_write_count: usize,
-    ) -> Vec<Vec<u8>> {
+        has_checkpoint: bool,
+    ) -> Result<Vec<Vec<u8>>> {
         let mut keys = vec![
             height_key(id.height),
             record_key(finalized.block.header.block_hash),
             block_key(finalized.block.header.block_hash),
-            certificate_key(id.certificate_hash),
-            consensus_state_key(id.height),
+            certificate_key(id.height),
+            CONSENSUS_STATE_KEY.to_vec(),
             state_write_count_key(id.height),
             TIP_KEY.to_vec(),
         ];
         keys.extend(transaction_ids.iter().map(transaction_key));
         keys.extend((0..state_write_count).map(|index| state_write_key(id.height, index)));
-        keys
+        if has_checkpoint {
+            keys.push(STATE_ROOT_KEY.to_vec());
+            keys.push(state_root_key(id.height));
+            keys.push(STATE_CHECKPOINT_KEY.to_vec());
+            keys.push(checkpoint_key(id.height));
+        }
+        Ok(keys)
+    }
+
+    async fn verify_checkpoint(
+        &self,
+        height: u64,
+        expected: &CanonicalStateCheckpoint,
+    ) -> Result<()> {
+        let stored = self
+            .db
+            .get(&checkpoint_key(height))
+            .await?
+            .ok_or_else(|| anyhow!("canonical state checkpoint is missing"))?;
+        let actual: CanonicalStateCheckpoint = decode(&stored, "canonical state checkpoint")?;
+        if actual != *expected {
+            bail!("canonical state checkpoint conflicts with durable state");
+        }
+        let stored_root: Hash = decode(
+            &self
+                .db
+                .get(&state_root_key(height))
+                .await?
+                .ok_or_else(|| anyhow!("canonical state root is missing"))?,
+            "canonical state root",
+        )?;
+        if stored_root != expected.state_root {
+            bail!("canonical state root conflicts with durable checkpoint");
+        }
+        Ok(())
     }
 
     async fn verify_state_writes(&self, height: u64, expected: &[Vec<u8>]) -> Result<()> {
@@ -311,12 +599,8 @@ fn block_key(block_id: Hash) -> Vec<u8> {
     key_with_bytes(BLOCK_PREFIX, &block_id.0)
 }
 
-fn certificate_key(certificate_hash: Hash) -> Vec<u8> {
-    key_with_bytes(CERTIFICATE_PREFIX, &certificate_hash.0)
-}
-
-fn consensus_state_key(height: u64) -> Vec<u8> {
-    key_with_bytes(CONSENSUS_STATE_PREFIX, &height.to_be_bytes())
+fn certificate_key(height: u64) -> Vec<u8> {
+    key_with_bytes(CERTIFICATE_PREFIX, &height.to_be_bytes())
 }
 
 fn state_write_count_key(height: u64) -> Vec<u8> {
@@ -329,13 +613,105 @@ fn state_write_key(height: u64, index: usize) -> Vec<u8> {
     key_with_bytes(STATE_WRITE_PREFIX, &suffix)
 }
 
+fn checkpoint_key(height: u64) -> Vec<u8> {
+    key_with_bytes(STATE_CHECKPOINT_PREFIX, &height.to_be_bytes())
+}
+
+fn state_root_key(height: u64) -> Vec<u8> {
+    key_with_bytes(STATE_ROOT_PREFIX, &height.to_be_bytes())
+}
+
 fn transaction_key(transaction_id: &TransactionId) -> Vec<u8> {
     key_with_bytes(TRANSACTION_PREFIX, &transaction_id.0 .0)
+}
+
+fn state_account_key(address: &norn_common::types::Address) -> Vec<u8> {
+    key_with_bytes(STATE_ACCOUNT_PREFIX, &address.0)
+}
+
+fn state_storage_key(address: &norn_common::types::Address, slot: &[u8]) -> Vec<u8> {
+    let mut suffix = address.0.to_vec();
+    suffix.push(b'/');
+    suffix.extend_from_slice(slot);
+    key_with_bytes(STATE_STORAGE_PREFIX, &suffix)
+}
+
+fn state_code_key(hash: &Hash) -> Vec<u8> {
+    key_with_bytes(STATE_CODE_PREFIX, &hash.0)
+}
+
+fn snapshot_key(epoch: u64) -> Vec<u8> {
+    key_with_bytes(SNAPSHOT_PREFIX, &epoch.to_be_bytes())
+}
+
+fn canonical_state_entries(
+    checkpoint: &CanonicalStateCheckpoint,
+    state_write_values: &[Vec<u8>],
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut entries = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
+    for account in &checkpoint.accounts {
+        entries.insert(state_account_key(&account.address), encode(account)?);
+    }
+    for (address, items) in &checkpoint.storage {
+        for item in items {
+            entries.insert(state_storage_key(address, &item.key), item.value.clone());
+        }
+    }
+    for (hash, code) in &checkpoint.code.codes {
+        entries.insert(state_code_key(hash), code.clone());
+    }
+
+    // Overlay writes also emit tombstones for keys deleted by this block. The
+    // checkpoint remains the authoritative recovery image; these entries make
+    // the granular state namespace reflect the same update/delete operation.
+    for encoded in state_write_values {
+        let write: OverlayWrite = decode(encoded, "canonical overlay write")?;
+        match write {
+            OverlayWrite::Account {
+                address, new_state, ..
+            } => {
+                entries.insert(state_account_key(&address), encode(&new_state)?);
+            }
+            OverlayWrite::Storage {
+                address,
+                key,
+                new_value,
+                ..
+            } => {
+                entries.insert(
+                    state_storage_key(&address, &key),
+                    if new_value.is_empty() {
+                        STATE_TOMBSTONE.to_vec()
+                    } else {
+                        new_value
+                    },
+                );
+            }
+            OverlayWrite::Code {
+                new_hash,
+                code,
+                deleted,
+                ..
+            } => {
+                if !deleted {
+                    entries.insert(state_code_key(&new_hash), code);
+                }
+            }
+        }
+    }
+    Ok(entries.into_iter().collect())
 }
 
 fn key_with_bytes(prefix: &[u8], suffix: &[u8]) -> Vec<u8> {
     let mut key = prefix.to_vec();
     key.extend_from_slice(suffix);
+    key
+}
+
+fn pending_proposal_key(height: u64, round: u32) -> Vec<u8> {
+    let mut key = PENDING_PROPOSAL_PREFIX.to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key.extend_from_slice(&round.to_be_bytes());
     key
 }
 
@@ -434,7 +810,7 @@ mod tests {
                 epoch: 0,
                 round: 0,
                 timestamp: 1,
-                prev_block_hash: Hash([0; 32]),
+                prev_block_hash: Hash([8; 32]),
                 block_hash: block_id,
                 merkle_root: Hash([4; 32]),
                 state_root: Hash([5; 32]),
@@ -463,11 +839,52 @@ mod tests {
             commit_certificate_hash: commit.certificate_hash(),
             next_randomness: Hash([9; 32]),
             active_stake_snapshot_hash: snapshot_hash,
+            pending_validator_changes: Default::default(),
         };
         FinalizedBlockV2 {
+            proposal: Proposal {
+                protocol_version,
+                chain_id,
+                epoch: 0,
+                height: 1,
+                round: 0,
+                valid_round: None,
+                valid_round_certificate: None,
+                block_id: BlockId(block_id),
+                parent_block_hash: Hash([8; 32]),
+                stake_snapshot_hash: snapshot_hash,
+                proposer: ValidatorId([6; 32]),
+                vrf_preout: [10; 32],
+                vrf_proof: [11; 64],
+                signature: [12; 64],
+            },
             block,
             commit,
             consensus_state,
+        }
+    }
+
+    fn genesis_block() -> Block {
+        Block {
+            header: BlockHeader {
+                protocol_version: ProtocolVersion(2),
+                chain_id: ChainId(Hash([1; 32])),
+                height: 0,
+                epoch: 0,
+                round: 0,
+                timestamp: 0,
+                prev_block_hash: Hash::default(),
+                block_hash: Hash([8; 32]),
+                merkle_root: Hash::default(),
+                state_root: Hash::default(),
+                proposer: ValidatorId([0; 32]),
+                stake_snapshot_hash: StakeSnapshotHash([3; 32]),
+                parent_randomness: Hash::default(),
+                gas_limit: 0,
+                base_fee: 0,
+                consensus_data_hash: Hash::default(),
+            },
+            transactions: Vec::new(),
         }
     }
 
@@ -475,6 +892,10 @@ mod tests {
     async fn finality_is_idempotent_and_rejects_different_block_at_height() {
         let db = Arc::new(MemoryDb::default());
         let store = FinalityStore::new(db);
+        store
+            .initialize_genesis_tip(&genesis_block(), StakeSnapshotHash([3; 32]), Hash([7; 32]))
+            .await
+            .unwrap();
         let first = finalized();
         assert_eq!(
             store.commit_finalized_transaction(&first).await.unwrap(),
@@ -500,6 +921,10 @@ mod tests {
     async fn post_apply_failure_is_resolved_by_durable_retry() {
         let db = Arc::new(MemoryDb::default());
         let store = FinalityStore::new(db.clone());
+        store
+            .initialize_genesis_tip(&genesis_block(), StakeSnapshotHash([3; 32]), Hash([7; 32]))
+            .await
+            .unwrap();
         let block = finalized();
         db.apply_then_fail();
         assert!(store.commit_finalized_transaction(&block).await.is_err());

@@ -5,18 +5,20 @@ use norn_common::chain_context::{
     ChainContext, PeerRole, MAX_BLOCK_MESSAGE_BYTES, MAX_TRANSACTION_MESSAGE_BYTES,
 };
 use norn_common::consensus_types::{
-    CommitCertificate, ConsensusEnvelope, ConsensusMessage, MAX_CONSENSUS_ENVELOPE_BYTES,
+    CanonicalFinalizedTip, CommitCertificate, ConsensusEnvelope, ConsensusMessage, SignedVote,
+    MAX_CONSENSUS_ENVELOPE_BYTES,
 };
 use norn_common::genesis::ProtocolResourceLimits;
 use norn_common::types::ValidatorId;
 use norn_core::blockchain::Blockchain;
+use norn_core::consensus::driver::{ConsensusDriver, ConsensusDriverEvent};
 use norn_core::consensus::povf::PoVFEngine;
 use norn_core::consensus::producer::{BlockProducer, BlockProducerConfig};
 use norn_core::consensus::safety_store::{ConsensusSigner, PersistentSafetyStore};
 use norn_core::consensus::types::{ConsensusConfig, ProposalSigner};
 use norn_core::evm::{EVMConfig, EVMExecutor};
-use norn_core::execution::overlay::ExecutionOverlay;
 use norn_core::finality::FinalityStore;
+use norn_core::state::merkle::StateRootCalculator;
 use norn_core::state::{AccountStateConfig, AccountStateManager};
 use norn_core::txpool::TxPool;
 use norn_core::txpool_v2::TransactionV2Pool;
@@ -30,10 +32,11 @@ use crate::syncer::BlockSyncer;
 use crate::tx_handler::TxHandler;
 use libp2p::identity::Keypair;
 use norn_rpc::{create_ethereum_rpc, start_ethereum_rpc_server, start_rpc_server};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::signal;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::metrics::MetricsCollector;
 use crate::monitoring::MonitoringServer;
@@ -89,6 +92,7 @@ pub struct NornNode {
 
     /// Consensus engine for PoVF BFT consensus
     consensus: Arc<PoVFEngine>,
+    consensus_driver: ConsensusDriver,
     finality_store: Arc<FinalityStore>,
     signer: Option<Arc<EcdsaConsensusSigner>>,
 
@@ -161,6 +165,7 @@ impl NornNode {
 
         let genesis_config = config.load_genesis_config()?;
         let genesis_snapshot = config.validate_genesis_for_role(&genesis_config)?;
+        let genesis_snapshot_hash = genesis_snapshot.snapshot_hash;
         let chain_context = genesis_config.context();
 
         let db = Arc::new(SledDB::new(&config.data_dir)?);
@@ -224,6 +229,10 @@ impl NornNode {
             chain_id: chain_context.chain_id,
             epoch: genesis_config.epoch,
             epoch_length: genesis_config.epoch_length,
+            validator_update_delay: genesis_config.validator_update_delay,
+            unbonding_delay: genesis_config.unbonding_delay,
+            key_rotation_delay: genesis_config.key_rotation_delay,
+            slashing_activation_delay: genesis_config.slashing_activation_delay,
             timeout_propose_ms: defaults.timeout_propose_ms,
             timeout_prevote_ms: defaults.timeout_prevote_ms,
             timeout_precommit_ms: defaults.timeout_precommit_ms,
@@ -237,6 +246,13 @@ impl NornNode {
         let safety_path = Path::new(&config.data_dir).join("safety_store.log");
         let persistent_safety_store = Arc::new(PersistentSafetyStore::open(safety_path)?);
         let finality_store = Arc::new(FinalityStore::new(db.clone()));
+        let initialized_tip = finality_store
+            .initialize_genesis_tip(
+                &genesis_config.genesis_block,
+                genesis_snapshot_hash,
+                genesis_config.initial_randomness,
+            )
+            .await?;
 
         let consensus = Arc::new(PoVFEngine::new_with_parent_randomness(
             consensus_config,
@@ -245,22 +261,61 @@ impl NornNode {
             persistent_safety_store,
             local_validator_id,
         ));
+        {
+            let sm = consensus.state_machine.read().await;
+            info!(
+                "Consensus V2 initial height={} round={} local_validator={:?} proposer={:?}",
+                sm.height,
+                sm.round,
+                sm.local_validator_id,
+                sm.get_current_proposer()
+            );
+        }
+        let consensus_driver = ConsensusDriver::start(
+            genesis_config.resource_limits.max_verification_tasks.max(1) as usize,
+        )?;
         info!("Initialized disk-backed BFT consensus engine");
 
         let state_manager = Arc::new(AccountStateManager::new(AccountStateConfig::default()));
         let evm_config = EVMConfig::default();
         let evm_executor = Arc::new(EVMExecutor::new(state_manager.clone(), evm_config));
 
-        if let Some((finalized, state_writes)) =
-            finality_store.recover_finalized_tip_with_state().await?
+        if let Some((finalized, state_writes, checkpoint)) = finality_store
+            .recover_finalized_tip_with_state_and_checkpoint()
+            .await?
         {
-            ExecutionOverlay::apply_persisted_writes(
-                &state_writes,
-                &state_manager,
-                evm_executor.code_storage().as_ref(),
-            )
-            .await
-            .map_err(|error| anyhow!("failed to replay finalized state writes: {error}"))?;
+            let checkpoint = checkpoint.ok_or_else(|| {
+                anyhow!(
+                    "durable finalized V2 state has no canonical state checkpoint; refusing startup"
+                )
+            })?;
+            if checkpoint.state_root != finalized.block.header.state_root {
+                return Err(anyhow!(
+                    "durable canonical state root does not match finalized block"
+                ));
+            }
+            state_manager
+                .restore_canonical_state(
+                    &checkpoint.accounts,
+                    &checkpoint.storage,
+                    checkpoint.state_root,
+                )
+                .await
+                .map_err(|error| anyhow!("failed to restore canonical state: {error}"))?;
+            evm_executor
+                .code_storage()
+                .restore_checkpoint(&checkpoint.code)
+                .await
+                .map_err(|error| anyhow!("failed to restore canonical code: {error}"))?;
+            let recomputed_root = StateRootCalculator::new(false)
+                .calculate_from_manager(&state_manager)
+                .await?;
+            if recomputed_root != checkpoint.state_root {
+                return Err(anyhow!(
+                    "recovered canonical state root recomputation mismatch"
+                ));
+            }
+            let _ = state_writes;
             let next_snapshot = {
                 let sm = consensus.state_machine.read().await;
                 let next_height = finalized
@@ -269,8 +324,27 @@ impl NornNode {
                     .checked_add(1)
                     .ok_or_else(|| anyhow!("finalized height overflow during recovery"))?;
                 let next_epoch = sm.config.epoch_for_height(next_height)?;
-                sm.snapshot.for_epoch(next_epoch)?
+                if let Some(snapshot) = finality_store.recover_snapshot(next_epoch).await? {
+                    if snapshot.epoch != next_epoch {
+                        return Err(anyhow!(
+                            "durable next validator snapshot has an unexpected epoch"
+                        ));
+                    }
+                    snapshot
+                } else {
+                    sm.snapshot_for_height(next_height)?
+                }
             };
+            let expected_tip = CanonicalFinalizedTip::from_finalized_with_next_snapshot(
+                &finalized,
+                Some(&next_snapshot),
+            )
+            .map_err(|error| anyhow!("failed to derive canonical recovery tip: {error}"))?;
+            if initialized_tip != expected_tip {
+                return Err(anyhow!(
+                    "durable canonical tip conflicts with finalized block, state root, randomness, or next validator snapshot"
+                ));
+            }
             {
                 let mut sm = consensus.state_machine.write().await;
                 sm.restore_after_finalized(&finalized.consensus_state, next_snapshot)
@@ -310,6 +384,7 @@ impl NornNode {
                 );
                 producer.attach_v2_pool(tx_pool_v2.clone());
                 producer.attach_v2_code_storage(evm_executor.code_storage().clone());
+                producer.attach_finality_store(finality_store.clone());
                 Some(Arc::new(producer))
             }
             (NodeRole::FullNode, None, None) => None,
@@ -353,6 +428,7 @@ impl NornNode {
             tx_pool_v2,
             network,
             consensus,
+            consensus_driver,
             finality_store,
             signer,
             block_producer,
@@ -413,28 +489,270 @@ impl NornNode {
         if let Some(producer) = self.block_producer.clone() {
             let network_ref = self.network.clone();
             let chain_context = self.chain_context;
+            let resource_limits = self.resource_limits.clone();
+            let consensus = self.consensus.clone();
+            let consensus_driver = self.consensus_driver.clone();
+            let signer = self.signer.clone();
+            let state_manager = self.state_manager.clone();
+            let code_storage = self.evm_executor.code_storage().clone();
+            let finality_store = self.finality_store.clone();
             tokio::spawn(async move {
                 let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut produced_slot: Option<(u64, u32)> = None;
                 loop {
                     timer.tick().await;
+                    let slot = {
+                        let state_machine = consensus.state_machine.read().await;
+                        (state_machine.height, state_machine.round)
+                    };
+                    if produced_slot == Some(slot) {
+                        continue;
+                    }
                     if producer.should_produce().await {
-                        if let Ok((proposal, block)) = producer.produce_proposal().await {
+                        let (proposal, block, recovered_pending) = match finality_store
+                            .recover_pending_proposal(slot.0, slot.1)
+                            .await
+                        {
+                            Ok(Some((proposal, block))) => {
+                                info!(
+                                    "Recovering pending V2 proposal at height {} round {}",
+                                    proposal.height, proposal.round
+                                );
+                                (proposal, block, true)
+                            }
+                            Ok(None) => {
+                                let produced = match producer
+                                    .produce_v2_proposal(&chain_context, &resource_limits)
+                                    .await
+                                {
+                                    Ok(produced) => produced,
+                                    Err(error) => {
+                                        warn!("V2 proposal production failed: {}", error);
+                                        continue;
+                                    }
+                                };
+                                if let Err(error) = finality_store
+                                    .persist_pending_proposal(&produced.0, &produced.1)
+                                    .await
+                                {
+                                    warn!(
+                                        "V2 proposal was not durably recorded before voting: {}",
+                                        error
+                                    );
+                                    continue;
+                                }
+                                (produced.0, produced.1, false)
+                            }
+                            Err(error) => {
+                                warn!("Failed to recover pending V2 proposal: {}", error);
+                                continue;
+                            }
+                        };
+                        {
+                            produced_slot = Some(slot);
+                            let _ = consensus_driver
+                                .dispatch(ConsensusDriverEvent::LocalProposalReady {
+                                    height: block.header.height as u64,
+                                    block_id: proposal.block_id,
+                                })
+                                .await;
+                            consensus.candidate_blocks_v2.write().await.insert(
+                                (block.header.height as u64, proposal.block_id),
+                                block.clone(),
+                            );
+                            let local_vote = if recovered_pending {
+                                // Re-admit the recovered proposal through the same
+                                // state-machine path as a live proposal. The
+                                // SafetyStore makes this idempotent and returns the
+                                // exact durable prevote instead of signing a new
+                                // value for the slot. Keeping the vote in the local
+                                // pool is required for the proposer to observe a
+                                // post-restart Polka and produce its precommit.
+                                if let Some(signer) = signer.as_ref() {
+                                    match consensus
+                                        .handle_proposal_v2(
+                                            proposal.clone(),
+                                            block.clone(),
+                                            signer.as_ref(),
+                                            &state_manager,
+                                            &resource_limits,
+                                            &chain_context,
+                                            &code_storage,
+                                        )
+                                        .await
+                                    {
+                                        Ok(vote) => vote,
+                                        Err(error) => {
+                                            warn!(
+                                                "Recovered pending V2 proposal was not re-admitted to the voting state machine: {}",
+                                                error
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    match consensus
+                                        .verify_proposal_v2(
+                                            proposal.clone(),
+                                            block.clone(),
+                                            &state_manager,
+                                            &resource_limits,
+                                            &chain_context,
+                                            &code_storage,
+                                        )
+                                        .await
+                                    {
+                                        Ok(validated) => {
+                                            consensus
+                                                .remember_validated_candidate(&validated)
+                                                .await;
+                                        }
+                                        Err(error) => {
+                                            warn!(
+                                                "Recovered pending V2 proposal failed verification: {}",
+                                                error
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    None
+                                }
+                            } else if let Some(signer) = signer.as_ref() {
+                                match consensus
+                                    .handle_proposal_v2(
+                                        proposal.clone(),
+                                        block.clone(),
+                                        signer.as_ref(),
+                                        &state_manager,
+                                        &resource_limits,
+                                        &chain_context,
+                                        &code_storage,
+                                    )
+                                    .await
+                                {
+                                    Ok(vote) => vote,
+                                    Err(error) => {
+                                        warn!(
+                                                "Local V2 proposal was not accepted by the voting state machine: {}",
+                                                error
+                                            );
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            };
+                            let local_precommit = match (local_vote.as_ref(), signer.as_ref()) {
+                                (Some(vote), Some(signer)) => {
+                                    match consensus.handle_vote(vote.clone(), signer.as_ref()).await
+                                    {
+                                        Ok((precommit, _)) => {
+                                            if let Some(precommit) = precommit.as_ref() {
+                                                if let Err(error) = consensus
+                                                    .handle_vote(precommit.clone(), signer.as_ref())
+                                                    .await
+                                                {
+                                                    warn!(
+                                                        "Local V2 precommit was not admitted to the vote pool: {}",
+                                                        error
+                                                    );
+                                                }
+                                            }
+                                            precommit
+                                        }
+                                        Err(error) => {
+                                            warn!(
+                                                "Local V2 prevote was not admitted to the vote pool: {}",
+                                                error
+                                            );
+                                            None
+                                        }
+                                    }
+                                }
+                                _ => None,
+                            };
                             let envelope = ConsensusEnvelope {
                                 wire_version: chain_context.wire_version,
                                 protocol_version: proposal.protocol_version,
                                 chain_id: proposal.chain_id,
                                 genesis_hash: chain_context.genesis_hash,
-                                payload: ConsensusMessage::Proposal {
+                                payload: ConsensusMessage::ProposalV2 {
                                     proposal: proposal.clone(),
                                     block: block.clone(),
                                 },
                             };
 
-                            if let Ok(msg_bytes) = bincode::serialize(&envelope) {
-                                let _ = network_ref
-                                    .command_tx
-                                    .send(NetworkCommand::BroadcastConsensus(msg_bytes))
-                                    .await;
+                            match bincode::serialize(&envelope) {
+                                Ok(msg_bytes) => {
+                                    debug!(
+                                        "Enqueueing V2 proposal broadcast at height {}",
+                                        proposal.height
+                                    );
+                                    if let Err(error) = network_ref
+                                        .command_tx
+                                        .send(NetworkCommand::BroadcastConsensus(msg_bytes))
+                                        .await
+                                    {
+                                        warn!("Failed to enqueue local V2 proposal: {}", error);
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!("Failed to encode local V2 proposal: {}", error)
+                                }
+                            }
+                            if let Some(vote) = local_vote {
+                                let vote_envelope = ConsensusEnvelope {
+                                    wire_version: chain_context.wire_version,
+                                    protocol_version: vote.protocol_version,
+                                    chain_id: vote.chain_id,
+                                    genesis_hash: chain_context.genesis_hash,
+                                    payload: ConsensusMessage::Vote(vote),
+                                };
+                                match bincode::serialize(&vote_envelope) {
+                                    Ok(vote_bytes) => {
+                                        if let Err(error) = network_ref
+                                            .command_tx
+                                            .send(NetworkCommand::BroadcastConsensus(vote_bytes))
+                                            .await
+                                        {
+                                            warn!(
+                                                "Failed to enqueue local V2 proposal vote: {}",
+                                                error
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        warn!("Failed to encode local V2 proposal vote: {}", error)
+                                    }
+                                }
+                            }
+                            if let Some(precommit) = local_precommit {
+                                let precommit_envelope = ConsensusEnvelope {
+                                    wire_version: chain_context.wire_version,
+                                    protocol_version: precommit.protocol_version,
+                                    chain_id: precommit.chain_id,
+                                    genesis_hash: chain_context.genesis_hash,
+                                    payload: ConsensusMessage::Vote(precommit),
+                                };
+                                match bincode::serialize(&precommit_envelope) {
+                                    Ok(precommit_bytes) => {
+                                        if let Err(error) = network_ref
+                                            .command_tx
+                                            .send(NetworkCommand::BroadcastConsensus(
+                                                precommit_bytes,
+                                            ))
+                                            .await
+                                        {
+                                            warn!(
+                                                "Failed to enqueue local V2 precommit: {}",
+                                                error
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        warn!("Failed to encode local V2 precommit: {}", error)
+                                    }
+                                }
                             }
                         }
                     }
@@ -462,6 +780,26 @@ impl NornNode {
                 );
                 continue;
             }
+            if let Some(signer) = self.signer.as_ref() {
+                match self
+                    .consensus
+                    .handle_vote(vote.clone(), signer.as_ref())
+                    .await
+                {
+                    Ok((Some(follow_up), _)) => {
+                        if let Err(error) = self.broadcast_v2_vote(follow_up).await {
+                            warn!("Failed to enqueue recovered follow-up vote: {}", error);
+                        }
+                    }
+                    Ok((None, _)) => {}
+                    Err(error) => {
+                        warn!(
+                            "Recovered vote was not admitted to the local vote pool: {}",
+                            error
+                        );
+                    }
+                }
+            }
             let envelope = ConsensusEnvelope {
                 wire_version: self.chain_context.wire_version,
                 protocol_version: vote.protocol_version,
@@ -484,6 +822,16 @@ impl NornNode {
             }
         }
 
+        // Any node may have been offline when validators broadcast several
+        // Commit certificates. Start an ordered finalized-record sync from
+        // the next canonical height; each response requests the following
+        // height after it has been verified and durably applied. Validators
+        // use the same verify-and-recover path after a crash/partition; they
+        // never treat a missing gossip replay as an implicit new proposal.
+        if let Some(tip) = self.finality_store.recover_canonical_tip().await? {
+            self.request_v2_finality(tip.next_height()?).await;
+        }
+
         if let Some(rx) = self.network_rx.take() {
             self.run_loop(rx).await;
         }
@@ -492,93 +840,446 @@ impl NornNode {
     }
 
     async fn finalize_commit(&self, commit: CommitCertificate) -> Result<()> {
-        let durable_v2 = self
+        if commit.protocol_version != self.chain_context.protocol_version
+            || commit.chain_id != self.chain_context.chain_id
+        {
+            return Err(anyhow!(
+                "UnsupportedProtocolVersion: finalized certificate is not for the active V2 chain"
+            ));
+        }
+        let canonical_tip = self
             .finality_store
-            .recover_finalized_v2_with_state(commit.height)
-            .await?;
-        let is_v2 = self
+            .recover_canonical_tip()
+            .await?
+            .ok_or_else(|| anyhow!("canonical finalized tip is unavailable"))?;
+        // A delayed/replayed certificate for an already superseded height is
+        // verified against its immutable durable record, then ignored. It
+        // must never restore an older checkpoint into the live state or move
+        // the consensus state backwards.
+        if canonical_tip.height > commit.height {
+            let persisted = self
+                .finality_store
+                .recover_finalized_v2(commit.height)
+                .await?
+                .ok_or_else(|| anyhow!("replayed finalized certificate has no durable record"))?;
+            self.verify_replayed_or_equivalent_certificate(&persisted, &commit)
+                .await?;
+            return Ok(());
+        }
+        let next_height = commit
+            .height
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("finalized height overflow"))?;
+        let next_snapshot = self
             .consensus
-            .candidate_blocks_v2
+            .state_machine
             .read()
             .await
-            .contains_key(&(commit.height, commit.block_id))
-            || durable_v2.is_some();
-        if is_v2 {
-            let (finalized, state_write_values, commit_status) =
-                if let Some((persisted, state_writes)) = durable_v2 {
-                    if persisted.block.header.height < 0
-                        || persisted.block.header.height as u64 != commit.height
-                        || persisted.commit.block_id != commit.block_id
-                        || persisted.commit.certificate_hash() != commit.certificate_hash()
-                    {
-                        return Err(anyhow!(
-                            "durable finalized payload conflicts with received certificate"
-                        ));
-                    }
-                    let status = self
-                        .finality_store
-                        .commit_finalized_transaction_with_state(&persisted, &state_writes)
-                        .await?;
-                    (persisted, state_writes, status)
-                } else {
-                    let finalized = self.consensus.finalize_block_v2(commit).await?;
-                    let execution = self
-                        .consensus
-                        .execute_v2_block_for_finality(
-                            &finalized.block,
-                            &self.state_manager,
-                            &self.resource_limits,
-                            &self.chain_context,
-                            self.evm_executor.code_storage(),
-                        )
-                        .await?;
-                    let state_writes = execution.overlay.canonical_persistence_values()?;
-                    let status = self
-                        .finality_store
-                        .commit_finalized_transaction_with_state(&finalized, &state_writes)
-                        .await?;
-                    (finalized, state_writes, status)
-                };
-            ExecutionOverlay::apply_persisted_writes(
-                &state_write_values,
-                &self.state_manager,
-                self.evm_executor.code_storage().as_ref(),
+            .snapshot_for_height(next_height)?;
+        if canonical_tip.height > 0
+            || canonical_tip.state_root != norn_common::types::Hash::default()
+        {
+            let current_root = StateRootCalculator::new(false)
+                .calculate_from_manager(&self.state_manager)
+                .await?;
+            if current_root != canonical_tip.state_root {
+                return Err(anyhow!(
+                    "execution parent state root does not match canonical finalized tip"
+                ));
+            }
+        }
+        let durable_v2 = self
+            .finality_store
+            .recover_finalized_v2_with_state_and_checkpoint(commit.height)
+            .await?;
+        let (finalized, state_write_values, checkpoint, commit_status) = if let Some((
+            persisted,
+            state_writes,
+            checkpoint,
+        )) = durable_v2
+        {
+            if persisted.block.header.height < 0
+                || persisted.block.header.height as u64 != commit.height
+                || persisted.commit.block_id != commit.block_id
+            {
+                warn!(
+                        "Durable V2 record mismatch: persisted_height={}, received_height={}, persisted_block={:?}, received_block={:?}",
+                        persisted.block.header.height,
+                        commit.height,
+                        persisted.commit.block_id,
+                        commit.block_id
+                    );
+                return Err(anyhow!(
+                    "durable finalized payload conflicts with received certificate"
+                ));
+            }
+            if persisted.commit != commit {
+                // Multiple valid quorum certificates can exist for the
+                // same block when weighted voting allows different
+                // minimal quorum member sets. The first durable record is
+                // canonical; a later equivalent certificate is verified
+                // and treated as an idempotent replay, never as a new
+                // state transition.
+                self.verify_replayed_or_equivalent_certificate(&persisted, &commit)
+                    .await?;
+                return Ok(());
+            }
+            let checkpoint = checkpoint.ok_or_else(|| {
+                anyhow!("durable V2 finality is missing canonical state checkpoint")
+            })?;
+            let status = self
+                .finality_store
+                .commit_finalized_transaction_with_state_and_checkpoint_and_snapshot(
+                    &persisted,
+                    &state_writes,
+                    Some(&checkpoint),
+                    Some(&next_snapshot),
+                )
+                .await?;
+            (persisted, state_writes, checkpoint, status)
+        } else {
+            let finalized = self.consensus.finalize_block_v2(commit).await?;
+            let execution = self
+                .consensus
+                .execute_v2_block_for_finality(
+                    &finalized.block,
+                    &self.state_manager,
+                    &self.resource_limits,
+                    &self.chain_context,
+                    self.evm_executor.code_storage(),
+                )
+                .await?;
+            let state_writes = execution.overlay.canonical_persistence_values()?;
+            let checkpoint = execution
+                .overlay
+                .canonical_state_checkpoint(&self.state_manager, self.evm_executor.code_storage())
+                .await?;
+            let status = self
+                .finality_store
+                .commit_finalized_transaction_with_state_and_checkpoint_and_snapshot(
+                    &finalized,
+                    &state_writes,
+                    Some(&checkpoint),
+                    Some(&next_snapshot),
+                )
+                .await?;
+            (finalized, state_writes, checkpoint, status)
+        };
+        self.state_manager
+            .restore_canonical_state(
+                &checkpoint.accounts,
+                &checkpoint.storage,
+                checkpoint.state_root,
             )
             .await
-            .map_err(|error| anyhow!("failed to apply finalized state writes: {error}"))?;
-            let next_snapshot = {
-                let sm = self.consensus.state_machine.read().await;
-                let next_height = finalized
-                    .consensus_state
-                    .height
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("finalized height overflow"))?;
-                let next_epoch = sm.config.epoch_for_height(next_height)?;
-                sm.snapshot.for_epoch(next_epoch)?
-            };
-            self.consensus
-                .advance_after_finalized_v2(&finalized, next_snapshot)
-                .await?;
-            info!(
-                "Finalized V2 block {:?} at height {}; durable finality status {:?}",
-                finalized.block.header.block_hash, finalized.block.header.height, commit_status
-            );
-            Ok(())
-        } else {
-            let finalized = self.consensus.finalize_block(commit).await?;
-            info!(
-                "Finalized block {:?} at height {}",
-                finalized.block.header.block_hash, finalized.block.header.height
-            );
-            self.blockchain.commit_block(&finalized.block).await?;
-            Ok(())
+            .map_err(|error| anyhow!("failed to apply finalized canonical state: {error}"))?;
+        self.evm_executor
+            .code_storage()
+            .restore_checkpoint(&checkpoint.code)
+            .await
+            .map_err(|error| anyhow!("failed to apply finalized canonical code: {error}"))?;
+        let recomputed_root = StateRootCalculator::new(false)
+            .calculate_from_manager(&self.state_manager)
+            .await?;
+        if recomputed_root != finalized.block.header.state_root {
+            return Err(anyhow!(
+                "finalized canonical state root does not match block state_root"
+            ));
         }
+        let _ = state_write_values;
+        self.consensus
+            .record_finalized_v2_after_durable(&finalized)
+            .await?;
+        self.consensus
+            .advance_after_finalized_v2(&finalized, next_snapshot)
+            .await?;
+        if let Err(error) = self
+            .finality_store
+            .clear_pending_proposal(finalized.commit.height, finalized.commit.round)
+            .await
+        {
+            warn!(
+                "Failed to clear finalized V2 pending proposal record: {}",
+                error
+            );
+        }
+        info!(
+            "Finalized V2 block {:?} at height {}; durable finality status {:?}",
+            finalized.block.header.block_hash, finalized.block.header.height, commit_status
+        );
+        Ok(())
+    }
+
+    async fn verify_replayed_or_equivalent_certificate(
+        &self,
+        persisted: &norn_common::consensus_types::FinalizedBlockV2,
+        received: &CommitCertificate,
+    ) -> Result<()> {
+        if persisted.commit.block_id != received.block_id
+            || persisted.commit.height != received.height
+            || persisted.commit.protocol_version != received.protocol_version
+            || persisted.commit.chain_id != received.chain_id
+            || persisted.commit.epoch != received.epoch
+            || persisted.commit.round != received.round
+            || persisted.commit.stake_snapshot_hash != received.stake_snapshot_hash
+        {
+            return Err(anyhow!(
+                "replayed finalized certificate conflicts with durable history"
+            ));
+        }
+        if persisted.commit == *received {
+            return Ok(());
+        }
+        let snapshot = self
+            .finality_store
+            .recover_snapshot(received.epoch)
+            .await?
+            .ok_or_else(|| anyhow!("snapshot for replayed finalized certificate is missing"))?;
+        self.consensus
+            .verify_commit_certificate_v2(&persisted.block, received, &snapshot)
+            .map_err(|error| {
+                anyhow!("equivalent finalized certificate failed verification: {error}")
+            })
+    }
+
+    async fn validate_and_remember_v2_candidate(
+        &self,
+        proposal: norn_common::consensus_types::Proposal,
+        block: norn_common::types::BlockV2,
+    ) -> Result<()> {
+        block.validate_structure(&self.chain_context, &self.resource_limits)?;
+        let tip = self
+            .finality_store
+            .recover_canonical_tip()
+            .await?
+            .ok_or_else(|| anyhow!("canonical finalized tip is unavailable"))?;
+        let parent_matches = block.header.height >= 0
+            && tip.next_height()? == block.header.height as u64
+            && tip.block_id.0 == block.header.prev_block_hash
+            && tip.next_randomness == block.header.parent_randomness;
+        if !parent_matches {
+            return Err(anyhow!(
+                "V2 proposal has a non-canonical parent, height, or randomness"
+            ));
+        }
+        let validated = self
+            .consensus
+            .verify_proposal_v2(
+                proposal,
+                block,
+                &self.state_manager,
+                &self.resource_limits,
+                &self.chain_context,
+                self.evm_executor.code_storage(),
+            )
+            .await?;
+        self.consensus
+            .remember_validated_candidate(&validated)
+            .await;
+        Ok(())
+    }
+
+    async fn request_v2_block(&self, height: u64, block_id: norn_common::types::BlockId) {
+        let envelope = ConsensusEnvelope {
+            wire_version: self.chain_context.wire_version,
+            protocol_version: self.chain_context.protocol_version,
+            chain_id: self.chain_context.chain_id,
+            genesis_hash: self.chain_context.genesis_hash,
+            payload: ConsensusMessage::BlockRequest { height, block_id },
+        };
+        match bincode::serialize(&envelope) {
+            Ok(bytes) => {
+                if let Err(error) = self
+                    .network
+                    .command_tx
+                    .send(NetworkCommand::BroadcastConsensus(bytes))
+                    .await
+                {
+                    warn!("Failed to request missing V2 block: {}", error);
+                }
+            }
+            Err(error) => warn!("Failed to encode V2 block request: {}", error),
+        }
+    }
+
+    async fn request_v2_finality(&self, height: u64) {
+        if height == 0 {
+            return;
+        }
+        let envelope = ConsensusEnvelope {
+            wire_version: self.chain_context.wire_version,
+            protocol_version: self.chain_context.protocol_version,
+            chain_id: self.chain_context.chain_id,
+            genesis_hash: self.chain_context.genesis_hash,
+            payload: ConsensusMessage::FinalityRequest { height },
+        };
+        match bincode::serialize(&envelope) {
+            Ok(bytes) => {
+                if let Err(error) = self
+                    .network
+                    .command_tx
+                    .send(NetworkCommand::BroadcastConsensus(bytes))
+                    .await
+                {
+                    warn!(
+                        "Failed to request missing V2 finality at height {}: {}",
+                        height, error
+                    );
+                }
+            }
+            Err(error) => warn!("Failed to encode V2 finality request: {}", error),
+        }
+    }
+
+    async fn respond_with_v2_block(
+        &self,
+        proposal: norn_common::consensus_types::Proposal,
+        block: norn_common::types::BlockV2,
+    ) {
+        let envelope = ConsensusEnvelope {
+            wire_version: self.chain_context.wire_version,
+            protocol_version: self.chain_context.protocol_version,
+            chain_id: self.chain_context.chain_id,
+            genesis_hash: self.chain_context.genesis_hash,
+            payload: ConsensusMessage::BlockResponse { proposal, block },
+        };
+        match bincode::serialize(&envelope) {
+            Ok(bytes) => {
+                if let Err(error) = self
+                    .network
+                    .command_tx
+                    .send(NetworkCommand::BroadcastConsensus(bytes))
+                    .await
+                {
+                    warn!("Failed to enqueue V2 block response: {}", error);
+                }
+            }
+            Err(error) => warn!("Failed to encode V2 block response: {}", error),
+        }
+    }
+
+    async fn respond_with_v2_finality(
+        &self,
+        finalized: norn_common::consensus_types::FinalizedBlockV2,
+    ) {
+        let envelope = ConsensusEnvelope {
+            wire_version: self.chain_context.wire_version,
+            protocol_version: self.chain_context.protocol_version,
+            chain_id: self.chain_context.chain_id,
+            genesis_hash: self.chain_context.genesis_hash,
+            payload: ConsensusMessage::FinalityResponse { finalized },
+        };
+        match bincode::serialize(&envelope) {
+            Ok(bytes) => {
+                if let Err(error) = self
+                    .network
+                    .command_tx
+                    .send(NetworkCommand::BroadcastConsensus(bytes))
+                    .await
+                {
+                    warn!("Failed to enqueue V2 finality response: {}", error);
+                }
+            }
+            Err(error) => warn!("Failed to encode V2 finality response: {}", error),
+        }
+    }
+
+    async fn respond_to_v2_block_request(
+        &self,
+        height: u64,
+        block_id: norn_common::types::BlockId,
+    ) {
+        if let Some((proposal, block)) = self
+            .consensus
+            .get_validated_candidate(height, block_id)
+            .await
+        {
+            self.respond_with_v2_block(proposal, block).await;
+            return;
+        }
+
+        // Candidate caches are intentionally pruned after durable finality.
+        // The finality record remains an authoritative source for a missed
+        // proposal, including its VRF proof and proposal context.
+        match self.finality_store.recover_finalized_v2(height).await {
+            Ok(Some(finalized)) if finalized.commit.block_id == block_id => {
+                self.respond_with_v2_block(finalized.proposal, finalized.block)
+                    .await;
+            }
+            Ok(Some(_)) => warn!(
+                "Refused V2 block request with a block ID different from durable height {}",
+                height
+            ),
+            Ok(None) => warn!(
+                "No durable or in-memory V2 candidate available for requested height {} block {:?}",
+                height, block_id
+            ),
+            Err(error) => warn!(
+                "Failed to recover durable V2 block for requested height {}: {}",
+                height, error
+            ),
+        }
+    }
+
+    async fn respond_to_v2_finality_request(&self, height: u64) {
+        match self.finality_store.recover_finalized_v2(height).await {
+            Ok(Some(finalized)) => self.respond_with_v2_finality(finalized).await,
+            Ok(None) => debug!(
+                "No durable V2 finality record exists at requested height {}",
+                height
+            ),
+            Err(error) => warn!(
+                "Failed to recover durable V2 finality at requested height {}: {}",
+                height, error
+            ),
+        }
+    }
+
+    async fn broadcast_v2_vote(&self, vote: SignedVote) -> Result<()> {
+        let envelope = ConsensusEnvelope {
+            wire_version: self.chain_context.wire_version,
+            protocol_version: vote.protocol_version,
+            chain_id: vote.chain_id,
+            genesis_hash: self.chain_context.genesis_hash,
+            payload: ConsensusMessage::Vote(vote),
+        };
+        let bytes = bincode::serialize(&envelope)
+            .map_err(|error| anyhow!("failed to encode V2 vote: {error}"))?;
+        self.network
+            .command_tx
+            .send(NetworkCommand::BroadcastConsensus(bytes))
+            .await
+            .map_err(|error| anyhow!("failed to enqueue V2 vote: {error}"))
+    }
+
+    async fn finalize_and_broadcast_commit(&self, commit: CommitCertificate) -> Result<()> {
+        self.finalize_commit(commit.clone()).await?;
+        let _ = self
+            .consensus_driver
+            .dispatch(ConsensusDriverEvent::FinalityDurable(commit.clone()))
+            .await;
+        let envelope = ConsensusEnvelope {
+            wire_version: self.chain_context.wire_version,
+            protocol_version: commit.protocol_version,
+            chain_id: commit.chain_id,
+            genesis_hash: self.chain_context.genesis_hash,
+            payload: ConsensusMessage::Commit(commit),
+        };
+        let bytes = bincode::serialize(&envelope)
+            .map_err(|error| anyhow!("failed to encode durable Commit broadcast: {error}"))?;
+        self.network
+            .command_tx
+            .send(NetworkCommand::BroadcastConsensus(bytes))
+            .await
+            .map_err(|error| anyhow!("failed to enqueue durable Commit broadcast: {error}"))
     }
 
     pub async fn run_loop(
         &mut self,
         mut network_events: tokio::sync::mpsc::Receiver<norn_network::service::NetworkEvent>,
     ) {
+        let mut pending_commits: HashMap<(u64, norn_common::types::BlockId), CommitCertificate> =
+            HashMap::new();
         loop {
             tokio::select! {
                 event = network_events.recv() => {
@@ -596,6 +1297,11 @@ impl NornNode {
                                 }
                                 norn_network::service::NetworkEvent::PeerAuthenticated { peer_id, role } => {
                                     info!("Authenticated network peer {:?} as {:?}", peer_id, role);
+                                    if let Ok(Some(tip)) = self.finality_store.recover_canonical_tip().await {
+                                        if let Ok(next_height) = tip.next_height() {
+                                            self.request_v2_finality(next_height).await;
+                                        }
+                                    }
                                 }
                                 norn_network::service::NetworkEvent::PeerDisconnected(peer_id) => {
                                     info!("Network peer disconnected: {:?}", peer_id);
@@ -615,6 +1321,10 @@ impl NornNode {
                                     self.tx_handler.handle_tx_data(data).await;
                                 }
                                 norn_network::service::NetworkEvent::ConsensusMessageReceived(data) => {
+                                    debug!(
+                                        "Node received consensus event ({} bytes)",
+                                        data.len()
+                                    );
                                     if data.len() > MAX_CONSENSUS_ENVELOPE_BYTES {
                                         warn!("Rejected oversized consensus network message");
                                         continue;
@@ -631,64 +1341,47 @@ impl NornNode {
                                         }
                                     };
                                     match envelope.payload {
-                                            ConsensusMessage::Proposal { proposal, block } => {
-                                                let Some(signer) = self.signer.clone() else {
-                                                    // FullNode validation is implemented in the later
-                                                    // proposal-validation phase. Until then it must not
-                                                    // manufacture a signer or imply that the payload was
-                                                    // fully validated.
-                                                    warn!("FullNode received Proposal; no local vote will be cast");
+                                            ConsensusMessage::ProposalV2 { proposal, block } => {
+                                                if let Err(err) = self
+                                                    .consensus_driver
+                                                    .dispatch(ConsensusDriverEvent::NetworkProposal {
+                                                        proposal: proposal.clone(),
+                                                        block: block.clone(),
+                                                    })
+                                                    .await
+                                                {
+                                                    warn!("Consensus driver rejected proposal event: {}", err);
                                                     continue;
-                                                };
-                                                if let Ok(Some(vote)) = self.consensus.handle_proposal(proposal, block, signer.as_ref()).await {
-                                                    let resp_env = ConsensusEnvelope {
-                                                        wire_version: self.chain_context.wire_version,
-                                                        protocol_version: vote.protocol_version,
-                                                        chain_id: vote.chain_id,
-                                                        genesis_hash: self.chain_context.genesis_hash,
-                                                        payload: ConsensusMessage::Vote(vote),
-                                                    };
-                                                    if let Ok(vote_msg) = bincode::serialize(&resp_env) {
-                                                        if let Err(err) = self
-                                                            .network
-                                                            .command_tx
-                                                            .send(NetworkCommand::BroadcastConsensus(vote_msg))
-                                                            .await
-                                                        {
-                                                            warn!("Failed to enqueue signed proposal vote: {}", err);
-                                                        }
-                                                    } else {
-                                                        warn!("Failed to encode signed proposal vote");
+                                                }
+                                                if let Err(err) = self
+                                                    .validate_and_remember_v2_candidate(
+                                                        proposal.clone(),
+                                                        block.clone(),
+                                                    )
+                                                    .await
+                                                {
+                                                    warn!("Rejected V2 proposal verification: {}", err);
+                                                    continue;
+                                                }
+                                                if let Some(commit) = pending_commits
+                                                    .remove(&(proposal.height, proposal.block_id))
+                                                {
+                                                    if let Err(err) = self.finalize_commit(commit).await {
+                                                        warn!("Validated V2 proposal could not satisfy pending Commit: {}", err);
                                                     }
                                                 }
-                                            }
-                                            ConsensusMessage::ProposalV2 { proposal, block } => {
-                                                if let Err(err) = block.validate_structure(
-                                                    &self.chain_context,
-                                                    &self.resource_limits,
-                                                ) {
-                                                    warn!("Rejected V2 proposal resource/commitment validation: {}", err);
-                                                    continue;
-                                                }
-                                                let latest = self.blockchain.latest_block.read().await;
-                                                let parent_matches = latest.header.block_hash
-                                                    == block.header.prev_block_hash
-                                                    && latest.header.height.checked_add(1)
-                                                        == Some(block.header.height);
-                                                drop(latest);
-                                                if !parent_matches {
-                                                    warn!("Rejected V2 proposal with non-canonical parent or height");
-                                                    continue;
-                                                }
                                                 let Some(signer) = self.signer.clone() else {
-                                                    warn!("FullNode received V2 Proposal; no local vote will be cast");
+                                                    info!(
+                                                        "FullNode verified V2 proposal at height {}; no vote will be cast",
+                                                        proposal.height
+                                                    );
                                                     continue;
                                                 };
-                                                if let Ok(Some(vote)) = self
+                                                match self
                                                     .consensus
                                                     .handle_proposal_v2(
-                                                        proposal,
-                                                        block,
+                                                        proposal.clone(),
+                                                        block.clone(),
                                                         signer.as_ref(),
                                                         &self.state_manager,
                                                         &self.resource_limits,
@@ -697,90 +1390,256 @@ impl NornNode {
                                                     )
                                                     .await
                                                 {
-                                                    let resp_env = ConsensusEnvelope {
-                                                        wire_version: self.chain_context.wire_version,
-                                                        protocol_version: vote.protocol_version,
-                                                        chain_id: vote.chain_id,
-                                                        genesis_hash: self.chain_context.genesis_hash,
-                                                        payload: ConsensusMessage::Vote(vote),
-                                                    };
-                                                    if let Ok(vote_msg) = bincode::serialize(&resp_env) {
-                                                        if let Err(err) = self
-                                                            .network
-                                                            .command_tx
-                                                            .send(NetworkCommand::BroadcastConsensus(vote_msg))
+                                                    Ok(Some(vote)) => {
+                                                        let precommit = match self
+                                                            .consensus
+                                                            .handle_vote(vote.clone(), signer.as_ref())
                                                             .await
                                                         {
-                                                            warn!("Failed to enqueue signed V2 proposal vote: {}", err);
+                                                        Ok((precommit, _)) => {
+                                                            if let Some(precommit) = precommit.as_ref() {
+                                                                if let Err(error) = self
+                                                                    .consensus
+                                                                    .handle_vote(
+                                                                        precommit.clone(),
+                                                                        signer.as_ref(),
+                                                                    )
+                                                                    .await
+                                                                {
+                                                                    warn!(
+                                                                        "Signed V2 precommit was not admitted locally: {}",
+                                                                        error
+                                                                    );
+                                                                }
+                                                            }
+                                                            precommit
                                                         }
-                                                    } else {
-                                                        warn!("Failed to encode signed V2 proposal vote");
+                                                        Err(error) => {
+                                                            warn!(
+                                                                "Signed V2 proposal vote was not admitted locally: {}",
+                                                                error
+                                                            );
+                                                            None
+                                                        }
+                                                        };
+                                                        if let Err(error) = self.broadcast_v2_vote(vote).await {
+                                                            warn!("Failed to enqueue signed V2 proposal vote: {}", error);
+                                                        }
+                                                        if let Some(precommit) = precommit {
+                                                            if let Err(error) =
+                                                                self.broadcast_v2_vote(precommit).await
+                                                            {
+                                                                warn!("Failed to enqueue signed V2 precommit: {}", error);
+                                                            }
+                                                        }
+                                                    }
+                                                    Ok(None) => {}
+                                                    Err(error) => {
+                                                        warn!(
+                                                            "Rejected V2 proposal during voting state transition at height {} round {} block {:?}: {}",
+                                                            proposal.height,
+                                                            proposal.round,
+                                                            proposal.block_id,
+                                                            error
+                                                        );
                                                     }
                                                 }
-                                            }
-                                            ConsensusMessage::Vote(vote) => {
-                                                let Some(signer) = self.signer.clone() else {
-                                                    warn!("FullNode received Vote; no local vote action will be produced");
-                                                    continue;
-                                                };
-                                                if let Ok((vote_opt, cert_opt)) = self.consensus.handle_vote(vote, signer.as_ref()).await {
-                                                    if let Some(precommit_vote) = vote_opt {
-                                                        let resp_env = ConsensusEnvelope {
-                                                            wire_version: self.chain_context.wire_version,
-                                                            protocol_version: precommit_vote.protocol_version,
-                                                            chain_id: precommit_vote.chain_id,
-                                                            genesis_hash: self.chain_context.genesis_hash,
-                                                            payload: ConsensusMessage::Vote(precommit_vote),
-                                                        };
-                                                        if let Ok(vote_msg) = bincode::serialize(&resp_env) {
-                                                            if let Err(err) = self
-                                                                .network
-                                                                .command_tx
-                                                                .send(NetworkCommand::BroadcastConsensus(vote_msg))
-                                                                .await
-                                                            {
-                                                                warn!("Failed to enqueue signed precommit vote: {}", err);
-                                                            }
-                                                        } else {
-                                                            warn!("Failed to encode signed precommit vote");
-                                                        }
-                                                     }
-                                                     if let Some(commit_cert) = cert_opt {
-                                                         match self.finalize_commit(commit_cert.clone()).await {
-                                                             Ok(()) => {
-                                                                 let commit_env = ConsensusEnvelope {
-                                                                     wire_version: self.chain_context.wire_version,
-                                                                     protocol_version: commit_cert.protocol_version,
-                                                                     chain_id: commit_cert.chain_id,
-                                                                     genesis_hash: self.chain_context.genesis_hash,
-                                                                     payload: ConsensusMessage::Commit(commit_cert),
-                                                                 };
-                                                                 match bincode::serialize(&commit_env) {
-                                                                     Ok(commit_msg) => {
-                                                                         if let Err(err) = self
-                                                                             .network
-                                                                             .command_tx
-                                                                             .send(NetworkCommand::BroadcastConsensus(commit_msg))
-                                                                             .await
-                                                                         {
-                                                                             warn!("Failed to enqueue durable Commit broadcast: {}", err);
-                                                                         }
-                                                                     }
-                                                                     Err(err) => warn!("Failed to encode durable Commit broadcast: {}", err),
-                                                                 }
-                                                             }
-                                                             Err(err) => error!(
-                                                                 "Finalized commit was not durably accepted; Commit will not be broadcast: {}",
-                                                                 err
-                                                             ),
-                                                         }
+                                             }
+                                             ConsensusMessage::BlockRequest { height, block_id } => {
+                                                 self.respond_to_v2_block_request(height, block_id).await;
+                                             }
+                                             ConsensusMessage::BlockResponse { proposal, block } => {
+                                                 if let Err(err) = self
+                                                     .consensus_driver
+                                                     .dispatch(ConsensusDriverEvent::NetworkProposal {
+                                                         proposal: proposal.clone(),
+                                                         block: block.clone(),
+                                                     })
+                                                     .await
+                                                 {
+                                                     warn!("Consensus driver rejected V2 block response: {}", err);
+                                                     continue;
+                                                 }
+                                                 if let Err(err) = self
+                                                     .validate_and_remember_v2_candidate(
+                                                         proposal.clone(),
+                                                         block,
+                                                     )
+                                                     .await
+                                                 {
+                                                     warn!("Rejected V2 block response: {}", err);
+                                                     continue;
+                                                 }
+                                                 if let Some(commit) = pending_commits
+                                                     .remove(&(proposal.height, proposal.block_id))
+                                                 {
+                                                     if let Err(err) = self.finalize_commit(commit).await {
+                                                         warn!("V2 block response could not satisfy pending Commit: {}", err);
                                                      }
                                                  }
                                              }
+                                             ConsensusMessage::FinalityRequest { height } => {
+                                                 self.respond_to_v2_finality_request(height).await;
+                                             }
+                                             ConsensusMessage::FinalityResponse { finalized } => {
+                                                 let height = finalized.commit.height;
+                                                 if let Err(err) = self
+                                                     .validate_and_remember_v2_candidate(
+                                                         finalized.proposal.clone(),
+                                                         finalized.block.clone(),
+                                                     )
+                                                     .await
+                                                 {
+                                                     warn!(
+                                                         "Rejected V2 finalized-record response at height {}: {}",
+                                                         height, err
+                                                     );
+                                                     continue;
+                                                 }
+                                                 if let Err(err) = self.finalize_commit(finalized.commit.clone()).await {
+                                                     warn!(
+                                                         "V2 finalized-record response could not be applied at height {}: {}",
+                                                         height, err
+                                                     );
+                                                     continue;
+                                                 }
+                                                if let Some(next_height) = height.checked_add(1) {
+                                                    self.request_v2_finality(next_height).await;
+                                                }
+                                             }
+                                             ConsensusMessage::Vote(vote) => {
+                                                if let Err(err) = self
+                                                    .consensus_driver
+                                                    .dispatch(ConsensusDriverEvent::NetworkVote(vote.clone()))
+                                                    .await
+                                                {
+                                                    warn!("Consensus driver rejected vote event: {}", err);
+                                                    continue;
+                                                }
+                                                let Some(signer) = self.signer.clone() else {
+                                                    if let Err(err) = self.consensus.verify_vote(&vote).await {
+                                                        warn!("FullNode rejected invalid V2 vote: {}", err);
+                                                    } else {
+                                                        info!("FullNode verified V2 vote; no local vote action will be produced");
+                                                    }
+                                                    continue;
+                                                };
+                                                 match self.consensus.handle_vote(vote.clone(), signer.as_ref()).await {
+                                                     Ok((vote_opt, cert_opt)) => {
+                                                     if let Some(precommit_vote) = vote_opt {
+                                                         info!(
+                                                             "Generated local V2 precommit for height {} round {} block {:?}",
+                                                             precommit_vote.height,
+                                                             precommit_vote.round,
+                                                             precommit_vote.block_id
+                                                         );
+                                                         let local_cert = match self
+                                                             .consensus
+                                                             .handle_vote(
+                                                                precommit_vote.clone(),
+                                                                signer.as_ref(),
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok((_, cert)) => cert,
+                                                            Err(error) => {
+                                                                warn!(
+                                                                    "Signed V2 precommit was not admitted locally: {}",
+                                                                    error
+                                                                );
+                                                                None
+                                                            }
+                                                        };
+                                                        if let Err(error) =
+                                                            self.broadcast_v2_vote(precommit_vote).await
+                                                        {
+                                                            warn!(
+                                                                "Failed to enqueue signed precommit vote: {}",
+                                                                error
+                                                            );
+                                                        }
+                                                        if let Some(commit_cert) = local_cert {
+                                                            if let Err(error) = self
+                                                                .finalize_and_broadcast_commit(commit_cert)
+                                                                .await
+                                                            {
+                                                                error!(
+                                                                    "Finalized commit was not durably accepted: {}",
+                                                                    error
+                                                                );
+                                                            }
+                                                        }
+                                                     }
+                                                         if let Some(commit_cert) = cert_opt {
+                                                         if let Err(err) = self
+                                                             .finalize_and_broadcast_commit(commit_cert)
+                                                             .await
+                                                         {
+                                                             error!(
+                                                                 "Finalized commit was not durably accepted; Commit will not be broadcast: {}",
+                                                                 err
+                                                             );
+                                                             }
+                                                         }
+                                                     }
+                                                     Err(error) => {
+                                                         warn!(
+                                                             "Rejected incoming V2 vote at height {} round {} step {:?} block {:?}: {}",
+                                                             vote.height,
+                                                             vote.round,
+                                                             vote.step,
+                                                             vote.block_id,
+                                                             error
+                                                         );
+                                                     }
+                                                 }
+                                              }
                                              ConsensusMessage::Commit(commit_cert) => {
+                                                 if let Err(err) = self
+                                                     .consensus_driver
+                                                     .dispatch(ConsensusDriverEvent::NetworkCommit(commit_cert.clone()))
+                                                     .await
+                                                 {
+                                                     error!("Consensus driver rejected Commit event: {}", err);
+                                                     continue;
+                                                 }
+                                                 let candidate_available = self
+                                                     .consensus
+                                                     .get_validated_candidate(
+                                                         commit_cert.height,
+                                                         commit_cert.block_id,
+                                                     )
+                                                     .await
+                                                     .is_some();
+                                                 let already_durable = self
+                                                     .finality_store
+                                                     .recover_finalized_v2(commit_cert.height)
+                                                     .await
+                                                     .ok()
+                                                     .flatten()
+                                                     .is_some();
+                                                 if !candidate_available && !already_durable {
+                                                     pending_commits.insert(
+                                                         (commit_cert.height, commit_cert.block_id),
+                                                         commit_cert.clone(),
+                                                     );
+                                                     self.request_v2_block(
+                                                         commit_cert.height,
+                                                         commit_cert.block_id,
+                                                     )
+                                                     .await;
+                                                     info!(
+                                                         "Queued Commit for missing V2 candidate at height {}; requested Proposal/Block",
+                                                         commit_cert.height
+                                                     );
+                                                     continue;
+                                                 }
                                                  if let Err(err) = self.finalize_commit(commit_cert).await {
                                                      error!("Failed to apply incoming Commit certificate: {}", err);
                                                  }
+                                             }
+                                             _ => {
+                                                 warn!("UnsupportedProtocolVersion: rejected legacy consensus payload");
                                              }
                                     }
                                 }

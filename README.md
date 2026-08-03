@@ -134,7 +134,7 @@ prv_key = "0000000000000000000000000000000000000000000000000000000000000001"
 [network]
 listen_address = "/ip4/0.0.0.0/tcp/4001"
 bootstrap_peers = []
-mdns = true
+mdns = false # V2 requires explicit bootstrap peers
 ```
 
 ---

@@ -5,9 +5,11 @@
 //! canonical address/key order. This prevents transaction order or hash-map
 //! iteration order from changing the state transition.
 
-use crate::evm::{CodeStorage, EVMCodeChange, EVMConfig, EVMContext, EVMExecutor};
+use crate::evm::{
+    CodeStorage, CodeStorageCheckpoint, EVMCodeChange, EVMConfig, EVMContext, EVMExecutor,
+};
 use crate::state::merkle::StateRootCalculator;
-use crate::state::{AccountState, AccountStateManager, AccountType};
+use crate::state::{AccountState, AccountStateManager, AccountType, StorageItem};
 use norn_common::error::{NornError, Result};
 use norn_common::genesis::ProtocolResourceLimits;
 use norn_common::types::Address;
@@ -100,6 +102,17 @@ pub struct V2BlockExecution {
     pub overlay: ExecutionOverlay,
     pub results: Vec<V2ExecutionResult>,
     pub gas_used: u64,
+}
+
+/// Full canonical state checkpoint written with a finalized V2 block. The
+/// granular keys are emitted from this value, while the root record provides
+/// one bounded recovery object that does not depend on a prior error result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanonicalStateCheckpoint {
+    pub state_root: norn_common::types::Hash,
+    pub accounts: Vec<AccountState>,
+    pub storage: Vec<(Address, Vec<StorageItem>)>,
+    pub code: CodeStorageCheckpoint,
 }
 
 /// Canonical commitment to deterministic execution results.
@@ -303,6 +316,59 @@ impl ExecutionOverlay {
             .iter()
             .map(|write| norn_common::utils::codec::serialize(write))
             .collect()
+    }
+
+    pub async fn canonical_state_checkpoint(
+        &self,
+        base: &AccountStateManager,
+        code_storage: &CodeStorage,
+    ) -> anyhow::Result<CanonicalStateCheckpoint> {
+        let projected = base.clone();
+        self.apply_account_storage_writes(&projected).await?;
+        let state_root = StateRootCalculator::new(false)
+            .calculate_from_manager(&projected)
+            .await?;
+
+        let mut accounts = projected
+            .accounts_map()
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect::<Vec<_>>();
+        accounts.sort_by_key(|account| account.address.0);
+
+        let mut storage = projected
+            .storage_map()
+            .iter()
+            .map(|entry| {
+                let mut items = entry.value().values().cloned().collect::<Vec<_>>();
+                items.sort_by(|left, right| left.key.cmp(&right.key));
+                (*entry.key(), items)
+            })
+            .collect::<Vec<_>>();
+        storage.sort_by_key(|(address, _)| address.0);
+
+        let projected_code = code_storage.fork().await?;
+        for write in self.ordered_writes() {
+            if let OverlayWrite::Code {
+                address,
+                new_hash,
+                code,
+                deleted,
+                ..
+            } = write
+            {
+                projected_code
+                    .apply_code_change(address, new_hash, code, deleted)
+                    .await?;
+            }
+        }
+
+        Ok(CanonicalStateCheckpoint {
+            state_root,
+            accounts,
+            storage,
+            code: projected_code.checkpoint().await,
+        })
     }
 
     /// Replay state writes recovered from a durable finalized transaction.

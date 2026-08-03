@@ -11,7 +11,9 @@ pub mod pruning;
 pub mod traits; // Unified trait for account state management // State pruning for storage optimization
 
 // Re-export the comprehensive account state manager and trait
-pub use account::{AccountState, AccountStateConfig, AccountStateManager, AccountType};
+pub use account::{
+    AccountState, AccountStateConfig, AccountStateManager, AccountType, StorageItem,
+};
 pub use history::{StateChangeRecord, StateChangeType, StateHistory, StateSnapshot};
 pub use persistent::{PersistentConfig, PersistentStateManager};
 pub use pruning::{PruningConfig, PruningResult, PruningStats, StatePruningManager};

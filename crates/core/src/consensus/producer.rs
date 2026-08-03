@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::{interval, Instant};
-use tracing::info;
+use tracing::{debug, info};
 
 use anyhow::{anyhow, Result};
 use norn_common::chain_context::ChainContext;
@@ -24,6 +24,7 @@ use crate::consensus::povf::PoVFEngine;
 use crate::consensus::types::ProposalSigner;
 use crate::evm::{CodeStorage, EIP1559FeeCalculator};
 use crate::execution::{calculate_v2_execution_data_hash, execute_v2_block, V2ExecutionContext};
+use crate::finality::FinalityStore;
 use crate::merkle::build_merkle_tree;
 use crate::state::merkle::StateRootCalculator;
 use crate::state::AccountStateManager;
@@ -84,6 +85,7 @@ pub struct BlockProducer {
     last_produced: Arc<RwLock<Option<Instant>>>,
     consensus_engine: Option<Arc<PoVFEngine>>,
     proposal_signer: Option<Arc<dyn ProposalSigner>>,
+    finality_store: Option<Arc<FinalityStore>>,
     fee_calculator: EIP1559FeeCalculator,
 }
 
@@ -112,6 +114,7 @@ impl BlockProducer {
             last_produced: Arc::new(RwLock::new(None)),
             consensus_engine,
             proposal_signer,
+            finality_store: None,
             fee_calculator,
         }
     }
@@ -127,6 +130,10 @@ impl BlockProducer {
         self.v2_code_storage = Some(code_storage);
     }
 
+    pub fn attach_finality_store(&mut self, finality_store: Arc<FinalityStore>) {
+        self.finality_store = Some(finality_store);
+    }
+
     /// Get current producer state
     pub async fn get_state(&self) -> ProducerState {
         *self.state.read().await
@@ -135,6 +142,7 @@ impl BlockProducer {
     /// Check if local node is the current BFT proposer
     pub async fn should_produce(&self) -> bool {
         if !self.config.is_validator {
+            info!("V2 producer disabled because node is not a validator");
             return false;
         }
 
@@ -147,7 +155,22 @@ impl BlockProducer {
 
         if let Some(ref engine) = self.consensus_engine {
             let sm = engine.state_machine.read().await;
-            sm.is_local_proposer()
+            let selected = sm.is_local_proposer();
+            debug!(
+                "V2 producer eligibility check height={} round={} local={:?} proposer={:?} selected={}",
+                sm.height,
+                sm.round,
+                sm.local_validator_id,
+                sm.get_current_proposer(),
+                selected
+            );
+            if selected {
+                debug!(
+                    "V2 producer eligible at height {} round {} for validator {:?}",
+                    sm.height, sm.round, sm.local_validator_id
+                );
+            }
+            selected
         } else {
             true
         }
@@ -337,19 +360,19 @@ impl BlockProducer {
         }
         let transactions = self.select_v2_transactions(tx_pool, limits);
 
-        let latest = self.blockchain.latest_block.read().await;
-        if latest.header.protocol_version != context.protocol_version
-            || latest.header.chain_id != context.chain_id
-        {
-            return Err(anyhow!("latest block does not match V2 chain context"));
-        }
-        if latest.header.height == i64::MAX {
-            return Err(anyhow!("block height overflow"));
-        }
-        let prev_hash = latest.header.block_hash;
-        let new_height = (latest.header.height + 1) as u64;
-        let parent_base_fee = latest.header.base_fee;
-        drop(latest);
+        let finality_store = self
+            .finality_store
+            .as_ref()
+            .ok_or_else(|| anyhow!("V2 production requires the canonical finality store"))?;
+        let tip = finality_store
+            .recover_canonical_tip()
+            .await?
+            .ok_or_else(|| anyhow!("canonical finalized tip is not initialized"))?;
+        let new_height = tip
+            .next_height()
+            .map_err(|error| anyhow!(error.to_string()))?;
+        let prev_hash = tip.block_id.0;
+        let parent_base_fee = tip.base_fee;
 
         let engine = self
             .consensus_engine
@@ -359,7 +382,12 @@ impl BlockProducer {
         let epoch = sm.current_epoch()?;
         let round = sm.round;
         let snapshot = sm.snapshot.clone();
-        let parent_randomness = sm.parent_randomness;
+        if snapshot.snapshot_hash != tip.active_snapshot_hash {
+            return Err(anyhow!(
+                "in-memory validator snapshot does not match canonical finalized tip"
+            ));
+        }
+        let parent_randomness = tip.next_randomness;
         drop(sm);
         let proposer = self
             .proposal_signer
@@ -479,7 +507,12 @@ impl BlockProducer {
         context: &ChainContext,
         limits: &ProtocolResourceLimits,
     ) -> Result<(Proposal, BlockV2)> {
+        debug!("Starting V2 proposal production");
         let block = self.produce_v2_block(context, limits).await?;
+        info!(
+            "V2 block template produced at height {}",
+            block.header.height
+        );
         let engine = self
             .consensus_engine
             .as_ref()

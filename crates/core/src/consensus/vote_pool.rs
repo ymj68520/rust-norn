@@ -63,6 +63,13 @@ impl VotePool {
             warn!("Rejected vote from unknown validator {:?}", vote.validator);
             return AddVoteResult::UnknownValidator;
         };
+        if !record.is_active_at(snapshot.epoch) {
+            warn!(
+                "Rejected vote from jailed or slashed validator {:?}",
+                vote.validator
+            );
+            return AddVoteResult::UnknownValidator;
+        }
 
         // Strict fail-closed secp256k1 ECDSA verification over canonical bytes
         if record.consensus_public_key.0 == [0u8; 33] || vote.signature == [0u8; 64] {
@@ -172,6 +179,9 @@ impl VotePool {
         for (validator_id, vote) in step_votes {
             if vote.block_id == block_id {
                 if let Some(record) = snapshot.validators.get(validator_id) {
+                    if !record.is_active_at(snapshot.epoch) {
+                        continue;
+                    }
                     accumulated_power =
                         match accumulated_power.checked_add(record.voting_power as u128) {
                             Some(val) => val,
@@ -295,6 +305,8 @@ mod tests {
                 consensus_public_key: norn_common::types::ConsensusPublicKey(pk1_bytes),
                 vrf_public_key: norn_common::types::VrfPublicKey::default(),
                 voting_power: 10,
+                jailed_until_epoch: None,
+                slashed: false,
             },
         );
         snapshot.validators.insert(
@@ -304,6 +316,8 @@ mod tests {
                 consensus_public_key: norn_common::types::ConsensusPublicKey(pk2_bytes),
                 vrf_public_key: norn_common::types::VrfPublicKey::default(),
                 voting_power: 10,
+                jailed_until_epoch: None,
+                slashed: false,
             },
         );
         snapshot.validators.insert(
@@ -313,6 +327,8 @@ mod tests {
                 consensus_public_key: norn_common::types::ConsensusPublicKey(pk3_bytes),
                 vrf_public_key: norn_common::types::VrfPublicKey::default(),
                 voting_power: 10,
+                jailed_until_epoch: None,
+                slashed: false,
             },
         );
 

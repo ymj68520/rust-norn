@@ -9,6 +9,10 @@ use std::path::Path;
 pub const GENESIS_SCHEMA_VERSION: u16 = 2;
 pub const GENESIS_IDENTITY_KEY: &[u8] = b"genesis_identity_v2";
 
+fn default_epoch_delay() -> u64 {
+    1
+}
+
 /// Consensus resource limits. They are part of the canonical Genesis
 /// document so validators cannot silently choose different execution bounds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +95,14 @@ pub struct GenesisConfig {
     pub chain_id: ChainId,
     pub epoch: u64,
     pub epoch_length: u64,
+    #[serde(default = "default_epoch_delay")]
+    pub validator_update_delay: u64,
+    #[serde(default = "default_epoch_delay")]
+    pub unbonding_delay: u64,
+    #[serde(default = "default_epoch_delay")]
+    pub key_rotation_delay: u64,
+    #[serde(default = "default_epoch_delay")]
+    pub slashing_activation_delay: u64,
     pub initial_randomness: Hash,
     pub resource_limits: ProtocolResourceLimits,
     pub genesis_block: Block,
@@ -106,6 +118,10 @@ impl GenesisConfig {
             chain_id: genesis_block.header.chain_id,
             epoch: genesis_block.header.epoch as u64,
             epoch_length: 1_000,
+            validator_update_delay: default_epoch_delay(),
+            unbonding_delay: default_epoch_delay(),
+            key_rotation_delay: default_epoch_delay(),
+            slashing_activation_delay: default_epoch_delay(),
             initial_randomness: genesis_block.header.parent_randomness,
             resource_limits: ProtocolResourceLimits::default(),
             genesis_block,
@@ -155,6 +171,15 @@ impl GenesisConfig {
         if self.epoch_length == 0 {
             return Err(NornError::Config(
                 "Genesis epoch length must be non-zero".into(),
+            ));
+        }
+        if self.validator_update_delay == 0
+            || self.unbonding_delay == 0
+            || self.key_rotation_delay == 0
+            || self.slashing_activation_delay == 0
+        {
+            return Err(NornError::Config(
+                "Genesis validator transition delays must be non-zero".into(),
             ));
         }
         if self.initial_randomness == Hash::default() {
@@ -219,6 +244,15 @@ impl GenesisConfig {
         // encoding is checked by the node/crypto boundary where those curve
         // implementations are available.
         if require_validators || !self.validators.is_empty() {
+            if self
+                .validators
+                .iter()
+                .any(|record| record.slashed || record.jailed_until_epoch.is_some())
+            {
+                return Err(NornError::Config(
+                    "Genesis validator records cannot be jailed or slashed".into(),
+                ));
+            }
             let snapshot = StakeSnapshot::from_genesis(self.epoch, self.validators.clone())?;
             if header.stake_snapshot_hash != snapshot.snapshot_hash {
                 return Err(NornError::Config(
@@ -268,6 +302,10 @@ impl GenesisConfig {
         bytes.extend_from_slice(&self.chain_id.0 .0);
         bytes.extend_from_slice(&self.epoch.to_be_bytes());
         bytes.extend_from_slice(&self.epoch_length.to_be_bytes());
+        bytes.extend_from_slice(&self.validator_update_delay.to_be_bytes());
+        bytes.extend_from_slice(&self.unbonding_delay.to_be_bytes());
+        bytes.extend_from_slice(&self.key_rotation_delay.to_be_bytes());
+        bytes.extend_from_slice(&self.slashing_activation_delay.to_be_bytes());
         bytes.extend_from_slice(&self.initial_randomness.0);
         bytes.extend_from_slice(&self.resource_limits.max_block_bytes.to_be_bytes());
         bytes.extend_from_slice(
@@ -321,6 +359,8 @@ fn append_validator(bytes: &mut Vec<u8>, record: &ValidatorRecord) {
     bytes.extend_from_slice(&record.consensus_public_key.0);
     bytes.extend_from_slice(&record.vrf_public_key.0);
     bytes.extend_from_slice(&record.voting_power.to_be_bytes());
+    bytes.extend_from_slice(&record.jailed_until_epoch.unwrap_or(u64::MAX).to_be_bytes());
+    bytes.push(u8::from(record.slashed));
 }
 
 /// 获取固定的创世块
@@ -484,12 +524,16 @@ mod tests {
             consensus_public_key: ConsensusPublicKey([2u8; 33]),
             vrf_public_key: VrfPublicKey([3u8; 32]),
             voting_power: 10,
+            jailed_until_epoch: None,
+            slashed: false,
         };
         let record_b = ValidatorRecord {
             validator_id: ValidatorId([4u8; 32]),
             consensus_public_key: ConsensusPublicKey([5u8; 33]),
             vrf_public_key: VrfPublicKey([6u8; 32]),
             voting_power: 20,
+            jailed_until_epoch: None,
+            slashed: false,
         };
 
         let mut first = GenesisConfig::from_fixed_genesis();
@@ -532,12 +576,16 @@ mod tests {
                 consensus_public_key: ConsensusPublicKey([2u8; 33]),
                 vrf_public_key: VrfPublicKey([3u8; 32]),
                 voting_power: 1,
+                jailed_until_epoch: None,
+                slashed: false,
             },
             ValidatorRecord {
                 validator_id: ValidatorId([4u8; 32]),
                 consensus_public_key: ConsensusPublicKey([2u8; 33]),
                 vrf_public_key: VrfPublicKey([6u8; 32]),
                 voting_power: 1,
+                jailed_until_epoch: None,
+                slashed: false,
             },
         ];
 

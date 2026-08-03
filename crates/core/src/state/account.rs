@@ -609,6 +609,33 @@ impl AccountStateManager {
         Ok(())
     }
 
+    /// Restore the canonical V2 account/storage image after its durable
+    /// checkpoint has been verified. This is intentionally separate from the
+    /// historical snapshot API so consensus recovery cannot accidentally use
+    /// an older legacy snapshot format.
+    pub async fn restore_canonical_state(
+        &self,
+        accounts: &[AccountState],
+        storage: &[(Address, Vec<StorageItem>)],
+        state_root: Hash,
+    ) -> Result<()> {
+        self.accounts.clear();
+        for account in accounts {
+            self.accounts.insert(account.address, account.clone());
+        }
+        self.storage.clear();
+        for (address, items) in storage {
+            let values = items
+                .iter()
+                .cloned()
+                .map(|item| (item.key.clone(), item))
+                .collect::<HashMap<_, _>>();
+            self.storage.insert(*address, values);
+        }
+        *self.state_root.write().await = state_root;
+        Ok(())
+    }
+
     /// 清理已删除的账户
     pub async fn cleanup_deleted_accounts(&self) -> Result<usize> {
         debug!("Cleaning up deleted accounts");

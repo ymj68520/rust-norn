@@ -37,6 +37,10 @@ pub struct NetworkHandshake {
     /// across different peers and lets receivers detect identity claims that
     /// do not match the authenticated transport source.
     pub peer_id: Vec<u8>,
+    /// Changes on every local connection attempt so a reconnected peer is not
+    /// hidden by gossipsub's duplicate-message cache.
+    #[serde(default)]
+    pub session_nonce: u64,
 }
 
 pub const MAX_HANDSHAKE_BYTES: usize = 1024;
@@ -55,11 +59,17 @@ impl NetworkHandshake {
             genesis_hash: context.genesis_hash,
             peer_role,
             peer_id: Vec::new(),
+            session_nonce: 0,
         }
     }
 
     pub fn with_peer_id(mut self, peer_id: impl Into<Vec<u8>>) -> Self {
         self.peer_id = peer_id.into();
+        self
+    }
+
+    pub fn with_session_nonce(mut self, session_nonce: u64) -> Self {
+        self.session_nonce = session_nonce;
         self
     }
 

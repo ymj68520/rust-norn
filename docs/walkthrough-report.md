@@ -1,194 +1,112 @@
-# Rust-Norn Comprehensive Refactoring Walkthrough Report
+# Rust-Norn V2 安全重构 Walkthrough
 
-## 1. Scope and conclusion
+## 1. 范围与结论
 
-本报告以提交 `a8631c5` 及其后的当前工作区为审查基线，覆盖已批准的
-Candidate v4 Final 八阶段安全重构计划。
+本报告以提交 `d282c8c` 为基线，覆盖后续 V2 P0 修复、网络恢复增强、依赖安全升级和最终验证。
 
-结论：八个实现阶段均已完成，阶段性测试门禁全部通过；项目可以作为
-Candidate 验收版本交付。按照既定要求，本报告不将当前代码标记为
-production-ready。正式上线前仍需要独立安全审计、长时间压力/故障演练和
-部署级验收。
+结论：Candidate V2 实现已完成，核心测试门禁通过；项目仍不标记为 `production-ready`。正式上线前仍需独立安全审计、长期故障演练、部署 runbook 和 release review。
 
-协议升级采用方案 A：不猜测兼容旧序列化数据，而是使用新的版本化协议对象
-和新的 canonical Genesis/chain identity。未知版本、错误 Genesis 或不匹配的
-数据库身份均 fail-closed。
-
-## 2. 整体执行路径
+## 2. 端到端执行路径
 
 ```mermaid
 flowchart TD
-    G[Canonical Genesis] --> C[ChainContext]
-    C --> H[Peer handshake + context topics]
-    H --> E[ConsensusEnvelope validation]
-    E --> T[TransactionV2 + resource limits]
-    T --> O[Deterministic ExecutionOverlay]
-    O --> V[VRF / proposer / Tendermint vote]
-    V --> W[Intent -> Safety WAL -> sign -> persisted vote]
-    W --> Q[Prevote / Precommit quorum]
-    Q --> F[Idempotent finality batch]
-    F --> R[Persisted overlay replay + next randomness]
+    G["Canonical Genesis"] --> C["ChainContext"]
+    C --> H["Authenticated V2 handshake"]
+    H --> E["ConsensusEnvelope validation"]
+    E --> T["TransactionV2 and resource limits"]
+    T --> O["Deterministic ExecutionOverlay"]
+    O --> V["VRF, proposer and Tendermint state"]
+    V --> W["VoteIntent -> Safety WAL -> signer"]
+    W --> Q["Prevote / Precommit quorum"]
+    Q --> F["Idempotent finality batch"]
+    F --> R["Durable state, tip and next randomness"]
 ```
 
-关键原则是：网络消息先绑定链身份，交易执行先产生无副作用的确定性写集，
-投票先持久化安全意图再签名，最终性先完成原子持久化再广播 Commit。
+关键安全顺序为：网络身份验证 → 纯执行与 commitment 校验 → WAL 持久化意图 → 签名及 SignedVote 持久化 → 广播 → 达成 finality → 单批次持久化并 flush → 更新缓存和广播 Commit。
 
-## 3. 八阶段实现结果
+## 3. 已完成的主要改动
 
-### 阶段一：链身份、Genesis 与节点角色
+### 链身份、Genesis 与版本
 
-- 引入 `NetworkMode`、`NodeRole`、`ChainContext`。
-- Genesis schema、canonical encoding、Genesis hash 和 snapshot hash 已版本化。
-- Production 缺少显式 Genesis、Validator 密钥不匹配、重复 ValidatorId/public key/VRF key、零权重、权重溢出或数据库 Genesis 不一致时启动失败。
-- FullNode 无验证者私钥可以启动，但不会产生投票。
-- 四份独立配置可生成相同 snapshot/proposer 序列。
+- 引入 `NetworkMode`、`NodeRole`、`ChainContext` 和版本化 Genesis schema。
+- Genesis canonical encoding、Genesis hash、Validator snapshot hash 和 proposer 序列均确定性生成。
+- Production 缺少 Genesis、Validator 密钥不匹配、重复身份、零权重、权重溢出或数据库 Genesis 不一致时 fail-closed。
+- V2 节点不依赖旧格式反序列化猜测；未知版本和旧 live Proposal 在网络入口拒绝。
 
-主要位置：`crates/node/src/config.rs`、`crates/common/src/genesis.rs`、
-`crates/common/src/chain_context.rs`。
+### 交易、区块与执行
 
-### 阶段二：严格网络入口
+- `TransactionV2` 移除 `block_hash`、`height`、`index` 等循环字段，交易 ID、Merkle root 和 BlockV2 commitment 自包含且稳定。
+- `ExecutionOverlay` 提供确定性读取、排序写集、状态根和执行结果 commitment；验证失败不会污染 live state。
+- 区块字节数、交易数、gas、签名成员数和 overlay 写集均受协议参数约束。
+- TxPoolV2 具备容量上限、ID 去重和确定性选择。
 
-- ConsensusEnvelope 绑定 `wire_version`、`protocol_version`、`chain_id`、
-  `genesis_hash` 和 payload。
-- topic namespace 同样绑定完整 ChainContext。
-- 握手加入发送方 PeerId，并要求它等于 libp2p transport source，避免不同
-  节点的相同 role/context 握手被 gossipsub 去重。
-- bootstrap/Dial 地址必须显式包含 `/p2p/<PeerId>`。
-- 只有完成握手的 Validator 可以发送 consensus；FullNode consensus 输入被拒绝。
+### VRF、随机性、epoch 与共识
 
-主要位置：`crates/network/src/event_loop.rs`、
-`crates/network/src/service.rs`、`crates/common/src/chain_context.rs`、
-`docs/network-wire-v2.md`。
+- VRF 使用 verify-and-derive，Proposal 不携带可伪造的 `vrf_score`。
+- 验证后的 randomness 唯一地成为下一高度的 `parent_randomness`。
+- proposer 选择绑定 chain、epoch、height、round、parent randomness 和 snapshot hash。
+- epoch snapshot、ValidatorChange、jailing、slashing 和延迟生效规则确定性执行。
+- Prevote、Precommit、NIL、锁定/解锁、valid round 和 timeout 规则固定并有状态机测试。
+- `ConsensusDriver` 使用单写入队列和 stale timeout token；ConsensusAction 采用 Intent/Ack 语义，避免签名失败或 WAL 失败时错误推进状态。
 
-### 阶段三：TransactionV2 与确定性执行
+### 网络与节点角色
 
-- 交易移除 `block_hash`、`height`、`index`，消除交易 ID、区块 hash 和 Merkle
-  root 的循环依赖。
-- 引入强类型 TransactionV2/BlockV2、canonical encoding、V2 Merkle/header commitment。
-- ExecutionOverlay 先执行、后统一产生有序写集和 projected state root，不在验证
-  阶段污染 live state。
-- TxPoolV2 使用有界容量、ID 去重和确定性选择，提议失败不会丢失交易。
-- 区块字节数、交易数、gas、写集和验证并发等限制由 Genesis 协议参数约束。
+- `ConsensusEnvelope`、topic namespace 和 handshake 绑定 wire/protocol version、chain ID、Genesis hash、角色及 PeerId。
+- bootstrap/Dial 地址必须显式包含 `/p2p/<PeerId>`，连接关闭后清除认证状态并重新握手。
+- V2 使用显式 `bootstrap_peers`；mDNS 不编译进 V2 行为，`mdns=true` 配置直接拒绝，避免未经认证的本地发现入口。
+- `libp2p` 升级至 `0.56`，并适配 Kademlia 配置 API。
+- FullNode 只执行验证、同步和 Commit 应用，不持有或调用验证者签名密钥。
+- Validator 与 FullNode 均可通过有序 FinalityResponse 恢复 canonical finalized records。
 
-主要位置：`crates/common/src/types.rs`、`crates/core/src/execution/overlay.rs`、
-`crates/core/src/txpool_v2.rs`、`docs/transaction-v2.md`。
+### Finality、存储与恢复
 
-### 阶段四：VRF、randomness、epoch 与证书
+- 所有 V2 路径使用统一 `CanonicalFinalizedTip`，严格检查高度、父哈希、状态根、epoch 和 randomness successor 关系。
+- block、certificate、tip、consensus state、snapshot 和 canonical state 使用同一 Sled batch 持久化。
+- `FinalizeTransactionId { height, block_id, certificate_hash }` 保证重复提交幂等；同高度不同 block fail-closed。
+- `apply_batch` 成功但 flush 返回错误或进程崩溃时，重启通过 durable marker 恢复完整旧状态或完整新状态，不依据瞬时错误类型猜测结果。
+- Commit 仅在持久化和 flush 成功后广播。
 
-- VRF 只通过 verify-and-derive 获得 randomness；proposal 不携带可伪造的
-  `vrf_score`。
-- randomness 只能由验证后的 VRF 派生，并作为下一高度的 parent randomness。
-- proposer 由 chain/epoch/height/round/parent randomness/snapshot hash 确定性选择。
-- epoch snapshot 规则固定，CommitCertificate 使用 ValidatorId 字节序 canonical 排序。
-- future height/round、证书成员数量和 snapshot 成员数量均受限。
+## 4. 依赖安全处理
 
-主要位置：`crates/core/src/consensus/povf.rs`、
-`crates/core/src/consensus/state_machine.rs`、
-`crates/common/src/consensus_types.rs`。
+本轮使用 `cargo audit` 检查 Cargo.lock，并完成以下可安全升级项：
 
-### 阶段五：Tendermint 状态机与 Intent/Ack
+- `bytes`、`crossbeam-epoch`、`time`
+- `libp2p 0.53 → 0.56`
+- `prometheus 0.13 → 0.14`，连带 `protobuf 2.28 → 3.7.2`
+- `ruint 1.17.2 → 1.20.0`
+- 移除 V2 默认构建中的 DNS/mDNS feature，清除实际网络构建中的旧 `ring` 和旧 `rustls-webpki` 链。
 
-状态转换顺序固定为：
+当前 `cargo audit --no-fetch --no-yanked` 仍报告 2 个 `hickory-proto 0.25.2` advisory，以及 13 个维护性/健壮性 warning。hickory 来自 libp2p 锁定元数据中的可选依赖；默认 feature tree 中不可达，但 cargo-audit 按 Cargo.lock 进行扫描，因此没有被静默忽略。该项仍需后续依赖链升级或经过审查的审计例外决策。
 
-```text
-VoteIntent
-  -> Safety WAL durable intent
-  -> real signer
-  -> durable SignedVote
-  -> broadcast
-  -> VotePersisted acknowledgement
-  -> state-machine step/lock transition
-```
+## 5. 验证结果
 
-- WAL 失败：不签名、不广播、不推进状态。
-- signer 失败：不广播，状态保持可重试。
-- 广播失败：已产生的签名只能重播同一票，不得改签其他 block。
-- 重启时恢复并重新广播 exact signed vote。
-- Proposal、Prevote、NIL、Precommit、锁定、解锁、timeout 和 finality 规则已写入
-  `docs/consensus-tendermint-v2.md`。
-
-主要位置：`crates/core/src/consensus/safety_store.rs`、
-`crates/core/src/consensus/state_machine.rs`、
-`docs/consensus-tendermint-v2.md`。
-
-### 阶段六：最终性原子提交与恢复
-
-- FinalizeTransactionId 为 `{height, block_id, certificate_hash}`。
-- 相同最终性事务重复提交幂等；同高度不同 block/certificate fail-closed。
-- block、certificate、consensus state、finalized marker、overlay write-set、
-  transaction marker 和 tip 在单次数据库 batch 中持久化。
-- `apply_batch` 成功但 `flush` 返回错误或进程崩溃时，重试通过 durable marker
-  判断结果，不依据调用时错误类型猜测状态。
-- 重启从 durable finalized record 恢复精确证书和写集；重复 Commit 不要求内存中仍有候选块。
-
-主要位置：`crates/core/src/finality.rs`、
-`crates/core/src/execution/overlay.rs`、`crates/node/src/service.rs`、
-`crates/core/src/blockchain.rs`。
-
-### 阶段七：P2P、Byzantine 与多进程验证
-
-- 网络库支持显式监听地址、Dial、bootstrap 连接和连接状态事件。
-- connection close 清除认证状态，reconnect 重新发布握手。
-- 进程内多节点测试覆盖两 Validator 和一个 FullNode。
-- OS 子进程测试 `stage7_process_test` 启动独立 Validator/Validator/FullNode worker，
-  验证跨进程 bootstrap、握手、Validator consensus 传递、FullNode consensus 拒绝和
-  错误 Genesis 隔离。
-
-主要位置：`crates/network/src/bin/stage7_worker.rs`、
-`crates/network/tests/stage7_process_test.rs`、
-`crates/network/src/service.rs`。
-
-### 阶段八：模型、fuzz 与最终门禁
-
-- bounded Tendermint lock/unlock model 穷举 lock round、candidate、valid round 和
-  certificate 组合，确认不同 block 只能凭有效 valid-round certificate 解锁。
-- wire fuzz corpus 对合法 envelope 每一位翻转，并执行 2,048 个有界伪随机 byte input；
-  decoder 均只返回错误或成功，不发生 panic 或无界分配。
-- `cargo test --workspace -j 1` 全部通过。
-- `cargo fmt --all -- --check` 和 `git diff --check` 通过。
-
-门禁清单见 `docs/verification-gate.md`。
-
-## 4. 已执行验证
+以下门禁已通过：
 
 ```text
-cargo test --workspace -j 1
-cargo test -p norn-network --test stage7_process_test -- --nocapture
-cargo test -p norn-core --test four_node_bft_test -- --nocapture
-cargo test -p norn-core --lib finality -- --nocapture
+cargo check --workspace --all-features --locked
+cargo clippy --workspace --all-targets --locked
 cargo fmt --all -- --check
 git diff --check
+cargo test --workspace --locked -j 1
+cargo test -p norn-network --lib --locked
+cargo test -p norn --test four_process_v2_bft --locked
 ```
 
-最终 workspace 回归结果包括：
+最终结果包括：
 
-- `norn-common`：37 tests passed；
-- `norn-core`：236 library tests passed；
-- `norn-network`：13 library tests passed；
-- OS process network test：1 passed；
-- four-node BFT integration：1 passed；
-- 其余 workspace crates/integration targets：全部 passed，无 failed。
-
-编译输出仍有既有 unused/deprecated/config warning，但没有编译错误或测试失败。
-
-## 5. 后续事项与上线边界
-
-实现阶段没有阻塞性后续任务。以下是 production 前的独立验收事项，而不是本轮
-Candidate 实现缺口：
-
-1. 对共识、VRF、签名、Genesis migration 和持久化恢复进行独立第三方安全审计；
-2. 在目标操作系统和实际文件系统上进行长时间 crash/kill、磁盘满、I/O error、网络分区和重连演练；
-3. 在 CI/隔离环境中追加 native libFuzzer 长时间运行，并记录 corpus、覆盖率和崩溃复现结果；
-4. 按新 Genesis 网络策略编写正式部署、密钥轮换、回滚和数据库备份恢复 runbook；
-5. 通过正式 release review 后，才能将 Candidate 改为 production-ready。
+- workspace 测试全部通过，无失败；
+- core 237 个 library tests 通过；
+- common 39 个 tests 通过；
+- 四进程 Validator/FullNode BFT 测试通过，覆盖十个高度、proposer kill/restart、恢复和网络隔离；
+- 网络 crate 最终 14 个测试通过；
+- 编译仅剩既有 unused、deprecated、unexpected-cfg 等 warning，无编译错误。
 
 ## 6. 最终状态
 
-本次 walkthrough 结论为：
-
 ```text
-Implementation: complete
+Implementation: complete for approved Candidate V2 scope
 Verification gates: passed
-Protocol migration policy: decided (new Genesis + versioned objects)
+Cargo audit: 2 hickory advisories + 13 warnings remain
 Production status: Candidate only
+Commit status: this report and current changes are ready for review
 ```

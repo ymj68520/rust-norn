@@ -88,7 +88,7 @@ impl NetworkService {
             .collect::<Result<Vec<_>>>()?;
 
         let transport = build_transport(&keypair)?;
-        let behaviour = build_behaviour(&keypair, &local_peer_id, &config);
+        let behaviour = build_behaviour(&keypair, &local_peer_id, &config)?;
 
         let mut swarm = SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()

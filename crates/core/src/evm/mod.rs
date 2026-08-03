@@ -28,7 +28,7 @@ pub use access_list::{
 };
 pub use benchmarks::{BenchmarkResult, BenchmarkSuite};
 pub use blockhash::{BlockHistory, MAX_BLOCK_HASH_HISTORY};
-pub use code_storage::CodeStorage;
+pub use code_storage::{CodeStorage, CodeStorageCheckpoint};
 pub use eip1559::{EIP1559Config, EIP1559FeeCalculator};
 pub use error::{EVMError, EVMResult};
 pub use executor::{EVMExecutionResult, EVMExecutor, ExecutionLog};

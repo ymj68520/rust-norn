@@ -157,8 +157,38 @@ impl CommitCertificate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConsensusMessage {
-    Proposal { proposal: Proposal, block: Block },
-    ProposalV2 { proposal: Proposal, block: BlockV2 },
+    Proposal {
+        proposal: Proposal,
+        block: Block,
+    },
+    ProposalV2 {
+        proposal: Proposal,
+        block: BlockV2,
+    },
+    /// Request a V2 block/proposal pair needed to verify a Commit received
+    /// after a restart or while the original proposal was not observed.
+    BlockRequest {
+        height: u64,
+        block_id: BlockId,
+    },
+    /// Response to BlockRequest. The proposal is carried as well as the block
+    /// because the VRF-derived next randomness is not recoverable from a
+    /// block header alone.
+    BlockResponse {
+        proposal: Proposal,
+        block: BlockV2,
+    },
+    /// Request one durable V2 finalized record by height. FullNodes use this
+    /// after restart to catch up through heights whose Commit broadcasts were
+    /// missed while they were offline.
+    FinalityRequest {
+        height: u64,
+    },
+    /// Response to FinalityRequest. The durable record contains the exact
+    /// proposal/block pair and certificate required for verify-only replay.
+    FinalityResponse {
+        finalized: FinalizedBlockV2,
+    },
     Vote(SignedVote),
     Commit(CommitCertificate),
 }
@@ -311,6 +341,67 @@ impl ConsensusEnvelope {
                     validate_prevote_certificate(certificate, proposal)?;
                 }
             }
+            ConsensusMessage::BlockRequest { height, block_id } => {
+                if *height == 0 || *block_id == BlockId(Hash::default()) {
+                    return Err(protocol_error(
+                        "V2 block request has an invalid height or block ID",
+                    ));
+                }
+            }
+            ConsensusMessage::BlockResponse { proposal, block } => {
+                validate_shared_context(
+                    proposal.protocol_version,
+                    proposal.chain_id,
+                    proposal.epoch,
+                    proposal.height,
+                    proposal.round,
+                    proposal.stake_snapshot_hash,
+                    self,
+                )?;
+                if proposal.block_id != BlockId(block.header.block_hash)
+                    || proposal.parent_block_hash != block.header.prev_block_hash
+                    || proposal.protocol_version != block.header.protocol_version
+                    || proposal.chain_id != block.header.chain_id
+                    || proposal.epoch != block.header.epoch
+                    || proposal.round != block.header.round
+                    || proposal.stake_snapshot_hash != block.header.stake_snapshot_hash
+                    || proposal.proposer != block.header.proposer
+                    || block.header.height < 0
+                    || proposal.height != block.header.height as u64
+                {
+                    return Err(protocol_error(
+                        "V2 block response proposal and block contexts do not match",
+                    ));
+                }
+                block.validate_structure(
+                    &ChainContext {
+                        wire_version: self.wire_version,
+                        genesis_schema_version: 0,
+                        protocol_version: self.protocol_version,
+                        chain_id: self.chain_id,
+                        genesis_hash: self.genesis_hash,
+                    },
+                    &crate::genesis::ProtocolResourceLimits::default(),
+                )?;
+                if proposal.proposer.0 == [0u8; 32]
+                    || proposal.stake_snapshot_hash.0 == [0u8; 32]
+                    || proposal.vrf_preout == [0u8; 32]
+                    || proposal.vrf_proof == [0u8; 64]
+                    || proposal.signature == [0u8; 64]
+                {
+                    return Err(protocol_error(
+                        "V2 block response contains a zero identity or proof field",
+                    ));
+                }
+            }
+            ConsensusMessage::FinalityRequest { height } => {
+                if *height == 0 {
+                    return Err(protocol_error("V2 finality request has an invalid height"));
+                }
+            }
+            ConsensusMessage::FinalityResponse { finalized } => {
+                validate_finalized_v2(finalized, self)?;
+            }
             ConsensusMessage::Vote(vote) => {
                 validate_shared_context(
                     vote.protocol_version,
@@ -413,6 +504,109 @@ fn validate_shared_context(
         return Err(protocol_error("consensus payload height must be non-zero"));
     }
     let _ = (epoch, round);
+    Ok(())
+}
+
+fn validate_finalized_v2(finalized: &FinalizedBlockV2, envelope: &ConsensusEnvelope) -> Result<()> {
+    let proposal = &finalized.proposal;
+    let block = &finalized.block;
+    let certificate = &finalized.commit;
+    let consensus_state = &finalized.consensus_state;
+
+    validate_shared_context(
+        proposal.protocol_version,
+        proposal.chain_id,
+        proposal.epoch,
+        proposal.height,
+        proposal.round,
+        proposal.stake_snapshot_hash,
+        envelope,
+    )?;
+    if proposal.block_id != BlockId(block.header.block_hash)
+        || proposal.parent_block_hash != block.header.prev_block_hash
+        || proposal.protocol_version != block.header.protocol_version
+        || proposal.chain_id != block.header.chain_id
+        || proposal.epoch != block.header.epoch
+        || proposal.round != block.header.round
+        || proposal.stake_snapshot_hash != block.header.stake_snapshot_hash
+        || proposal.proposer != block.header.proposer
+        || block.header.height < 0
+        || proposal.height != block.header.height as u64
+    {
+        return Err(protocol_error(
+            "V2 finalized record proposal and block contexts do not match",
+        ));
+    }
+    block.validate_structure(
+        &ChainContext {
+            wire_version: envelope.wire_version,
+            genesis_schema_version: 0,
+            protocol_version: envelope.protocol_version,
+            chain_id: envelope.chain_id,
+            genesis_hash: envelope.genesis_hash,
+        },
+        &crate::genesis::ProtocolResourceLimits::default(),
+    )?;
+    if proposal.proposer.0 == [0u8; 32]
+        || proposal.stake_snapshot_hash.0 == [0u8; 32]
+        || proposal.vrf_preout == [0u8; 32]
+        || proposal.vrf_proof == [0u8; 64]
+        || proposal.signature == [0u8; 64]
+    {
+        return Err(protocol_error(
+            "V2 finalized record contains a zero identity or proof field",
+        ));
+    }
+    if proposal.valid_round.is_some() && proposal.valid_round_certificate.is_none() {
+        return Err(protocol_error(
+            "V2 finalized record valid round is missing its certificate",
+        ));
+    }
+    if let Some(certificate) = &proposal.valid_round_certificate {
+        validate_prevote_certificate(certificate, proposal)?;
+    }
+
+    validate_shared_context(
+        certificate.protocol_version,
+        certificate.chain_id,
+        certificate.epoch,
+        certificate.height,
+        certificate.round,
+        certificate.stake_snapshot_hash,
+        envelope,
+    )?;
+    if certificate.block_id != proposal.block_id
+        || certificate.height != proposal.height
+        || certificate.round != proposal.round
+        || certificate.precommits.is_empty()
+        || certificate.precommits.len() > MAX_CONSENSUS_CERTIFICATE_VOTES
+    {
+        return Err(protocol_error(
+            "V2 finalized record certificate does not match its proposal",
+        ));
+    }
+    validate_precommit_order(certificate)?;
+    for vote in &certificate.precommits {
+        validate_vote_context(vote, certificate)?;
+        if vote.step != VoteStep::Precommit
+            || vote.block_id != Some(certificate.block_id)
+            || vote.validator.0 == [0u8; 32]
+            || vote.signature == [0u8; 64]
+        {
+            return Err(protocol_error(
+                "V2 finalized record contains an invalid precommit",
+            ));
+        }
+    }
+    if consensus_state.height != certificate.height
+        || consensus_state.finalized_block_id != certificate.block_id
+        || consensus_state.commit_certificate_hash != certificate.certificate_hash()
+        || consensus_state.active_stake_snapshot_hash != block.header.stake_snapshot_hash
+    {
+        return Err(protocol_error(
+            "V2 finalized record consensus state does not match its certificate",
+        ));
+    }
     Ok(())
 }
 
@@ -722,6 +916,92 @@ pub struct FinalizedConsensusState {
     pub commit_certificate_hash: Hash,
     pub next_randomness: Hash,
     pub active_stake_snapshot_hash: StakeSnapshotHash,
+    #[serde(default)]
+    pub pending_validator_changes: PendingValidatorChanges,
+}
+
+/// The single canonical finalized-chain authority used by V2 production,
+/// proposal validation, execution recovery, and RPC-facing tip reads.
+///
+/// This is intentionally richer than a height/hash pointer: the next block's
+/// parent randomness and active validator snapshot are consensus inputs, while
+/// the state root and base fee bind execution to the same finalized parent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CanonicalFinalizedTip {
+    pub height: u64,
+    pub block_id: BlockId,
+    pub state_root: Hash,
+    pub base_fee: u64,
+    pub next_randomness: Hash,
+    pub active_snapshot_hash: StakeSnapshotHash,
+    pub epoch: u64,
+}
+
+impl CanonicalFinalizedTip {
+    pub fn from_genesis(
+        genesis: &Block,
+        active_snapshot_hash: StakeSnapshotHash,
+        next_randomness: Hash,
+    ) -> Result<Self> {
+        if genesis.header.height != 0 || genesis.header.block_hash == Hash::default() {
+            return Err(NornError::ConsensusError(
+                "canonical Genesis tip has an invalid height or block ID".into(),
+            ));
+        }
+        Ok(Self {
+            height: 0,
+            block_id: BlockId(genesis.header.block_hash),
+            state_root: genesis.header.state_root,
+            base_fee: genesis.header.base_fee,
+            next_randomness,
+            active_snapshot_hash,
+            epoch: genesis.header.epoch as u64,
+        })
+    }
+
+    pub fn from_finalized(finalized: &FinalizedBlockV2) -> Result<Self> {
+        if finalized.block.header.height < 0
+            || finalized.block.header.block_hash == Hash::default()
+            || finalized.commit.block_id != BlockId(finalized.block.header.block_hash)
+            || finalized.consensus_state.height != finalized.commit.height
+        {
+            return Err(NornError::ConsensusError(
+                "canonical finalized tip does not match finalized block".into(),
+            ));
+        }
+        Ok(Self {
+            height: finalized.commit.height,
+            block_id: finalized.commit.block_id,
+            state_root: finalized.block.header.state_root,
+            base_fee: finalized.block.header.base_fee,
+            next_randomness: finalized.consensus_state.next_randomness,
+            active_snapshot_hash: finalized.consensus_state.active_stake_snapshot_hash,
+            epoch: finalized.block.header.epoch as u64,
+        })
+    }
+
+    pub fn from_finalized_with_next_snapshot(
+        finalized: &FinalizedBlockV2,
+        next_snapshot: Option<&StakeSnapshot>,
+    ) -> Result<Self> {
+        let mut tip = Self::from_finalized(finalized)?;
+        if let Some(snapshot) = next_snapshot {
+            if snapshot.epoch < tip.epoch {
+                return Err(NornError::ConsensusError(
+                    "next validator snapshot regresses canonical tip epoch".into(),
+                ));
+            }
+            tip.active_snapshot_hash = snapshot.snapshot_hash;
+            tip.epoch = snapshot.epoch;
+        }
+        Ok(tip)
+    }
+
+    pub fn next_height(&self) -> Result<u64> {
+        self.height
+            .checked_add(1)
+            .ok_or_else(|| NornError::ConsensusError("canonical tip height overflow".into()))
+    }
 }
 
 impl FinalizedConsensusState {
@@ -750,6 +1030,7 @@ impl FinalizedConsensusState {
             commit_certificate_hash: commit.certificate_hash(),
             next_randomness,
             active_stake_snapshot_hash: block.header.stake_snapshot_hash,
+            pending_validator_changes: PendingValidatorChanges::default(),
         })
     }
 
@@ -774,6 +1055,10 @@ pub struct FinalizedBlock {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FinalizedBlockV2 {
+    /// The verified proposal is durable with the finalized block so a
+    /// FullNode that missed the proposal can recover the VRF proof and derive
+    /// the committed next randomness from the finality record alone.
+    pub proposal: Proposal,
     pub block: BlockV2,
     pub commit: CommitCertificate,
     pub consensus_state: FinalizedConsensusState,
@@ -811,6 +1096,151 @@ pub struct ValidatorRecord {
     pub consensus_public_key: ConsensusPublicKey,
     pub vrf_public_key: VrfPublicKey,
     pub voting_power: u64,
+    #[serde(default)]
+    pub jailed_until_epoch: Option<u64>,
+    #[serde(default)]
+    pub slashed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValidatorChange {
+    Add(ValidatorRecord),
+    Remove {
+        validator_id: ValidatorId,
+    },
+    SetVotingPower {
+        validator_id: ValidatorId,
+        voting_power: u64,
+    },
+    RotateKeys {
+        validator_id: ValidatorId,
+        consensus_public_key: ConsensusPublicKey,
+        vrf_public_key: VrfPublicKey,
+    },
+    Jail {
+        validator_id: ValidatorId,
+        until_epoch: u64,
+    },
+    Unjail {
+        validator_id: ValidatorId,
+    },
+    Slash {
+        validator_id: ValidatorId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingValidatorChange {
+    pub effective_epoch: u64,
+    pub change: ValidatorChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PendingValidatorChanges {
+    pub changes: Vec<PendingValidatorChange>,
+}
+
+impl PendingValidatorChanges {
+    pub fn queue(&mut self, change: PendingValidatorChange) -> Result<()> {
+        if change.effective_epoch == 0 {
+            return Err(NornError::ConsensusError(
+                "validator change must target a non-zero epoch".into(),
+            ));
+        }
+        self.changes.push(change);
+        self.changes.sort_by(|left, right| {
+            left.effective_epoch
+                .cmp(&right.effective_epoch)
+                .then_with(|| {
+                    bincode::serialize(&left.change)
+                        .unwrap_or_default()
+                        .cmp(&bincode::serialize(&right.change).unwrap_or_default())
+                })
+        });
+        Ok(())
+    }
+
+    /// Apply all changes between the current snapshot and `epoch`, in their
+    /// canonical effective-epoch/order sequence. This matters when a node
+    /// recovers across more than one epoch boundary: applying only the target
+    /// epoch would silently skip an earlier queued update.
+    pub fn snapshot_for_epoch(&self, current: &StakeSnapshot, epoch: u64) -> Result<StakeSnapshot> {
+        if epoch < current.epoch {
+            return Err(NornError::ConsensusError(
+                "validator snapshot cannot move backwards across epochs".into(),
+            ));
+        }
+        let mut records = current.validators.clone();
+        for pending in self.changes.iter().filter(|change| {
+            change.effective_epoch > current.epoch && change.effective_epoch <= epoch
+        }) {
+            match &pending.change {
+                ValidatorChange::Add(record) => {
+                    if record.slashed {
+                        return Err(NornError::ConsensusError(
+                            "a slashed validator cannot be added to a snapshot".into(),
+                        ));
+                    }
+                    if records.contains_key(&record.validator_id) {
+                        return Err(NornError::ConsensusError(
+                            "validator change adds a duplicate ValidatorId".into(),
+                        ));
+                    }
+                    records.insert(record.validator_id, record.clone());
+                }
+                ValidatorChange::Remove { validator_id } => {
+                    records.remove(validator_id);
+                }
+                ValidatorChange::SetVotingPower {
+                    validator_id,
+                    voting_power,
+                } => {
+                    let record = records.get_mut(validator_id).ok_or_else(|| {
+                        NornError::ConsensusError(
+                            "validator power update targets an unknown validator".into(),
+                        )
+                    })?;
+                    record.voting_power = *voting_power;
+                }
+                ValidatorChange::RotateKeys {
+                    validator_id,
+                    consensus_public_key,
+                    vrf_public_key,
+                } => {
+                    let record = records.get_mut(validator_id).ok_or_else(|| {
+                        NornError::ConsensusError(
+                            "validator key rotation targets an unknown validator".into(),
+                        )
+                    })?;
+                    record.consensus_public_key = *consensus_public_key;
+                    record.vrf_public_key = *vrf_public_key;
+                }
+                ValidatorChange::Jail {
+                    validator_id,
+                    until_epoch,
+                } => {
+                    let record = records.get_mut(validator_id).ok_or_else(|| {
+                        NornError::ConsensusError("jail targets an unknown validator".into())
+                    })?;
+                    record.jailed_until_epoch = Some(*until_epoch);
+                }
+                ValidatorChange::Unjail { validator_id } => {
+                    let record = records.get_mut(validator_id).ok_or_else(|| {
+                        NornError::ConsensusError("unjail targets an unknown validator".into())
+                    })?;
+                    record.jailed_until_epoch = None;
+                }
+                ValidatorChange::Slash { validator_id } => {
+                    let record = records.get_mut(validator_id).ok_or_else(|| {
+                        NornError::ConsensusError("slash targets an unknown validator".into())
+                    })?;
+                    record.slashed = true;
+                }
+            }
+        }
+        let records = records.into_values().collect::<Vec<_>>();
+        StakeSnapshot::from_genesis(epoch, records)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -883,10 +1313,24 @@ impl StakeSnapshot {
     }
 
     pub fn total_voting_power(&self) -> Result<u128> {
-        self.validators.values().try_fold(0u128, |acc, v| {
-            acc.checked_add(v.voting_power as u128)
-                .ok_or_else(|| NornError::ConsensusError("Voting power overflow".into()))
-        })
+        self.validators
+            .values()
+            .filter(|v| {
+                !v.slashed
+                    && !v
+                        .jailed_until_epoch
+                        .is_some_and(|until_epoch| self.epoch < until_epoch)
+            })
+            .try_fold(0u128, |acc, v| {
+                acc.checked_add(v.voting_power as u128)
+                    .ok_or_else(|| NornError::ConsensusError("Voting power overflow".into()))
+            })
+    }
+
+    pub fn is_active_validator(&self, validator_id: &ValidatorId) -> bool {
+        self.validators
+            .get(validator_id)
+            .is_some_and(|record| record.is_active_at(self.epoch))
     }
 
     /// Reuse the validator set at an epoch boundary while changing only the
@@ -906,11 +1350,22 @@ impl StakeSnapshot {
             hasher.update(&record.consensus_public_key.0);
             hasher.update(&record.vrf_public_key.0);
             hasher.update(&record.voting_power.to_be_bytes());
+            hasher.update(&record.jailed_until_epoch.unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update([u8::from(record.slashed)]);
         }
         let res = hasher.finalize();
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&res);
         StakeSnapshotHash(arr)
+    }
+}
+
+impl ValidatorRecord {
+    pub fn is_active_at(&self, epoch: u64) -> bool {
+        !self.slashed
+            && !self
+                .jailed_until_epoch
+                .is_some_and(|until_epoch| epoch < until_epoch)
     }
 }
 
@@ -924,6 +1379,8 @@ mod finalized_consensus_state_tests {
             consensus_public_key: ConsensusPublicKey([id; 33]),
             vrf_public_key: VrfPublicKey([id; 32]),
             voting_power: u64::from(id),
+            jailed_until_epoch: None,
+            slashed: false,
         }
     }
 
@@ -933,6 +1390,68 @@ mod finalized_consensus_state_tests {
         let second = StakeSnapshot::from_genesis(2, vec![record(2), record(1)]).unwrap();
         assert_ne!(first.snapshot_hash, second.snapshot_hash);
         assert_eq!(first.for_epoch(2).unwrap(), second);
+    }
+
+    #[test]
+    fn pending_changes_apply_intermediate_epochs_and_preserve_slashing_state() {
+        let current = StakeSnapshot::from_genesis(1, vec![record(1), record(2)]).unwrap();
+        let mut pending = PendingValidatorChanges::default();
+        pending
+            .queue(PendingValidatorChange {
+                effective_epoch: 2,
+                change: ValidatorChange::Jail {
+                    validator_id: ValidatorId([1; 32]),
+                    until_epoch: 4,
+                },
+            })
+            .unwrap();
+        pending
+            .queue(PendingValidatorChange {
+                effective_epoch: 3,
+                change: ValidatorChange::Slash {
+                    validator_id: ValidatorId([2; 32]),
+                },
+            })
+            .unwrap();
+        pending
+            .queue(PendingValidatorChange {
+                effective_epoch: 3,
+                change: ValidatorChange::Add(record(3)),
+            })
+            .unwrap();
+
+        let next = pending.snapshot_for_epoch(&current, 3).unwrap();
+        assert_eq!(next.epoch, 3);
+        assert!(next.validators[&ValidatorId([1; 32])].jailed_until_epoch == Some(4));
+        assert!(next.validators[&ValidatorId([2; 32])].slashed);
+        assert!(!next.is_active_validator(&ValidatorId([1; 32])));
+        assert!(!next.is_active_validator(&ValidatorId([2; 32])));
+        assert!(next.is_active_validator(&ValidatorId([3; 32])));
+        assert_eq!(next.total_voting_power().unwrap(), 3);
+    }
+
+    #[test]
+    fn pending_changes_reject_backward_epoch_and_duplicate_keys() {
+        let current = StakeSnapshot::from_genesis(2, vec![record(1)]).unwrap();
+        let pending = PendingValidatorChanges::default();
+        assert!(pending.snapshot_for_epoch(&current, 1).is_err());
+
+        let duplicate = ValidatorRecord {
+            validator_id: ValidatorId([2; 32]),
+            consensus_public_key: ConsensusPublicKey([1; 33]),
+            vrf_public_key: VrfPublicKey([2; 32]),
+            voting_power: 1,
+            jailed_until_epoch: None,
+            slashed: false,
+        };
+        let mut pending = PendingValidatorChanges::default();
+        pending
+            .queue(PendingValidatorChange {
+                effective_epoch: 3,
+                change: ValidatorChange::Add(duplicate),
+            })
+            .unwrap();
+        assert!(pending.snapshot_for_epoch(&current, 3).is_err());
     }
 
     #[test]

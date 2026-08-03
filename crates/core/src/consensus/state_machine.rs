@@ -6,8 +6,8 @@ use super::vote_pool::{AddVoteResult, VotePool};
 use anyhow::{anyhow, Result};
 use k256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use norn_common::consensus_types::{
-    CommitCertificate, FinalizedConsensusState, PrevoteCertificate, Proposal, SignedVote,
-    StakeSnapshot, VoteStep,
+    CommitCertificate, FinalizedConsensusState, PendingValidatorChange, PendingValidatorChanges,
+    PrevoteCertificate, Proposal, SignedVote, StakeSnapshot, ValidatorChange, VoteStep,
 };
 use norn_common::types::{Block, BlockHeader, BlockId, BlockV2, ValidatorId};
 use norn_crypto::vrf::{VRFPreOutBytes, VRFProofBytes, VerifiedVrfOutput, VrfContext};
@@ -32,6 +32,7 @@ pub struct TendermintStateMachine {
     pub vote_pool: VotePool,
     pub safety_store: Arc<dyn ConsensusSafetyStore>,
     pub local_validator_id: Option<ValidatorId>,
+    pub pending_validator_changes: PendingValidatorChanges,
 }
 
 /// A side-effect-free request emitted by the consensus state machine.  The
@@ -95,6 +96,7 @@ mod tests {
             commit_certificate_hash: Hash([3; 32]),
             next_randomness: Hash([4; 32]),
             active_stake_snapshot_hash: snapshot.snapshot_hash,
+            pending_validator_changes: PendingValidatorChanges::default(),
         };
 
         state_machine
@@ -236,7 +238,47 @@ impl TendermintStateMachine {
             vote_pool: VotePool::new(),
             safety_store,
             local_validator_id,
+            pending_validator_changes: PendingValidatorChanges::default(),
         }
+    }
+
+    pub fn queue_validator_change(
+        &mut self,
+        change: ValidatorChange,
+        effective_epoch: u64,
+    ) -> Result<()> {
+        let delay = match &change {
+            ValidatorChange::RotateKeys { .. } => self.config.key_rotation_delay,
+            ValidatorChange::Remove { .. } => self.config.unbonding_delay,
+            ValidatorChange::Slash { .. } => self.config.slashing_activation_delay,
+            _ => self.config.validator_update_delay,
+        };
+        let minimum_epoch = self
+            .snapshot
+            .epoch
+            .checked_add(delay)
+            .ok_or_else(|| anyhow!("validator change effective epoch overflow"))?;
+        if effective_epoch < minimum_epoch {
+            return Err(anyhow!(
+                "validator change violates its protocol activation delay"
+            ));
+        }
+        self.pending_validator_changes
+            .queue(PendingValidatorChange {
+                effective_epoch,
+                change,
+            })
+            .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    pub fn snapshot_for_height(&self, height: u64) -> Result<StakeSnapshot> {
+        let epoch = self.config.epoch_for_height(height)?;
+        if epoch == self.snapshot.epoch {
+            return Ok(self.snapshot.clone());
+        }
+        self.pending_validator_changes
+            .snapshot_for_epoch(&self.snapshot, epoch)
+            .map_err(|e| anyhow!(e.to_string()))
     }
 
     /// Advance to next height
@@ -255,6 +297,9 @@ impl TendermintStateMachine {
         self.valid_round = None;
         self.valid_round_certificate = None;
         self.snapshot = snapshot;
+        self.pending_validator_changes
+            .changes
+            .retain(|change| change.effective_epoch > self.snapshot.epoch);
         self.parent_randomness = parent_randomness;
         info!("Consensus starting new height {}", height);
         self.start_new_round(0);
@@ -375,6 +420,65 @@ impl TendermintStateMachine {
         signer: &dyn ConsensusSigner,
     ) -> Result<(SignedVote, Option<VerifiedVrfOutput>)> {
         self.handle_proposal_header(proposal, &block.header, signer)
+    }
+
+    /// Pure V2 proposal validation for validators and FullNodes. It verifies
+    /// the active context, proposer membership/selection, canonical signature,
+    /// and VRF derivation without casting a vote or mutating locks, rounds, or
+    /// the vote pool.
+    pub fn validate_proposal_v2_without_vote(
+        &self,
+        proposal: &Proposal,
+        block: &BlockV2,
+    ) -> Result<VerifiedVrfOutput> {
+        let expected_epoch = self.current_epoch()?;
+        if proposal.height != self.height
+            || proposal.round != self.round
+            || proposal.epoch != expected_epoch
+            || proposal.protocol_version != self.config.protocol_version
+            || proposal.chain_id != self.config.chain_id
+            || proposal.stake_snapshot_hash != self.snapshot.snapshot_hash
+            || block.header.height < 0
+            || proposal.height != block.header.height as u64
+            || proposal.parent_block_hash != block.header.prev_block_hash
+            || block.header.epoch != expected_epoch
+            || block.header.parent_randomness != self.parent_randomness
+            || proposal.block_id != BlockId(block.header.block_hash)
+        {
+            return Err(anyhow!("V2 proposal context mismatch"));
+        }
+        let expected_proposer = self
+            .get_current_proposer()
+            .ok_or_else(|| anyhow!("no deterministic proposer is available"))?;
+        if proposal.proposer != expected_proposer {
+            return Err(anyhow!(
+                "V2 proposal proposer is not selected for this round"
+            ));
+        }
+        let record = self
+            .snapshot
+            .validators
+            .get(&proposal.proposer)
+            .ok_or_else(|| anyhow!("V2 proposal proposer is not in the active snapshot"))?;
+        if !record.is_active_at(self.snapshot.epoch) {
+            return Err(anyhow!(
+                "V2 proposal proposer is jailed or slashed in the active snapshot"
+            ));
+        }
+        if record.consensus_public_key.0 == [0u8; 33] || proposal.signature == [0u8; 64] {
+            return Err(anyhow!("V2 proposal has a zero key or signature"));
+        }
+        let verifying_key = VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0)
+            .map_err(|_| anyhow!("malformed V2 proposer public key"))?;
+        let signature = Signature::from_slice(&proposal.signature)
+            .map_err(|_| anyhow!("malformed V2 proposer signature"))?;
+        if signature.normalize_s().is_some() {
+            return Err(anyhow!("V2 proposer signature is not canonical"));
+        }
+        verifying_key
+            .verify(&proposal.canonical_bytes(), &signature)
+            .map_err(|_| anyhow!("V2 proposer signature verification failed"))?;
+        self.verify_proposal_vrf(proposal, &block.header)
     }
 
     /// Verify the proposer VRF against the complete active-height context.
@@ -838,6 +942,10 @@ impl TendermintStateMachine {
         }
         let parent_randomness = finalized.parent_randomness_for_height(next_height)?;
         self.start_new_height(next_height, snapshot, parent_randomness);
+        self.pending_validator_changes = finalized.pending_validator_changes.clone();
+        self.pending_validator_changes
+            .changes
+            .retain(|change| change.effective_epoch > self.snapshot.epoch);
         Ok(())
     }
 
@@ -864,6 +972,10 @@ impl TendermintStateMachine {
         }
         let parent_randomness = finalized.parent_randomness_for_height(next_height)?;
         self.start_new_height(next_height, snapshot, parent_randomness);
+        self.pending_validator_changes = finalized.pending_validator_changes.clone();
+        self.pending_validator_changes
+            .changes
+            .retain(|change| change.effective_epoch > self.snapshot.epoch);
         Ok(())
     }
 }

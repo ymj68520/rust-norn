@@ -9,4 +9,4 @@ rpc_address = "0.0.0.0:50051"
 [network]
 listen_address = "/ip4/0.0.0.0/tcp/4001"
 bootstrap_peers = []
-mdns = true
+mdns = false

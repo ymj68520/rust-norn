@@ -1,10 +1,11 @@
 use crate::behaviour::NornBehaviour;
 use crate::config::NetworkConfig;
+use anyhow::{bail, Result};
 use libp2p::{
     gossipsub, identify,
     identity::Keypair,
     kad::{store::MemoryStore, Behaviour as KadBehaviour, Config as KadConfig},
-    mdns, PeerId, StreamProtocol,
+    PeerId, StreamProtocol,
 };
 use std::hash::Hash;
 use std::time::Duration;
@@ -13,7 +14,10 @@ pub fn build_behaviour(
     keypair: &Keypair,
     peer_id: &PeerId,
     config: &NetworkConfig,
-) -> NornBehaviour {
+) -> Result<NornBehaviour> {
+    if config.mdns {
+        bail!("mDNS is disabled in protocol V2; configure explicit bootstrap_peers");
+    }
     // Gossipsub configuration
     let message_id_fn = |message: &gossipsub::Message| {
         let mut s = std::collections::hash_map::DefaultHasher::new();
@@ -37,8 +41,7 @@ pub fn build_behaviour(
 
     // Kademlia configuration
     let store = MemoryStore::new(peer_id.clone());
-    let mut kad_config = KadConfig::default();
-    kad_config.set_protocol_names(vec![StreamProtocol::new("/norn/kad/1.0.0")]);
+    let kad_config = KadConfig::new(StreamProtocol::new("/norn/kad/1.0.0"));
 
     // Add bootstrap peers if configured
     let kademlia = if !config.bootstrap_peers.is_empty() {
@@ -65,19 +68,26 @@ pub fn build_behaviour(
         keypair.public(),
     ));
 
-    // mDNS configuration - enabled by default for local network discovery
-    // Can be disabled via config.mdns = false
-    let mdns_behaviour = if config.mdns {
-        mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id.clone()).expect("mDNS config")
-    } else {
-        // Create a dummy behaviour that does nothing when mDNS is disabled
-        mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id.clone()).expect("mDNS config")
-    };
-
-    NornBehaviour {
+    // V2 uses explicit bootstrap peers only. This keeps peer discovery
+    // deterministic and avoids an unauthenticated local-discovery ingress.
+    Ok(NornBehaviour {
         gossipsub,
         kademlia,
         identify,
-        mdns: mdns_behaviour,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mdns_configuration_is_rejected_in_v2() {
+        let keypair = Keypair::generate_ed25519();
+        let peer_id = PeerId::from_public_key(&keypair.public());
+        let mut config = NetworkConfig::default();
+        config.mdns = true;
+
+        assert!(build_behaviour(&keypair, &peer_id, &config).is_err());
     }
 }

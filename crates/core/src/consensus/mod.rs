@@ -1,3 +1,4 @@
+pub mod driver;
 pub mod povf;
 pub mod producer;
 pub mod safety_store;
