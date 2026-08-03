@@ -2,7 +2,7 @@
 
 ## Scope
 
-This report records the follow-up work on top of commit `e3c4745`. The changes are currently in the working tree and are not committed. The project remains a Candidate prototype; this report does not declare production readiness.
+This report records the follow-up work on top of commit `e3c4745`, committed as `fe692408fe29e84261bca5b1c2bb4a35a2de434a`. The project remains a Candidate prototype; this report does not declare production readiness.
 
 ## Implemented in this follow-up
 
@@ -59,5 +59,5 @@ Until these items are independently reviewed and accepted, the status remains:
 ```text
 Candidate prototype
 Not production-ready
-Current follow-up changes: uncommitted
+Follow-up implementation commit: `fe692408fe29e84261bca5b1c2bb4a35a2de434a`
 ```
