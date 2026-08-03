@@ -212,6 +212,20 @@ impl ConsensusEnvelope {
     /// This checks only wire/context invariants; cryptographic membership,
     /// quorum, and full block execution validation remain separate steps.
     pub fn validate_for_context(&self, context: &ChainContext) -> Result<()> {
+        self.validate_for_context_with_limits(
+            context,
+            &crate::genesis::ProtocolResourceLimits::default(),
+        )
+    }
+
+    /// Validate an already decoded envelope using the limits committed by
+    /// the active Genesis document.  The context-only compatibility method
+    /// above remains available for callers that do not have Genesis state.
+    pub fn validate_for_context_with_limits(
+        &self,
+        context: &ChainContext,
+        limits: &crate::genesis::ProtocolResourceLimits,
+    ) -> Result<()> {
         if self.wire_version != context.wire_version {
             return Err(protocol_error("consensus envelope wire version mismatch"));
         }
@@ -281,7 +295,7 @@ impl ConsensusEnvelope {
                     ));
                 }
                 if let Some(certificate) = &proposal.valid_round_certificate {
-                    validate_prevote_certificate(certificate, proposal)?;
+                    validate_prevote_certificate(certificate, proposal, limits)?;
                 }
             }
             ConsensusMessage::ProposalV2 { proposal, block } => {
@@ -309,9 +323,8 @@ impl ConsensusEnvelope {
                         "V2 proposal and block contexts do not match",
                     ));
                 }
-                // The node applies its Genesis-specific limits after this
-                // context-only envelope check. The default here catches
-                // malformed roots/hashes before any consensus allocation.
+                // Apply the active Genesis limits at the same admission
+                // boundary as the context and commitment checks.
                 block.validate_structure(
                     &ChainContext {
                         wire_version: self.wire_version,
@@ -320,7 +333,7 @@ impl ConsensusEnvelope {
                         chain_id: self.chain_id,
                         genesis_hash: self.genesis_hash,
                     },
-                    &crate::genesis::ProtocolResourceLimits::default(),
+                    limits,
                 )?;
                 if proposal.proposer.0 == [0u8; 32]
                     || proposal.stake_snapshot_hash.0 == [0u8; 32]
@@ -338,7 +351,7 @@ impl ConsensusEnvelope {
                     ));
                 }
                 if let Some(certificate) = &proposal.valid_round_certificate {
-                    validate_prevote_certificate(certificate, proposal)?;
+                    validate_prevote_certificate(certificate, proposal, limits)?;
                 }
             }
             ConsensusMessage::BlockRequest { height, block_id } => {
@@ -381,7 +394,7 @@ impl ConsensusEnvelope {
                         chain_id: self.chain_id,
                         genesis_hash: self.genesis_hash,
                     },
-                    &crate::genesis::ProtocolResourceLimits::default(),
+                    limits,
                 )?;
                 if proposal.proposer.0 == [0u8; 32]
                     || proposal.stake_snapshot_hash.0 == [0u8; 32]
@@ -400,7 +413,7 @@ impl ConsensusEnvelope {
                 }
             }
             ConsensusMessage::FinalityResponse { finalized } => {
-                validate_finalized_v2(finalized, self)?;
+                validate_finalized_v2(finalized, self, limits)?;
             }
             ConsensusMessage::Vote(vote) => {
                 validate_shared_context(
@@ -442,8 +455,10 @@ impl ConsensusEnvelope {
                         "commit certificate has an invalid identity or no votes",
                     ));
                 }
-                if certificate.precommits.len() > MAX_CONSENSUS_CERTIFICATE_VOTES {
-                    return Err(protocol_error("commit certificate exceeds wire vote limit"));
+                if certificate.precommits.len() > limits.max_certificate_members as usize {
+                    return Err(protocol_error(
+                        "commit certificate exceeds Genesis member limit",
+                    ));
                 }
                 validate_precommit_order(certificate)?;
                 for vote in &certificate.precommits {
@@ -467,6 +482,20 @@ impl ConsensusEnvelope {
     /// Enforce the pre-decode byte ceiling and then validate the decoded
     /// envelope against the local chain identity.
     pub fn decode_and_validate(bytes: &[u8], context: &ChainContext) -> Result<Self> {
+        Self::decode_and_validate_with_limits(
+            bytes,
+            context,
+            &crate::genesis::ProtocolResourceLimits::default(),
+        )
+    }
+
+    /// Decode and validate an envelope with the active Genesis resource
+    /// limits. This is the production node ingress path.
+    pub fn decode_and_validate_with_limits(
+        bytes: &[u8],
+        context: &ChainContext,
+        limits: &crate::genesis::ProtocolResourceLimits,
+    ) -> Result<Self> {
         if bytes.is_empty() {
             return Err(protocol_error("empty consensus envelope"));
         }
@@ -475,7 +504,7 @@ impl ConsensusEnvelope {
         }
         let envelope = bincode::deserialize::<Self>(bytes)
             .map_err(|e| crate::error::NornError::Serialization(e.to_string()))?;
-        envelope.validate_for_context(context)?;
+        envelope.validate_for_context_with_limits(context, limits)?;
         let canonical = bincode::serialize(&envelope)
             .map_err(|e| crate::error::NornError::Serialization(e.to_string()))?;
         if canonical != bytes {
@@ -507,7 +536,11 @@ fn validate_shared_context(
     Ok(())
 }
 
-fn validate_finalized_v2(finalized: &FinalizedBlockV2, envelope: &ConsensusEnvelope) -> Result<()> {
+fn validate_finalized_v2(
+    finalized: &FinalizedBlockV2,
+    envelope: &ConsensusEnvelope,
+    limits: &crate::genesis::ProtocolResourceLimits,
+) -> Result<()> {
     let proposal = &finalized.proposal;
     let block = &finalized.block;
     let certificate = &finalized.commit;
@@ -545,7 +578,7 @@ fn validate_finalized_v2(finalized: &FinalizedBlockV2, envelope: &ConsensusEnvel
             chain_id: envelope.chain_id,
             genesis_hash: envelope.genesis_hash,
         },
-        &crate::genesis::ProtocolResourceLimits::default(),
+        limits,
     )?;
     if proposal.proposer.0 == [0u8; 32]
         || proposal.stake_snapshot_hash.0 == [0u8; 32]
@@ -563,7 +596,7 @@ fn validate_finalized_v2(finalized: &FinalizedBlockV2, envelope: &ConsensusEnvel
         ));
     }
     if let Some(certificate) = &proposal.valid_round_certificate {
-        validate_prevote_certificate(certificate, proposal)?;
+        validate_prevote_certificate(certificate, proposal, limits)?;
     }
 
     validate_shared_context(
@@ -579,7 +612,7 @@ fn validate_finalized_v2(finalized: &FinalizedBlockV2, envelope: &ConsensusEnvel
         || certificate.height != proposal.height
         || certificate.round != proposal.round
         || certificate.precommits.is_empty()
-        || certificate.precommits.len() > MAX_CONSENSUS_CERTIFICATE_VOTES
+        || certificate.precommits.len() > limits.max_certificate_members as usize
     {
         return Err(protocol_error(
             "V2 finalized record certificate does not match its proposal",
@@ -637,6 +670,7 @@ fn validate_precommit_order(certificate: &CommitCertificate) -> Result<()> {
 fn validate_prevote_certificate(
     certificate: &PrevoteCertificate,
     proposal: &Proposal,
+    limits: &crate::genesis::ProtocolResourceLimits,
 ) -> Result<()> {
     if certificate.protocol_version != proposal.protocol_version
         || certificate.chain_id != proposal.chain_id
@@ -651,7 +685,7 @@ fn validate_prevote_certificate(
         ));
     }
     if certificate.prevotes.is_empty()
-        || certificate.prevotes.len() > MAX_CONSENSUS_CERTIFICATE_VOTES
+        || certificate.prevotes.len() > limits.max_certificate_members as usize
     {
         return Err(protocol_error(
             "proposal prevote certificate has an invalid vote count",
@@ -773,6 +807,7 @@ mod wire_validation_tests {
         block.header.prev_block_hash = Hash([6u8; 32]);
         block.header.stake_snapshot_hash = snapshot_hash;
         block.header.proposer = proposer;
+        block.header.gas_limit = 2;
         block.finalize_header().unwrap();
 
         let envelope = ConsensusEnvelope {
@@ -801,6 +836,12 @@ mod wire_validation_tests {
             },
         };
         envelope.validate_for_context(&context).unwrap();
+
+        let mut strict_limits = crate::genesis::ProtocolResourceLimits::default();
+        strict_limits.max_block_gas = 1;
+        assert!(envelope
+            .validate_for_context_with_limits(&context, &strict_limits)
+            .is_err());
 
         let mut tampered = envelope;
         if let ConsensusMessage::ProposalV2 { block, .. } = &mut tampered.payload {
@@ -863,6 +904,12 @@ mod wire_validation_tests {
             ..envelope
         };
         assert!(valid.validate_for_context(&context).is_ok());
+
+        let mut strict_limits = crate::genesis::ProtocolResourceLimits::default();
+        strict_limits.max_certificate_members = 1;
+        assert!(valid
+            .validate_for_context_with_limits(&context, &strict_limits)
+            .is_err());
     }
 
     #[test]
@@ -1102,6 +1149,42 @@ pub struct ValidatorRecord {
     pub slashed: bool,
 }
 
+/// Proofs required when a live validator rotates its consensus and VRF keys.
+/// The old consensus key authorizes the transition, the new consensus key
+/// proves control of its replacement, and the VRF pre-output/proof proves
+/// control of the replacement VRF key over the same domain-separated bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatorKeyRotationProof {
+    #[serde(with = "crate::types::hex_serde_fixed_64")]
+    pub old_consensus_signature: [u8; 64],
+    #[serde(with = "crate::types::hex_serde_fixed_64")]
+    pub new_consensus_signature: [u8; 64],
+    pub vrf_preout: [u8; 32],
+    #[serde(with = "crate::types::hex_serde_fixed_64")]
+    pub vrf_proof: [u8; 64],
+}
+
+impl ValidatorKeyRotationProof {
+    pub fn canonical_bytes(
+        chain_id: &ChainId,
+        validator_id: &ValidatorId,
+        effective_epoch: u64,
+        old_consensus_public_key: &ConsensusPublicKey,
+        new_consensus_public_key: &ConsensusPublicKey,
+        new_vrf_public_key: &VrfPublicKey,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(32 + 32 + 8 + 33 + 33 + 32);
+        bytes.extend_from_slice(b"NORN_VALIDATOR_KEY_ROTATION_V2");
+        bytes.extend_from_slice(&chain_id.0 .0);
+        bytes.extend_from_slice(&validator_id.0);
+        bytes.extend_from_slice(&effective_epoch.to_be_bytes());
+        bytes.extend_from_slice(&old_consensus_public_key.0);
+        bytes.extend_from_slice(&new_consensus_public_key.0);
+        bytes.extend_from_slice(&new_vrf_public_key.0);
+        bytes
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValidatorChange {
     Add(ValidatorRecord),
@@ -1116,6 +1199,7 @@ pub enum ValidatorChange {
         validator_id: ValidatorId,
         consensus_public_key: ConsensusPublicKey,
         vrf_public_key: VrfPublicKey,
+        proof: ValidatorKeyRotationProof,
     },
     Jail {
         validator_id: ValidatorId,
@@ -1147,16 +1231,45 @@ impl PendingValidatorChanges {
                 "validator change must target a non-zero epoch".into(),
             ));
         }
+        if self.changes.iter().any(|pending| {
+            pending.effective_epoch == change.effective_epoch
+                && pending.change.target_validator_id() == change.change.target_validator_id()
+        }) {
+            return Err(NornError::ConsensusError(
+                "conflicting validator changes for the same epoch and ValidatorId".into(),
+            ));
+        }
         self.changes.push(change);
         self.changes.sort_by(|left, right| {
             left.effective_epoch
                 .cmp(&right.effective_epoch)
                 .then_with(|| {
-                    bincode::serialize(&left.change)
-                        .unwrap_or_default()
-                        .cmp(&bincode::serialize(&right.change).unwrap_or_default())
+                    left.change
+                        .target_validator_id()
+                        .cmp(&right.change.target_validator_id())
                 })
+                .then_with(|| left.change.type_ordinal().cmp(&right.change.type_ordinal()))
         });
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let mut seen = HashSet::new();
+        for pending in &self.changes {
+            if pending.effective_epoch == 0 {
+                return Err(NornError::ConsensusError(
+                    "validator change must target a non-zero epoch".into(),
+                ));
+            }
+            if !seen.insert((
+                pending.effective_epoch,
+                pending.change.target_validator_id(),
+            )) {
+                return Err(NornError::ConsensusError(
+                    "conflicting validator changes for the same epoch and ValidatorId".into(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1170,6 +1283,7 @@ impl PendingValidatorChanges {
                 "validator snapshot cannot move backwards across epochs".into(),
             ));
         }
+        self.validate()?;
         let mut records = current.validators.clone();
         for pending in self.changes.iter().filter(|change| {
             change.effective_epoch > current.epoch && change.effective_epoch <= epoch
@@ -1206,6 +1320,7 @@ impl PendingValidatorChanges {
                     validator_id,
                     consensus_public_key,
                     vrf_public_key,
+                    ..
                 } => {
                     let record = records.get_mut(validator_id).ok_or_else(|| {
                         NornError::ConsensusError(
@@ -1240,6 +1355,32 @@ impl PendingValidatorChanges {
         }
         let records = records.into_values().collect::<Vec<_>>();
         StakeSnapshot::from_genesis(epoch, records)
+    }
+}
+
+impl ValidatorChange {
+    pub fn target_validator_id(&self) -> ValidatorId {
+        match self {
+            Self::Add(record) => record.validator_id,
+            Self::Remove { validator_id }
+            | Self::SetVotingPower { validator_id, .. }
+            | Self::RotateKeys { validator_id, .. }
+            | Self::Jail { validator_id, .. }
+            | Self::Unjail { validator_id }
+            | Self::Slash { validator_id } => *validator_id,
+        }
+    }
+
+    pub fn type_ordinal(&self) -> u8 {
+        match self {
+            Self::Add(_) => 1,
+            Self::Remove { .. } => 2,
+            Self::SetVotingPower { .. } => 3,
+            Self::RotateKeys { .. } => 4,
+            Self::Jail { .. } => 5,
+            Self::Unjail { .. } => 6,
+            Self::Slash { .. } => 7,
+        }
     }
 }
 
@@ -1452,6 +1593,29 @@ mod finalized_consensus_state_tests {
             })
             .unwrap();
         assert!(pending.snapshot_for_epoch(&current, 3).is_err());
+    }
+
+    #[test]
+    fn pending_changes_reject_same_epoch_validator_conflicts() {
+        let current = StakeSnapshot::from_genesis(1, vec![record(1)]).unwrap();
+        let mut pending = PendingValidatorChanges::default();
+        pending
+            .queue(PendingValidatorChange {
+                effective_epoch: 2,
+                change: ValidatorChange::Jail {
+                    validator_id: ValidatorId([1; 32]),
+                    until_epoch: 4,
+                },
+            })
+            .unwrap();
+        let conflict = pending.queue(PendingValidatorChange {
+            effective_epoch: 2,
+            change: ValidatorChange::Unjail {
+                validator_id: ValidatorId([1; 32]),
+            },
+        });
+        assert!(conflict.is_err());
+        assert!(pending.snapshot_for_epoch(&current, 2).is_ok());
     }
 
     #[test]

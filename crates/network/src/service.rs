@@ -6,6 +6,9 @@ use anyhow::{anyhow, Result};
 use libp2p::identity::Keypair;
 use libp2p::{Multiaddr, PeerId, SwarmBuilder};
 use norn_common::chain_context::{ChainContext, PeerRole};
+use norn_common::types::ValidatorId;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -33,6 +36,22 @@ pub enum NetworkEvent {
     ConsensusMessageReceived(Vec<u8>),
 }
 
+/// Optional local validator credentials used only for handshake challenge
+/// responses. The network crate receives a signing callback, never a private
+/// key, and the callback is invoked only over canonical challenge bytes.
+#[derive(Clone)]
+pub struct ValidatorHandshakeIdentity {
+    pub validator_id: ValidatorId,
+    pub consensus_public_key: [u8; 33],
+    pub sign: Arc<dyn Fn(&[u8]) -> Result<[u8; 64]> + Send + Sync>,
+}
+
+#[derive(Clone, Default)]
+pub struct NetworkAuthConfig {
+    pub local_validator: Option<ValidatorHandshakeIdentity>,
+    pub validator_public_keys: HashMap<ValidatorId, [u8; 33]>,
+}
+
 pub struct NetworkService {
     pub command_tx: mpsc::Sender<NetworkCommand>,
     pub event_rx: mpsc::Receiver<NetworkEvent>,
@@ -56,7 +75,24 @@ impl NetworkService {
         context: ChainContext,
         peer_role: PeerRole,
     ) -> Result<Self> {
-        Self::start_internal(config, keypair, context, peer_role).await
+        Self::start_internal(
+            config,
+            keypair,
+            context,
+            peer_role,
+            NetworkAuthConfig::default(),
+        )
+        .await
+    }
+
+    pub async fn start_with_context_and_auth(
+        config: NetworkConfig,
+        keypair: Keypair,
+        context: ChainContext,
+        peer_role: PeerRole,
+        auth: NetworkAuthConfig,
+    ) -> Result<Self> {
+        Self::start_internal(config, keypair, context, peer_role, auth).await
     }
 
     async fn start_internal(
@@ -64,6 +100,7 @@ impl NetworkService {
         keypair: Keypair,
         context: ChainContext,
         peer_role: PeerRole,
+        auth: NetworkAuthConfig,
     ) -> Result<Self> {
         let local_peer_id = PeerId::from(keypair.public());
         info!("Local peer id: {:?}", local_peer_id);
@@ -103,7 +140,7 @@ impl NetworkService {
         let (command_tx, command_rx) = mpsc::channel(100);
         let (event_tx, event_rx) = mpsc::channel(100);
 
-        let event_loop = EventLoop::new_with_context(
+        let event_loop = EventLoop::new_with_context_and_auth(
             swarm,
             command_rx,
             event_tx,
@@ -111,6 +148,7 @@ impl NetworkService {
             peer_role,
             local_peer_id,
             bootstrap_peers,
+            auth,
         );
 
         tokio::spawn(event_loop.run());
@@ -127,10 +165,12 @@ impl NetworkService {
 mod tests {
     use super::*;
     use crate::config::NetworkConfig;
+    use k256::ecdsa::{signature::Signer, SigningKey};
     use norn_common::consensus_types::{ConsensusEnvelope, ConsensusMessage, SignedVote, VoteStep};
     use norn_common::types::{
         BlockId, ChainId, Hash, ProtocolVersion, StakeSnapshotHash, ValidatorId,
     };
+    use std::sync::Arc;
     use tokio::time::{timeout, Duration};
 
     fn context(genesis_byte: u8) -> ChainContext {
@@ -140,6 +180,31 @@ mod tests {
             ChainId(Hash([7u8; 32])),
             Hash([genesis_byte; 32]),
         )
+    }
+
+    fn validator_auth(
+        validator_id: ValidatorId,
+        signing_key: &SigningKey,
+        validator_keys: &[(ValidatorId, [u8; 33])],
+    ) -> NetworkAuthConfig {
+        let public_key = signing_key.verifying_key().to_encoded_point(true);
+        let consensus_public_key: [u8; 33] = public_key
+            .as_bytes()
+            .try_into()
+            .expect("compressed public key has the expected length");
+        let signer = signing_key.clone();
+        NetworkAuthConfig {
+            local_validator: Some(ValidatorHandshakeIdentity {
+                validator_id,
+                consensus_public_key,
+                sign: Arc::new(move |bytes| {
+                    let signature: k256::ecdsa::Signature = signer.sign(bytes);
+                    let signature = signature.normalize_s().unwrap_or(signature);
+                    Ok(signature.to_bytes().into())
+                }),
+            }),
+            validator_public_keys: validator_keys.iter().copied().collect(),
+        }
     }
 
     fn network_config() -> NetworkConfig {
@@ -238,21 +303,43 @@ mod tests {
     #[tokio::test]
     async fn stage7_authenticates_valid_peers_and_rejects_wrong_role_and_context() {
         let valid_context = context(1);
-        let mut validator = NetworkService::start_with_context(
+        let validator_key = SigningKey::from_bytes((&[11u8; 32]).into()).unwrap();
+        let peer_key = SigningKey::from_bytes((&[12u8; 32]).into()).unwrap();
+        let validator_id = ValidatorId([1u8; 32]);
+        let peer_validator_id = ValidatorId([2u8; 32]);
+        let validator_public_key: [u8; 33] = validator_key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        let peer_public_key: [u8; 33] = peer_key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .unwrap();
+        let validator_keys = vec![
+            (validator_id, validator_public_key),
+            (peer_validator_id, peer_public_key),
+        ];
+        let mut validator = NetworkService::start_with_context_and_auth(
             network_config(),
             Keypair::generate_ed25519(),
             valid_context,
             PeerRole::Validator,
+            validator_auth(validator_id, &validator_key, &validator_keys),
         )
         .await
         .expect("validator network starts");
         let validator_address = next_listen_address(&mut validator.event_rx).await;
 
-        let mut peer = NetworkService::start_with_context(
+        let mut peer = NetworkService::start_with_context_and_auth(
             network_config(),
             Keypair::generate_ed25519(),
             valid_context,
             PeerRole::Validator,
+            validator_auth(peer_validator_id, &peer_key, &validator_keys),
         )
         .await
         .expect("validator peer network starts");

@@ -2,9 +2,9 @@
 
 ## 1. 范围与结论
 
-本报告以提交 `d282c8c` 为基线，覆盖后续 V2 P0 修复、网络恢复增强、依赖安全升级和最终验证。
+本报告以提交 `b65343c` 为已提交基线，覆盖后续 V2 P0/P1 修复、网络恢复增强、依赖安全升级、最终性恢复硬化和最终验证。
 
-结论：Candidate V2 实现已完成，核心测试门禁通过；项目仍不标记为 `production-ready`。正式上线前仍需独立安全审计、长期故障演练、部署 runbook 和 release review。
+结论：Candidate V2 的当前 P0/P1 主路径和恢复硬化已完成，核心工作区测试门禁通过；项目仍不标记为 `production-ready`。正式上线前仍需完成治理交易接入、独立安全审计、长期故障演练、部署 runbook 和 release review。
 
 ## 2. 端到端执行路径
 
@@ -45,7 +45,8 @@ flowchart TD
 - VRF 使用 verify-and-derive，Proposal 不携带可伪造的 `vrf_score`。
 - 验证后的 randomness 唯一地成为下一高度的 `parent_randomness`。
 - proposer 选择绑定 chain、epoch、height、round、parent randomness 和 snapshot hash。
-- epoch snapshot、ValidatorChange、jailing、slashing 和延迟生效规则确定性执行。
+- epoch snapshot、ValidatorChange、jailing、slashing 和延迟生效规则在状态机层确定性执行；pending changes 与 next snapshot 随 finalized record 同批持久化，并在重启时恢复。
+- 当前尚未把 `ValidatorChange` 接入 `TransactionV2`/system-governance admission；现有 queue API 不能单独宣称治理交易已经上线。
 - Prevote、Precommit、NIL、锁定/解锁、valid round 和 timeout 规则固定并有状态机测试。
 - `ConsensusDriver` 使用单写入队列和 stale timeout token；ConsensusAction 采用 Intent/Ack 语义，避免签名失败或 WAL 失败时错误推进状态。
 
@@ -65,6 +66,7 @@ flowchart TD
 - `FinalizeTransactionId { height, block_id, certificate_hash }` 保证重复提交幂等；同高度不同 block fail-closed。
 - `apply_batch` 成功但 flush 返回错误或进程崩溃时，重启通过 durable marker 恢复完整旧状态或完整新状态，不依据瞬时错误类型猜测结果。
 - Commit 仅在持久化和 flush 成功后广播。
+- 恢复时缺少 durable next snapshot 会 fail-closed，不会使用进程内 pending changes 猜测链上验证者集合。
 
 ## 4. 依赖安全处理
 
@@ -83,8 +85,7 @@ flowchart TD
 以下门禁已通过：
 
 ```text
-cargo check --workspace --all-features --locked
-cargo clippy --workspace --all-targets --locked
+cargo check --workspace --locked
 cargo fmt --all -- --check
 git diff --check
 cargo test --workspace --locked -j 1
@@ -92,21 +93,25 @@ cargo test -p norn-network --lib --locked
 cargo test -p norn --test four_process_v2_bft --locked
 ```
 
+完整 workspace clippy 目前仍受既有 warning 阻断，不能作为已通过门禁；
+`cargo audit` 仍报告 `hickory-proto 0.25.2` 的 2 个 advisory 和 13 个维护性/健壮性 warning。
+
 最终结果包括：
 
 - workspace 测试全部通过，无失败；
-- core 237 个 library tests 通过；
-- common 39 个 tests 通过；
+- core 246 个 library tests 通过；
+- common 40 个 tests 通过；
 - 四进程 Validator/FullNode BFT 测试通过，覆盖十个高度、proposer kill/restart、恢复和网络隔离；
-- 网络 crate 最终 14 个测试通过；
-- 编译仅剩既有 unused、deprecated、unexpected-cfg 等 warning，无编译错误。
+- 网络 crate 最终 18 个测试通过，另有独立进程认证测试通过；
+- 编译无错误；仍需处理既有 unused、deprecated、unexpected-cfg 等 warning，
+  才能关闭 `-D warnings` clippy 门禁。
 
 ## 6. 最终状态
 
 ```text
-Implementation: complete for approved Candidate V2 scope
-Verification gates: passed
+Implementation: P0/P1 main path and durable recovery hardening complete; governance admission pending
+Verification gates: workspace tests/fmt/diff passed; clippy and audit remain open
 Cargo audit: 2 hickory advisories + 13 warnings remain
 Production status: Candidate only
-Commit status: this report and current changes are ready for review
+Commit status: this report and current changes are included in the current main commit
 ```

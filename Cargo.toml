@@ -40,7 +40,9 @@ jsonrpsee = { version = "0.20", features = ["server", "macros"] }
 bincode = "1.3"
 
 # P2P Networking (Replacing go-libp2p)
-libp2p = { version = "0.56", features = ["tokio", "gossipsub", "kad", "macros", "noise", "tcp", "yamux", "identify", "ping"] }
+# V2 rejects mDNS and uses explicit IP/multiaddress dialing; keep resolver
+# features out of the production dependency graph.
+libp2p = { version = "0.56", default-features = false, features = ["tokio", "gossipsub", "kad", "macros", "noise", "tcp", "yamux", "identify", "ping"] }
 
 # Database (Replacing GoLevelDB)
 sled = "0.34"

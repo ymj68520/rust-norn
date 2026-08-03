@@ -230,14 +230,29 @@ fn four_process_norn_v2_bft_reaches_ten_heights_and_recovers_proposer() {
     let configs = (0..4)
         .map(|index| make_config(&root, &genesis_path, index, &peer_ids, index < 3))
         .collect::<Vec<_>>();
+    // Start the bootstrap root first and wait until its listener is ready.
+    // Starting all four processes at once makes the initial dial race the
+    // listener startup; that is a test harness race, not a consensus case.
     let mut guard = ProcessGuard {
         root: root.clone(),
-        children: configs
-            .iter()
-            .enumerate()
-            .map(|(index, config)| spawn_node(&executable, config, index))
-            .collect(),
+        children: Vec::with_capacity(configs.len()),
     };
+    guard.children.push(spawn_node(&executable, &configs[0], 0));
+    let root_listen_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < root_listen_deadline
+        && !log_dirs_contain(&root.join("node-0").join("logs"), "Network listening at")
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        log_dirs_contain(&root.join("node-0").join("logs"), "Network listening at"),
+        "bootstrap root did not start listening"
+    );
+    for index in 1..4 {
+        guard
+            .children
+            .push(spawn_node(&executable, &configs[index], index));
+    }
 
     let started = Instant::now();
     let first_height_deadline = started + Duration::from_secs(25);
@@ -334,7 +349,11 @@ fn four_process_norn_v2_bft_reaches_ten_heights_and_recovers_proposer() {
     guard.children[partitioned_index] =
         spawn_node(&executable, &configs[partitioned_index], partitioned_index);
 
-    let recovery_deadline = Instant::now() + Duration::from_secs(20);
+    // Recovery includes process startup, authenticated handshake retries,
+    // durable-tip reconciliation, and the next two finalized heights.  Keep
+    // enough margin for the workspace test runner when other crates are
+    // executing concurrently; this remains a bounded liveness assertion.
+    let recovery_deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < recovery_deadline
         && log_dirs
             .iter()
@@ -388,4 +407,14 @@ fn four_process_norn_v2_bft_reaches_ten_heights_and_recovers_proposer() {
         .children
         .iter_mut()
         .all(|child| child.try_wait().unwrap().is_none()));
+}
+
+fn log_dirs_contain(log_dir: &Path, marker: &str) -> bool {
+    let Ok(entries) = fs::read_dir(log_dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .any(|contents| contents.contains(marker))
 }

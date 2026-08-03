@@ -10,4 +10,6 @@ pub mod transport;
 
 pub use compression::{CompressionAlgorithm, CompressionConfig, CompressionLevel, Compressor};
 pub use config::NetworkConfig;
-pub use service::{NetworkCommand, NetworkEvent, NetworkService};
+pub use service::{
+    NetworkAuthConfig, NetworkCommand, NetworkEvent, NetworkService, ValidatorHandshakeIdentity,
+};

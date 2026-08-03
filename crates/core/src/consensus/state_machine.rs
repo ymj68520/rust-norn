@@ -7,10 +7,16 @@ use anyhow::{anyhow, Result};
 use k256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use norn_common::consensus_types::{
     CommitCertificate, FinalizedConsensusState, PendingValidatorChange, PendingValidatorChanges,
-    PrevoteCertificate, Proposal, SignedVote, StakeSnapshot, ValidatorChange, VoteStep,
+    PrevoteCertificate, Proposal, SignedVote, StakeSnapshot, ValidatorChange,
+    ValidatorKeyRotationProof, VoteStep,
 };
-use norn_common::types::{Block, BlockHeader, BlockId, BlockV2, ValidatorId};
-use norn_crypto::vrf::{VRFPreOutBytes, VRFProofBytes, VerifiedVrfOutput, VrfContext};
+use norn_common::types::{
+    Block, BlockHeader, BlockId, BlockV2, ConsensusPublicKey, ValidatorId, VrfPublicKey,
+};
+use norn_crypto::vrf::{
+    build_message_transcript, verify_vrf, VRFPreOutBytes, VRFProofBytes, VerifiedVrfOutput,
+    VrfContext,
+};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -56,7 +62,9 @@ pub enum ConsensusEvent {
 mod tests {
     use super::*;
     use crate::consensus::safety_store::MemorySafetyStore;
+    use k256::ecdsa::{signature::Signer, SigningKey};
     use norn_common::types::{Hash, StakeSnapshotHash};
+    use norn_crypto::vrf::{build_message_transcript, VRFKeyPair};
     use std::collections::BTreeMap;
 
     struct DummySigner;
@@ -104,6 +112,83 @@ mod tests {
             .unwrap();
         assert_eq!(state_machine.height, 2);
         assert_eq!(state_machine.parent_randomness, Hash([4; 32]));
+    }
+
+    #[test]
+    fn finalized_pending_validator_changes_survive_live_and_restart_transition() {
+        let validator_id = ValidatorId([7; 32]);
+        let record = norn_common::consensus_types::ValidatorRecord {
+            validator_id,
+            consensus_public_key: ConsensusPublicKey([1; 33]),
+            vrf_public_key: VrfPublicKey([2; 32]),
+            voting_power: 1,
+            jailed_until_epoch: None,
+            slashed: false,
+        };
+        let snapshot = StakeSnapshot::from_genesis(1, vec![record.clone()]).unwrap();
+        let safety_store = Arc::new(MemorySafetyStore::new());
+        let mut source = TendermintStateMachine::new(
+            ConsensusConfig {
+                epoch_length: 1,
+                ..ConsensusConfig::default()
+            },
+            snapshot.clone(),
+            Hash([1; 32]),
+            safety_store.clone(),
+            None,
+        );
+        source
+            .queue_validator_change(
+                ValidatorChange::SetVotingPower {
+                    validator_id,
+                    voting_power: 7,
+                },
+                3,
+            )
+            .unwrap();
+
+        let finalized = FinalizedConsensusState {
+            height: 1,
+            finalized_block_id: BlockId(Hash([2; 32])),
+            commit_certificate_hash: Hash([3; 32]),
+            next_randomness: Hash([4; 32]),
+            active_stake_snapshot_hash: snapshot.snapshot_hash,
+            pending_validator_changes: source.pending_validator_changes.clone(),
+        };
+        let next_snapshot = finalized
+            .pending_validator_changes
+            .snapshot_for_epoch(&snapshot, 2)
+            .unwrap();
+
+        let mut live = TendermintStateMachine::new(
+            source.config.clone(),
+            snapshot.clone(),
+            Hash([1; 32]),
+            safety_store.clone(),
+            None,
+        );
+        live.start_new_height_from_finalized(&finalized, next_snapshot.clone())
+            .unwrap();
+
+        let mut restarted =
+            TendermintStateMachine::new(source.config, snapshot, Hash([9; 32]), safety_store, None);
+        restarted
+            .restore_after_finalized(&finalized, next_snapshot)
+            .unwrap();
+
+        assert_eq!(live.height, 2);
+        assert_eq!(restarted.height, 2);
+        assert_eq!(live.parent_randomness, finalized.next_randomness);
+        assert_eq!(restarted.parent_randomness, finalized.next_randomness);
+        assert_eq!(
+            live.pending_validator_changes,
+            restarted.pending_validator_changes
+        );
+
+        let live_epoch_three = live.snapshot_for_height(3).unwrap();
+        let restarted_epoch_three = restarted.snapshot_for_height(3).unwrap();
+        assert_eq!(live_epoch_three, restarted_epoch_three);
+        assert_eq!(live_epoch_three.validators[&validator_id].voting_power, 7);
     }
 
     #[test]
@@ -156,6 +241,91 @@ mod tests {
         assert!(state_machine.on_timeout_propose(&FailingSigner).is_err());
         assert_eq!(state_machine.step, ConsensusStep::NewHeight);
         assert!(state_machine.locked_block.is_none());
+    }
+
+    #[test]
+    fn key_rotation_requires_old_and_new_consensus_and_vrf_possession() {
+        let old_consensus = SigningKey::from_bytes((&[21u8; 32]).into()).unwrap();
+        let new_consensus = SigningKey::from_bytes((&[22u8; 32]).into()).unwrap();
+        let old_vrf = VRFKeyPair::from_secret_bytes(&[23u8; 32]).unwrap();
+        let new_vrf = VRFKeyPair::from_secret_bytes(&[24u8; 32]).unwrap();
+        let validator_id = ValidatorId([7u8; 32]);
+        let old_consensus_public_key = ConsensusPublicKey(
+            old_consensus
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+        );
+        let new_consensus_public_key = ConsensusPublicKey(
+            new_consensus
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap(),
+        );
+        let old_vrf_public_key = VrfPublicKey(old_vrf.public_key_bytes());
+        let new_vrf_public_key = VrfPublicKey(new_vrf.public_key_bytes());
+        let snapshot = StakeSnapshot::from_genesis(
+            1,
+            vec![norn_common::consensus_types::ValidatorRecord {
+                validator_id,
+                consensus_public_key: old_consensus_public_key,
+                vrf_public_key: old_vrf_public_key,
+                voting_power: 1,
+                jailed_until_epoch: None,
+                slashed: false,
+            }],
+        )
+        .unwrap();
+        let mut config = ConsensusConfig::default();
+        config.key_rotation_delay = 1;
+        let safety_store = Arc::new(MemorySafetyStore::new());
+        let mut state_machine = TendermintStateMachine::new(
+            config,
+            snapshot,
+            Hash([1; 32]),
+            safety_store,
+            Some(validator_id),
+        );
+        let signing_bytes = ValidatorKeyRotationProof::canonical_bytes(
+            &state_machine.config.chain_id,
+            &validator_id,
+            2,
+            &old_consensus_public_key,
+            &new_consensus_public_key,
+            &new_vrf_public_key,
+        );
+        let old_signature: k256::ecdsa::Signature = old_consensus.sign(&signing_bytes);
+        let new_signature: k256::ecdsa::Signature = new_consensus.sign(&signing_bytes);
+        let (vrf_preout, vrf_proof) = new_vrf.vrf_sign(build_message_transcript(&signing_bytes));
+        let proof = ValidatorKeyRotationProof {
+            old_consensus_signature: old_signature
+                .normalize_s()
+                .unwrap_or(old_signature)
+                .to_bytes()
+                .into(),
+            new_consensus_signature: new_signature
+                .normalize_s()
+                .unwrap_or(new_signature)
+                .to_bytes()
+                .into(),
+            vrf_preout: vrf_preout.0,
+            vrf_proof: vrf_proof.0,
+        };
+        state_machine
+            .queue_validator_change(
+                ValidatorChange::RotateKeys {
+                    validator_id,
+                    consensus_public_key: new_consensus_public_key,
+                    vrf_public_key: new_vrf_public_key,
+                    proof,
+                },
+                2,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -263,12 +433,121 @@ impl TendermintStateMachine {
                 "validator change violates its protocol activation delay"
             ));
         }
+        if let ValidatorChange::RotateKeys {
+            validator_id,
+            consensus_public_key,
+            vrf_public_key,
+            proof,
+        } = &change
+        {
+            self.verify_key_rotation(
+                *validator_id,
+                effective_epoch,
+                *consensus_public_key,
+                *vrf_public_key,
+                proof,
+            )?;
+        }
         self.pending_validator_changes
             .queue(PendingValidatorChange {
                 effective_epoch,
                 change,
             })
             .map_err(|e| anyhow!(e.to_string()))
+    }
+
+    fn verify_key_rotation(
+        &self,
+        validator_id: ValidatorId,
+        effective_epoch: u64,
+        new_consensus_public_key: ConsensusPublicKey,
+        new_vrf_public_key: VrfPublicKey,
+        proof: &ValidatorKeyRotationProof,
+    ) -> Result<()> {
+        let current = self
+            .snapshot
+            .validators
+            .get(&validator_id)
+            .ok_or_else(|| anyhow!("key rotation targets an unknown validator"))?;
+        if !current.is_active_at(self.snapshot.epoch) {
+            return Err(anyhow!(
+                "inactive validator cannot authorize a key rotation"
+            ));
+        }
+        if new_consensus_public_key == current.consensus_public_key
+            || new_vrf_public_key == current.vrf_public_key
+        {
+            return Err(anyhow!(
+                "key rotation must change both consensus and VRF keys"
+            ));
+        }
+        if self.snapshot.validators.values().any(|record| {
+            record.validator_id != validator_id
+                && (record.consensus_public_key == new_consensus_public_key
+                    || record.vrf_public_key == new_vrf_public_key)
+        }) {
+            return Err(anyhow!(
+                "key rotation reuses a key already assigned to another validator"
+            ));
+        }
+        if self
+            .pending_validator_changes
+            .changes
+            .iter()
+            .any(|pending| {
+                matches!(
+                    &pending.change,
+                    ValidatorChange::RotateKeys {
+                        consensus_public_key,
+                        vrf_public_key,
+                        ..
+                    } if *consensus_public_key == new_consensus_public_key
+                        || *vrf_public_key == new_vrf_public_key
+                )
+            })
+        {
+            return Err(anyhow!(
+                "key rotation reuses a key from another pending rotation"
+            ));
+        }
+
+        let signing_bytes = ValidatorKeyRotationProof::canonical_bytes(
+            &self.config.chain_id,
+            &validator_id,
+            effective_epoch,
+            &current.consensus_public_key,
+            &new_consensus_public_key,
+            &new_vrf_public_key,
+        );
+        let old_key = VerifyingKey::from_sec1_bytes(&current.consensus_public_key.0)
+            .map_err(|_| anyhow!("current consensus key is malformed"))?;
+        let new_key = VerifyingKey::from_sec1_bytes(&new_consensus_public_key.0)
+            .map_err(|_| anyhow!("new consensus key is malformed"))?;
+        let old_signature = Signature::from_slice(&proof.old_consensus_signature)
+            .map_err(|_| anyhow!("old consensus key proof is malformed"))?;
+        let new_signature = Signature::from_slice(&proof.new_consensus_signature)
+            .map_err(|_| anyhow!("new consensus key proof is malformed"))?;
+        if old_signature.normalize_s().is_some() || new_signature.normalize_s().is_some() {
+            return Err(anyhow!("key rotation proofs must use low-S signatures"));
+        }
+        old_key
+            .verify(&signing_bytes, &old_signature)
+            .map_err(|_| anyhow!("old consensus key did not authorize rotation"))?;
+        new_key
+            .verify(&signing_bytes, &new_signature)
+            .map_err(|_| anyhow!("new consensus key proof of possession failed"))?;
+
+        if proof.vrf_preout == [0u8; 32] || proof.vrf_proof == [0u8; 64] {
+            return Err(anyhow!("new VRF key proof of possession is empty"));
+        }
+        verify_vrf(
+            &new_vrf_public_key.0,
+            build_message_transcript(&signing_bytes),
+            &VRFPreOutBytes(proof.vrf_preout),
+            &VRFProofBytes(proof.vrf_proof),
+        )
+        .map_err(|_| anyhow!("new VRF key proof of possession failed"))?;
+        Ok(())
     }
 
     pub fn snapshot_for_height(&self, height: u64) -> Result<StakeSnapshot> {
@@ -732,6 +1011,21 @@ impl TendermintStateMachine {
                         "2/3 Prevotes (Polka) reached for block {:?}, updating locks",
                         bid
                     );
+                    let certificate = PrevoteCertificate {
+                        protocol_version: self.config.protocol_version.clone(),
+                        chain_id: self.config.chain_id.clone(),
+                        epoch: self.current_epoch()?,
+                        height: self.height,
+                        round: self.round,
+                        block_id: bid,
+                        stake_snapshot_hash: self.snapshot.snapshot_hash.clone(),
+                        prevotes,
+                    };
+
+                    // A validator's lock is a consequence of a durable
+                    // Precommit intent, not of merely observing a Polka. If
+                    // WAL persistence or signing fails, leave every lock and
+                    // step untouched so the same request can be retried.
                     let precommit_vote = if self.local_validator_id.is_some() {
                         Some(self.cast_vote(VoteStep::Precommit, Some(bid), signer)?)
                     } else {
@@ -741,16 +1035,8 @@ impl TendermintStateMachine {
                     self.locked_round = Some(round);
                     self.valid_block = Some(bid);
                     self.valid_round = Some(round);
-                    self.valid_round_certificate = Some(PrevoteCertificate {
-                        protocol_version: self.config.protocol_version.clone(),
-                        chain_id: self.config.chain_id.clone(),
-                        epoch: self.current_epoch()?,
-                        height: self.height,
-                        round: self.round,
-                        block_id: bid,
-                        stake_snapshot_hash: self.snapshot.snapshot_hash.clone(),
-                        prevotes,
-                    });
+                    self.valid_round_certificate = Some(certificate);
+                    self.step = ConsensusStep::PrecommitWait;
 
                     // The locks above are committed only after the local
                     // precommit intent has been durably signed and

@@ -1,5 +1,5 @@
 use crate::error::{NornError, Result};
-use crate::types::{ChainId, Hash, ProtocolVersion};
+use crate::types::{ChainId, Hash, ProtocolVersion, ValidatorId};
 use serde::{Deserialize, Serialize};
 
 /// Network identity shared by every consensus and synchronization component.
@@ -24,6 +24,16 @@ pub enum PeerRole {
     FullNode,
 }
 
+/// Handshake messages are exchanged on the context-bound handshake topic.
+/// Validator authentication is deliberately a two-step challenge/response;
+/// a role claim or an unsigned Hello is never sufficient for consensus input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HandshakeMessage {
+    Hello,
+    Challenge,
+    Response,
+}
+
 /// The first message exchanged on a context-bound handshake topic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkHandshake {
@@ -34,13 +44,33 @@ pub struct NetworkHandshake {
     pub peer_role: PeerRole,
     /// Canonical libp2p PeerId bytes. Binding this into the payload prevents
     /// identical role/context handshakes from being gossipsub-deduplicated
-    /// across different peers and lets receivers detect identity claims that
-    /// do not match the authenticated transport source.
+    /// across different peers. Validator responses additionally sign this
+    /// identity, so gossipsub forwarding cannot turn a relayed claim into a
+    /// different authenticated validator.
     pub peer_id: Vec<u8>,
     /// Changes on every local connection attempt so a reconnected peer is not
     /// hidden by gossipsub's duplicate-message cache.
     #[serde(default)]
     pub session_nonce: u64,
+    #[serde(default = "default_handshake_message")]
+    pub message: HandshakeMessage,
+    /// The peer that issued a challenge. Present on Challenge and Response.
+    #[serde(default)]
+    pub receiver_peer_id: Vec<u8>,
+    /// Fresh receiver-generated nonce, present on Challenge and Response.
+    #[serde(default)]
+    pub receiver_nonce: Option<[u8; 32]>,
+    /// Genesis validator identity and proof, present only on Response.
+    #[serde(default)]
+    pub validator_id: Option<ValidatorId>,
+    #[serde(default)]
+    pub consensus_public_key: Option<Vec<u8>>,
+    #[serde(default)]
+    pub signature: Option<Vec<u8>>,
+}
+
+fn default_handshake_message() -> HandshakeMessage {
+    HandshakeMessage::Hello
 }
 
 pub const MAX_HANDSHAKE_BYTES: usize = 1024;
@@ -60,7 +90,55 @@ impl NetworkHandshake {
             peer_role,
             peer_id: Vec::new(),
             session_nonce: 0,
+            message: HandshakeMessage::Hello,
+            receiver_peer_id: Vec::new(),
+            receiver_nonce: None,
+            validator_id: None,
+            consensus_public_key: None,
+            signature: None,
         }
+    }
+
+    pub fn challenge(
+        context: ChainContext,
+        challenger_peer_id: impl Into<Vec<u8>>,
+        challenged_peer_id: impl Into<Vec<u8>>,
+        receiver_nonce: [u8; 32],
+    ) -> Self {
+        Self {
+            message: HandshakeMessage::Challenge,
+            peer_id: challenged_peer_id.into(),
+            receiver_peer_id: challenger_peer_id.into(),
+            receiver_nonce: Some(receiver_nonce),
+            ..Self::new(context, PeerRole::FullNode)
+        }
+    }
+
+    /// Canonical bytes signed by a validator response. The transport source
+    /// is included explicitly; gossipsub propagation_source is not trusted as
+    /// a consensus identity.
+    pub fn validator_signing_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(256);
+        bytes.extend_from_slice(b"NORN_VALIDATOR_HANDSHAKE_V2");
+        bytes.extend_from_slice(&self.wire_version.to_be_bytes());
+        bytes.extend_from_slice(&self.protocol_version.0.to_be_bytes());
+        bytes.extend_from_slice(&self.chain_id.0 .0);
+        bytes.extend_from_slice(&self.genesis_hash.0);
+        if let Some(validator_id) = self.validator_id {
+            bytes.extend_from_slice(&validator_id.0);
+        } else {
+            bytes.extend_from_slice(&[0u8; 32]);
+        }
+        bytes.extend_from_slice(&(self.peer_id.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&self.peer_id);
+        bytes.extend_from_slice(&(self.receiver_peer_id.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(&self.receiver_peer_id);
+        bytes.extend_from_slice(&self.receiver_nonce.unwrap_or_default());
+        bytes.push(match self.peer_role {
+            PeerRole::Validator => 1,
+            PeerRole::FullNode => 2,
+        });
+        bytes
     }
 
     pub fn with_peer_id(mut self, peer_id: impl Into<Vec<u8>>) -> Self {

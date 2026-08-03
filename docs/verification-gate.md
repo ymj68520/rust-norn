@@ -26,11 +26,22 @@ libFuzzer target against the same `decode_and_validate` entry point.
 
 - malformed, oversized, wrong-version, wrong-Genesis, and wrong-role network
   inputs fail closed before consensus processing;
+- a Validator handshake is accepted only after a fresh challenge response
+  verifies a Genesis consensus key, low-S signature, nonce, and bound PeerId;
+- `propagation_source` is never treated as the original consensus publisher:
+  context-valid relayed messages reach the V2 cryptographic validator, while a
+  FullNode may originate only `BlockRequest` and `FinalityRequest` messages;
+- the transport rejects new peer identities after the protocol connection
+  ceiling is reached, and bounded ingress queues may drop gossip without
+  blocking the network event loop;
 - Validator and FullNode behavior is tested separately;
 - a signer/WAL failure produces no broadcast and no state transition;
 - a torn safety-WAL tail is recoverable;
 - finality commit retry is idempotent after an apply/flush ambiguity;
 - a conflicting block at an already finalized height is rejected;
+- the finalized record, pending validator changes, and next validator snapshot
+  are recovered as one protocol state; a missing next snapshot fails closed
+  instead of being derived from process memory;
 - restart recovery replays the exact durable vote, certificate, and overlay
   write-set;
 - four independent configurations derive the same snapshot hash and proposer
@@ -40,3 +51,9 @@ libFuzzer target against the same `decode_and_validate` entry point.
 These checks are completion gates, not evidence that an unreviewed deployment
 is production-ready. Protocol upgrades continue to require a new versioned
 Genesis or an explicitly specified activation-height migration.
+
+The validator-change queue and epoch snapshot transition are deterministic and
+durable, but they are not by themselves a governance transaction format. The
+V2 transaction/system-action admission path must explicitly decode, authorize,
+and queue `ValidatorChange` records before this feature can be considered live
+chain governance.

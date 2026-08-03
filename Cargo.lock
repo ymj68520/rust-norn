@@ -3855,8 +3855,10 @@ dependencies = [
  "anyhow",
  "bincode",
  "hex",
+ "k256",
  "libp2p",
  "norn-common",
+ "rand 0.8.5",
  "serde",
  "serde_bytes",
  "serde_json",
@@ -3871,6 +3873,7 @@ name = "norn-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.7.9",
  "bincode",
  "chrono",

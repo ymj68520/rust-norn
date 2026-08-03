@@ -34,7 +34,7 @@ pub struct PoVFEngine {
     pub current_height: Arc<RwLock<u64>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedCandidate {
     pub proposal: Proposal,
     pub block: BlockV2,
@@ -166,6 +166,10 @@ impl PoVFEngine {
         let (vote, verified_vrf) = sm
             .handle_proposal_v2_with_vrf(&proposal, &block, signer)
             .map_err(|e| NornError::ConsensusError(e.to_string()))?;
+        // `handle_proposal_v2_with_vrf` creates the local Prevote through the
+        // safety store. Only after that durable acknowledgement may the live
+        // state enter the PrevoteWait phase.
+        sm.step = crate::consensus::types::ConsensusStep::PrevoteWait;
 
         let calculated_bid = BlockId(block.header.block_hash);
         if let Some(randomness) = verified_vrf.map(|output| Hash(output.randomness)) {
@@ -201,6 +205,67 @@ impl PoVFEngine {
             candidates.insert((proposal.height, calculated_bid), block);
         }
         Ok(Some(vote))
+    }
+
+    /// Apply a proposal that has already passed the pure V2 validation worker.
+    /// This method performs only the consensus state transition and durable
+    /// local vote creation; callers must not use it for unvalidated network
+    /// payloads.
+    pub async fn apply_validated_proposal_v2(
+        &self,
+        candidate: ValidatedCandidate,
+        signer: &dyn ConsensusSigner,
+    ) -> Result<Option<SignedVote>> {
+        let ValidatedCandidate {
+            proposal,
+            block,
+            derived_randomness,
+        } = candidate;
+        let mut sm = self.state_machine.write().await;
+        // A proposal can arrive after this validator has already cast its
+        // timeout NIL prevote.  It remains useful as a candidate for a later
+        // certificate, but must not trigger a second prevote in the same
+        // height/round.  The safety WAL rejects that equivocation; ignoring
+        // the late vote here also avoids turning ordinary network delay into
+        // a consensus-driver error.
+        let (vote, verified_vrf) = if matches!(
+            sm.step,
+            crate::consensus::types::ConsensusStep::NewHeight
+                | crate::consensus::types::ConsensusStep::Propose
+        ) {
+            let (vote, verified_vrf) = sm
+                .handle_proposal_v2_with_vrf(&proposal, &block, signer)
+                .map_err(|e| NornError::ConsensusError(e.to_string()))?;
+            // The local prevote has been durably acknowledged by the
+            // safety store before this transition is made.
+            sm.step = crate::consensus::types::ConsensusStep::PrevoteWait;
+            (Some(vote), verified_vrf)
+        } else {
+            (None, None)
+        };
+        drop(sm);
+
+        let calculated_bid = BlockId(block.header.block_hash);
+        let key = (proposal.height, calculated_bid);
+        let randomness = verified_vrf
+            .map(|output| Hash(output.randomness))
+            .unwrap_or(derived_randomness);
+        let mut proposals = self.candidate_proposals_v2.write().await;
+        if let Some(existing) = proposals.get(&key) {
+            if existing != &proposal {
+                return Err(NornError::ConsensusError(
+                    "conflicting V2 proposals for the same block ID".into(),
+                ));
+            }
+        } else {
+            proposals.insert(key, proposal.clone());
+        }
+        self.candidate_randomness_v2
+            .write()
+            .await
+            .insert(key, randomness);
+        self.candidate_blocks_v2.write().await.insert(key, block);
+        Ok(vote)
     }
 
     /// Validate a V2 proposal without requiring a local signer and without

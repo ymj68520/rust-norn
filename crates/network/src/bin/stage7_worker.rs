@@ -1,10 +1,15 @@
 use anyhow::{anyhow, Result};
+use k256::ecdsa::{signature::Signer, SigningKey};
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
 use norn_common::chain_context::{ChainContext, PeerRole};
 use norn_common::consensus_types::{ConsensusEnvelope, ConsensusMessage, SignedVote, VoteStep};
-use norn_common::types::{BlockId, ChainId, Hash, ProtocolVersion, StakeSnapshotHash};
-use norn_network::{NetworkCommand, NetworkConfig, NetworkEvent, NetworkService};
+use norn_common::types::{BlockId, ChainId, Hash, ProtocolVersion, StakeSnapshotHash, ValidatorId};
+use norn_network::{
+    NetworkAuthConfig, NetworkCommand, NetworkConfig, NetworkEvent, NetworkService,
+    ValidatorHandshakeIdentity,
+};
+use std::collections::HashMap;
 use std::env;
 use std::io::Write;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -46,6 +51,42 @@ fn emit(line: impl AsRef<str>) {
     let _ = std::io::stdout().flush();
 }
 
+fn validator_key(byte: u8) -> SigningKey {
+    SigningKey::from_bytes((&[byte; 32]).into()).expect("fixed stage7 key is valid")
+}
+
+fn validator_auth(validator_byte: u8) -> NetworkAuthConfig {
+    let validator_keys = (1u8..=3)
+        .map(|byte| {
+            let key = validator_key(byte);
+            let public_key: [u8; 33] = key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .try_into()
+                .expect("compressed stage7 public key has the expected length");
+            (ValidatorId([byte; 32]), public_key)
+        })
+        .collect::<HashMap<_, _>>();
+    let signing_key = validator_key(validator_byte);
+    let consensus_public_key = *validator_keys
+        .get(&ValidatorId([validator_byte; 32]))
+        .expect("local stage7 validator key is in the Genesis key table");
+    let signer = signing_key.clone();
+    NetworkAuthConfig {
+        local_validator: Some(ValidatorHandshakeIdentity {
+            validator_id: ValidatorId([validator_byte; 32]),
+            consensus_public_key,
+            sign: std::sync::Arc::new(move |bytes| {
+                let signature: k256::ecdsa::Signature = signer.sign(bytes);
+                let signature = signature.normalize_s().unwrap_or(signature);
+                Ok(signature.to_bytes().into())
+            }),
+        }),
+        validator_public_keys: validator_keys,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let mut args = env::args().skip(1);
@@ -59,12 +100,21 @@ async fn main() -> Result<()> {
         .next()
         .ok_or_else(|| anyhow!("genesis byte is required"))?
         .parse::<u8>()?;
+    let validator_byte = if role == PeerRole::Validator {
+        Some(
+            args.next()
+                .ok_or_else(|| anyhow!("validator byte is required"))?
+                .parse::<u8>()?,
+        )
+    } else {
+        None
+    };
     let bootstrap_peers = args.collect::<Vec<_>>();
 
     let keypair = Keypair::generate_ed25519();
     let local_peer_id = libp2p::PeerId::from(keypair.public());
     let chain_context = context(genesis_byte);
-    let network = NetworkService::start_with_context(
+    let network = NetworkService::start_with_context_and_auth(
         NetworkConfig {
             listen_address: "/ip4/127.0.0.1/tcp/0".to_string(),
             bootstrap_peers,
@@ -73,6 +123,9 @@ async fn main() -> Result<()> {
         keypair,
         chain_context,
         role,
+        validator_byte
+            .map(validator_auth)
+            .unwrap_or_else(NetworkAuthConfig::default),
     )
     .await?;
     let command_tx = network.command_tx.clone();

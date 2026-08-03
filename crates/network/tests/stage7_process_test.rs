@@ -14,6 +14,15 @@ struct Worker {
     address: String,
 }
 
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // If a bounded assertion returns early, do not leave a worker alive
+        // with its stdout pipe open.  Otherwise the test process can remain
+        // blocked indefinitely even though the test future has failed.
+        let _ = self.child.start_kill();
+    }
+}
+
 impl Worker {
     async fn send(&mut self, command: &str) -> Result<()> {
         self.stdin.write_all(command.as_bytes()).await?;
@@ -30,19 +39,24 @@ impl Worker {
 }
 
 async fn next_line(worker: &mut Worker) -> Result<String> {
-    timeout(Duration::from_secs(10), worker.lines.next_line())
-        .await
-        .map_err(|_| anyhow!("worker output timed out"))??
+    worker
+        .lines
+        .next_line()
+        .await?
         .ok_or_else(|| anyhow!("worker exited before producing output"))
 }
 
 async fn wait_for_line(worker: &mut Worker, expected: &str) -> Result<String> {
-    loop {
-        let line = next_line(worker).await?;
-        if line == expected || line.contains(expected) {
-            return Ok(line);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let line = next_line(worker).await?;
+            if line == expected || line.contains(expected) {
+                return Ok(line);
+            }
         }
-    }
+    })
+    .await
+    .map_err(|_| anyhow!("timed out waiting for worker output {expected:?}"))?
 }
 
 async fn assert_no_line_containing(worker: &mut Worker, forbidden: &str) -> Result<()> {
@@ -77,11 +91,17 @@ fn peer_id_from_address(address: &str) -> PeerId {
         .expect("worker listen address includes a PeerId")
 }
 
-async fn spawn_worker(role: &str, genesis_byte: u8, bootstrap: &[String]) -> Result<Worker> {
+async fn spawn_worker(
+    role: &str,
+    genesis_byte: u8,
+    validator_byte: Option<u8>,
+    bootstrap: &[String],
+) -> Result<Worker> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stage7_worker"));
     command
         .arg(role)
         .arg(genesis_byte.to_string())
+        .args(validator_byte.map(|byte| byte.to_string()))
         .args(bootstrap)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -112,12 +132,12 @@ async fn spawn_worker(role: &str, genesis_byte: u8, bootstrap: &[String]) -> Res
 
 #[tokio::test]
 async fn stage7_separate_processes_exchange_only_authenticated_validator_consensus() -> Result<()> {
-    let mut validator = spawn_worker("validator", 1, &[]).await?;
+    let mut validator = spawn_worker("validator", 1, Some(1), &[]).await?;
     let validator_address = validator.address.clone();
 
-    let mut peer = spawn_worker("validator", 1, &[validator_address.clone()]).await?;
+    let mut peer = spawn_worker("validator", 1, Some(2), &[validator_address.clone()]).await?;
     let peer_peer_id = peer_id_from_address(&peer.address);
-    let mut full_node = spawn_worker("fullnode", 1, &[validator_address.clone()]).await?;
+    let mut full_node = spawn_worker("fullnode", 1, None, &[validator_address.clone()]).await?;
     let full_node_peer_id = peer_id_from_address(&full_node.address);
 
     wait_for_line(&mut validator, &format!("AUTH {peer_peer_id} Validator")).await?;
@@ -133,7 +153,7 @@ async fn stage7_separate_processes_exchange_only_authenticated_validator_consens
     full_node.send("BROADCAST 3").await?;
     assert_no_line_containing(&mut validator, "CONSENSUS").await?;
 
-    let wrong_context = spawn_worker("validator", 2, &[validator_address]).await?;
+    let wrong_context = spawn_worker("validator", 2, Some(3), &[validator_address]).await?;
     let wrong_context_peer_id = peer_id_from_address(&wrong_context.address);
     assert_no_line_containing(&mut validator, &format!("AUTH {wrong_context_peer_id}")).await?;
 

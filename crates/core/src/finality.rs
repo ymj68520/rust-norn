@@ -37,6 +37,18 @@ pub enum FinalityCommitResult {
     AlreadyCommitted,
 }
 
+/// Result of inspecting durable markers after a DB operation returned an
+/// error. `Indeterminate` is deliberately distinct from `NotApplied`: the
+/// caller must fail-stop when the marker set cannot prove a complete old or
+/// complete new transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableCommitOutcome {
+    Applied,
+    AlreadyApplied,
+    NotApplied,
+    Indeterminate,
+}
+
 pub struct FinalityStore {
     db: Arc<dyn DBInterface>,
 }
@@ -197,11 +209,31 @@ impl FinalityStore {
         let height_key = height_key(id.height);
         if let Some(existing_bytes) = self.db.get(&height_key).await? {
             let existing: FinalizeTransactionId = decode(&existing_bytes, "height marker")?;
-            if existing != id {
+            if existing.height != id.height || existing.block_id != id.block_id {
                 bail!(
                     "height {} is already finalized by a different block or certificate",
                     id.height
                 );
+            }
+
+            // More than one valid quorum certificate can be formed for the
+            // same block when different validators observe the quorum at
+            // slightly different times.  The durable record keeps the first
+            // certificate, while a later certificate for the same block is a
+            // harmless equivalent finality result.  A different block at the
+            // same height remains a fail-closed conflict above.
+            if existing != id {
+                let persisted = self
+                    .recover_finalized_v2(id.height)
+                    .await?
+                    .ok_or_else(|| anyhow!("finalized height marker has no complete record"))?;
+                if persisted.commit.block_id != id.block_id {
+                    bail!(
+                        "height {} is already finalized by a different block or certificate",
+                        id.height
+                    );
+                }
+                return Ok(FinalityCommitResult::AlreadyCommitted);
             }
 
             let required = self.required_keys(
@@ -354,6 +386,118 @@ impl FinalityStore {
 
         self.db.batch_insert(&keys, &values).await?;
         Ok(FinalityCommitResult::Applied)
+    }
+
+    /// Reconcile a failed finality write by inspecting the durable marker
+    /// set. This method never infers persistence from the original error and
+    /// never mutates memory. It is safe to call after a crash or an ambiguous
+    /// flush result with the exact same finalized payload.
+    pub async fn reconcile_finalized_transaction(
+        &self,
+        finalized: &FinalizedBlockV2,
+        state_write_values: &[Vec<u8>],
+        checkpoint: Option<&CanonicalStateCheckpoint>,
+        next_snapshot: Option<&StakeSnapshot>,
+    ) -> Result<DurableCommitOutcome> {
+        let id = FinalizeTransactionId::from_v2(finalized);
+        let transaction_ids = finalized
+            .block
+            .transactions
+            .iter()
+            .map(|tx| tx.transaction_id)
+            .collect::<Vec<_>>();
+        let required = self.required_keys(
+            finalized,
+            &transaction_ids,
+            &id,
+            state_write_values.len(),
+            checkpoint.is_some(),
+        )?;
+        let mut probe_keys = required.clone();
+        if let Some(snapshot) = next_snapshot {
+            probe_keys.push(snapshot_key(snapshot.epoch));
+        }
+
+        let height_marker = self.db.get(&height_key(id.height)).await?;
+        let Some(height_bytes) = height_marker else {
+            // TIP_KEY is always present after Genesis initialization and is
+            // therefore excluded from this partial-write probe.
+            let mut any_non_tip = false;
+            for key in probe_keys.iter().filter(|key| key.as_slice() != TIP_KEY) {
+                if self.db.get(key).await?.is_some() {
+                    any_non_tip = true;
+                    break;
+                }
+            }
+            return Ok(if any_non_tip {
+                DurableCommitOutcome::Indeterminate
+            } else {
+                DurableCommitOutcome::NotApplied
+            });
+        };
+
+        let stored_id: FinalizeTransactionId = match decode(&height_bytes, "height marker") {
+            Ok(id) => id,
+            Err(_) => return Ok(DurableCommitOutcome::Indeterminate),
+        };
+        if stored_id != id {
+            if stored_id.height == id.height && stored_id.block_id == id.block_id {
+                let persisted = self.recover_finalized_v2(id.height).await?;
+                if persisted
+                    .as_ref()
+                    .is_some_and(|finalized| finalized.commit.block_id == id.block_id)
+                {
+                    return Ok(DurableCommitOutcome::AlreadyApplied);
+                }
+            }
+            return Ok(DurableCommitOutcome::Indeterminate);
+        }
+        if !self
+            .read_presence(&probe_keys)
+            .await?
+            .iter()
+            .all(|present| *present)
+        {
+            return Ok(DurableCommitOutcome::Indeterminate);
+        }
+        if self
+            .verify_state_writes(id.height, state_write_values)
+            .await
+            .is_err()
+        {
+            return Ok(DurableCommitOutcome::Indeterminate);
+        }
+        if let Some(checkpoint) = checkpoint {
+            if self.verify_checkpoint(id.height, checkpoint).await.is_err() {
+                return Ok(DurableCommitOutcome::Indeterminate);
+            }
+        }
+        if let Some(snapshot) = next_snapshot {
+            let stored = self
+                .recover_snapshot(snapshot.epoch)
+                .await?
+                .ok_or_else(|| anyhow!("durable next validator snapshot is missing"))?;
+            if stored != *snapshot {
+                return Ok(DurableCommitOutcome::Indeterminate);
+            }
+        }
+        let expected_tip =
+            CanonicalFinalizedTip::from_finalized_with_next_snapshot(finalized, next_snapshot)
+                .map_err(|error| anyhow!(error.to_string()))?;
+        if self.recover_canonical_tip().await? != Some(expected_tip) {
+            return Ok(DurableCommitOutcome::Indeterminate);
+        }
+        let Some(record_bytes) = self.db.get(&record_key(id.block_id.0)).await? else {
+            return Ok(DurableCommitOutcome::Indeterminate);
+        };
+        let persisted: FinalizedBlockV2 = match decode(&record_bytes, "finalized record") {
+            Ok(record) => record,
+            Err(_) => return Ok(DurableCommitOutcome::Indeterminate),
+        };
+        if persisted != *finalized {
+            return Ok(DurableCommitOutcome::Indeterminate);
+        }
+        Ok(DurableCommitOutcome::Applied)
     }
 
     /// Recover a complete finalized V2 record. A height marker without its
@@ -728,9 +872,13 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8], name: &str) -> Result<T>
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use norn_common::consensus_types::{CommitCertificate, FinalizedConsensusState};
+    use norn_common::consensus_types::{
+        CommitCertificate, FinalizedConsensusState, PendingValidatorChange,
+        PendingValidatorChanges, ValidatorChange, ValidatorRecord,
+    };
     use norn_common::types::{
-        BlockHeader, ChainId, Hash, ProtocolVersion, StakeSnapshotHash, ValidatorId,
+        BlockHeader, ChainId, ConsensusPublicKey, Hash, ProtocolVersion, StakeSnapshotHash,
+        ValidatorId, VrfPublicKey,
     };
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -906,6 +1054,46 @@ mod tests {
             FinalityCommitResult::AlreadyCommitted
         );
 
+        // A different quorum certificate may be formed for the same block;
+        // it must not be treated as a conflicting height.
+        let mut equivalent_certificate = first.clone();
+        equivalent_certificate
+            .commit
+            .precommits
+            .push(norn_common::consensus_types::SignedVote {
+                protocol_version: equivalent_certificate.commit.protocol_version,
+                chain_id: equivalent_certificate.commit.chain_id,
+                epoch: equivalent_certificate.commit.epoch,
+                height: equivalent_certificate.commit.height,
+                round: equivalent_certificate.commit.round,
+                step: norn_common::consensus_types::VoteStep::Precommit,
+                block_id: Some(equivalent_certificate.commit.block_id),
+                stake_snapshot_hash: equivalent_certificate.commit.stake_snapshot_hash,
+                validator: norn_common::types::ValidatorId([9; 32]),
+                signature: [13; 64],
+            });
+        equivalent_certificate
+            .consensus_state
+            .commit_certificate_hash = equivalent_certificate.commit.certificate_hash();
+        assert_ne!(
+            FinalizeTransactionId::from_v2(&first).certificate_hash,
+            FinalizeTransactionId::from_v2(&equivalent_certificate).certificate_hash
+        );
+        assert_eq!(
+            store
+                .commit_finalized_transaction(&equivalent_certificate)
+                .await
+                .unwrap(),
+            FinalityCommitResult::AlreadyCommitted
+        );
+        assert_eq!(
+            store
+                .reconcile_finalized_transaction(&equivalent_certificate, &[], None, None)
+                .await
+                .unwrap(),
+            DurableCommitOutcome::AlreadyApplied
+        );
+
         let mut conflicting = finalized();
         conflicting.block.header.block_hash = Hash([10; 32]);
         conflicting.commit.block_id = BlockId(Hash([10; 32]));
@@ -934,5 +1122,78 @@ mod tests {
             FinalityCommitResult::AlreadyCommitted
         );
         assert_eq!(store.recover_finalized_v2(1).await.unwrap(), Some(block));
+    }
+
+    #[tokio::test]
+    async fn pending_validator_changes_are_recovered_with_finalized_record() {
+        let db = Arc::new(MemoryDb::default());
+        let store = FinalityStore::new(db);
+        store
+            .initialize_genesis_tip(&genesis_block(), StakeSnapshotHash([3; 32]), Hash([7; 32]))
+            .await
+            .unwrap();
+
+        let mut block = finalized();
+        let validator_id = ValidatorId([6; 32]);
+        block.consensus_state.pending_validator_changes = PendingValidatorChanges {
+            changes: vec![PendingValidatorChange {
+                effective_epoch: 3,
+                change: ValidatorChange::SetVotingPower {
+                    validator_id,
+                    voting_power: 7,
+                },
+            }],
+        };
+        let next_snapshot = norn_common::consensus_types::StakeSnapshot::from_genesis(
+            1,
+            vec![ValidatorRecord {
+                validator_id,
+                consensus_public_key: ConsensusPublicKey([1; 33]),
+                vrf_public_key: VrfPublicKey([2; 32]),
+                voting_power: 1,
+                jailed_until_epoch: None,
+                slashed: false,
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(
+            store
+                .commit_finalized_transaction_with_state_and_checkpoint_and_snapshot(
+                    &block,
+                    &[],
+                    None,
+                    Some(&next_snapshot),
+                )
+                .await
+                .unwrap(),
+            FinalityCommitResult::Applied
+        );
+
+        let recovered = store.recover_finalized_v2(1).await.unwrap().unwrap();
+        assert_eq!(
+            recovered.consensus_state.pending_validator_changes,
+            block.consensus_state.pending_validator_changes
+        );
+        assert_eq!(
+            store.recover_snapshot(1).await.unwrap(),
+            Some(next_snapshot.clone())
+        );
+
+        let mut conflicting = block.clone();
+        conflicting
+            .consensus_state
+            .pending_validator_changes
+            .changes[0]
+            .effective_epoch = 4;
+        assert!(store
+            .commit_finalized_transaction_with_state_and_checkpoint_and_snapshot(
+                &conflicting,
+                &[],
+                None,
+                Some(&next_snapshot),
+            )
+            .await
+            .is_err());
     }
 }

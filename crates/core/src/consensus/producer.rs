@@ -508,28 +508,70 @@ impl BlockProducer {
         limits: &ProtocolResourceLimits,
     ) -> Result<(Proposal, BlockV2)> {
         debug!("Starting V2 proposal production");
-        let block = self.produce_v2_block(context, limits).await?;
-        info!(
-            "V2 block template produced at height {}",
-            block.header.height
-        );
         let engine = self
             .consensus_engine
             .as_ref()
             .expect("V2 production checked consensus engine above");
-        let sm = engine.state_machine.read().await;
-        let valid_round = sm.valid_round;
-        let valid_round_certificate = sm.valid_round_certificate.clone();
-        drop(sm);
+
+        // Tendermint re-proposes the exact block that reached a valid-round
+        // polka.  Generating a fresh block here would change its block ID
+        // while carrying the old certificate, which is an invalid proposal
+        // and must be rejected by the wire validator.
+        let (height, round, valid_block, valid_round, valid_round_certificate) = {
+            let sm = engine.state_machine.read().await;
+            (
+                sm.height,
+                sm.round,
+                sm.valid_block,
+                sm.valid_round,
+                sm.valid_round_certificate.clone(),
+            )
+        };
+        let block = if let Some(valid_block_id) = valid_block {
+            let candidate = engine
+                .candidate_blocks_v2
+                .read()
+                .await
+                .get(&(height, valid_block_id))
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "valid-round block {:?} is not available for safe re-proposal",
+                        valid_block_id
+                    )
+                })?;
+            if candidate.header.height < 0 || candidate.header.height as u64 != height {
+                return Err(anyhow!(
+                    "valid-round candidate height does not match consensus height"
+                ));
+            }
+            candidate
+        } else {
+            if valid_round.is_some() || valid_round_certificate.is_some() {
+                return Err(anyhow!(
+                    "valid-round certificate exists without a valid block"
+                ));
+            }
+            self.produce_v2_block(context, limits).await?
+        };
+        info!(
+            "V2 block template produced at height {}",
+            block.header.height
+        );
+        let proposer = self
+            .proposal_signer
+            .as_ref()
+            .ok_or_else(|| anyhow!("V2 proposal requires a validator signer"))?
+            .validator_id();
         let vrf_context = VrfContext {
             protocol_version: block.header.protocol_version,
             chain_id: block.header.chain_id,
             epoch: block.header.epoch,
             height: block.header.height as u64,
-            round: block.header.round,
+            round,
             parent_block_hash: block.header.prev_block_hash,
             stake_snapshot_hash: block.header.stake_snapshot_hash,
-            validator_id: block.header.proposer,
+            validator_id: proposer,
         };
         let vrf_output = VRFCalculator::calculate_with_context(&self.vrf_key_pair, &vrf_context)?;
         let mut proposal = Proposal {
@@ -537,21 +579,18 @@ impl BlockProducer {
             chain_id: block.header.chain_id,
             epoch: block.header.epoch,
             height: block.header.height as u64,
-            round: block.header.round,
+            round,
             valid_round,
             valid_round_certificate,
             block_id: BlockId(block.header.block_hash),
             parent_block_hash: block.header.prev_block_hash,
             stake_snapshot_hash: block.header.stake_snapshot_hash,
-            proposer: block.header.proposer,
+            proposer,
             vrf_preout: vrf_output.preout.0,
             vrf_proof: vrf_output.proof.0,
             signature: [0u8; 64],
         };
-        let signer = self
-            .proposal_signer
-            .as_ref()
-            .ok_or_else(|| anyhow!("V2 proposal requires a validator signer"))?;
+        let signer = self.proposal_signer.as_ref().expect("signer checked above");
         proposal.signature = signer.sign_proposal(&proposal.canonical_bytes())?;
         let envelope = ConsensusEnvelope {
             wire_version: context.wire_version,
