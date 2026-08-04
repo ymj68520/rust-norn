@@ -108,6 +108,23 @@ The uncommitted follow-up addresses the latest review findings:
   parent, and no more than the Genesis `max_block_timestamp_step`; local time
   is used only when proposing.
 
+### Current P1 follow-up on `af8ea55`
+
+- A proposer whose wall clock is beyond the parent-relative timestamp window
+  now clamps its proposal timestamp to `parent + max_block_timestamp_step`
+  instead of rejecting every block after a long outage. The minimum and
+  maximum bounds use checked arithmetic.
+- Genesis rejects timestamp steps outside the signed `i64` timestamp range;
+  state-machine, finality, and producer paths use checked `u64`-to-`i64`
+  conversion rather than a wrapping cast.
+- The default consensus round bound is 63 for rounds `0..=63`, matching the
+  default 64-attempt durable budget. Genesis rejects a durable-attempt budget
+  that cannot cover every permitted round, and FinalityStore rejects sparse
+  proposals whose round is already outside that budget.
+- Durable candidate recovery requires the real node `ChainContext`, including
+  the configured Genesis hash. Legacy/unit-only constructors have no recovery
+  context and fail closed instead of manufacturing a V4/zero-Genesis context.
+
 ## Verification
 
 Passed:
@@ -122,11 +139,27 @@ cargo test --workspace --locked -j 1
 The current V5 changes additionally pass the focused wire-validation,
 candidate-cache, exact-round finality, durable-candidate, Genesis activation,
 concurrent SafetyStore, V5 randomness, V5 timestamp, and durable-attempt-bound
-regressions. `cargo check --workspace --all-features --locked` and
-`cargo test --workspace --all-features --locked -j 1` also pass. The focused
-common/core run includes 265 `norn-core` unit tests and 43 `norn-common` tests.
+regressions. The current P1 follow-up passes the timestamp clamp, timestamp
+range, round/attempt-bound, and context-gated recovery regressions. The
+focused common/core run includes 266 `norn-core` unit tests and 45
+`norn-common` tests; the full workspace/all-features gate must be rerun after
+this follow-up.
 
-`cargo audit --no-fetch --no-yanked` remains a failing security gate: it reports two `hickory-proto 0.25.2` vulnerabilities and 13 allowed maintenance/unsoundness warnings. One Hickory advisory has no fixed upgrade; the other requires `hickory-proto >=0.26.1`. Clippy with `-D warnings` also remains open because of existing warnings outside this follow-up.
+The full workspace/all-features gate also passes:
+
+```text
+cargo check --workspace --all-features --locked
+cargo test --workspace --all-features --locked -j 1
+cargo test -p norn --test four_process_v2_bft --locked -- --nocapture
+```
+
+The focused common/core run includes 266 `norn-core` unit tests and 45
+`norn-common` tests. `cargo audit --no-fetch --no-yanked` remains a failing
+security gate: it reports two `hickory-proto 0.25.2` vulnerabilities and 13
+allowed maintenance/unsoundness warnings. One Hickory advisory has no fixed
+upgrade; the other requires `hickory-proto >=0.26.1`. Clippy with `-D
+warnings` also remains open because of existing warnings outside this
+follow-up.
 
 ## Remaining work
 
@@ -144,5 +177,6 @@ Until these items are independently reviewed and accepted, the status remains:
 Candidate prototype
 Not production-ready
 Published follow-up implementation commits: `fe692408fe29e84261bca5b1c2bb4a35a2de434a`, `1c35717`
-Current V5 hardening: uncommitted on `6e6edc0`
+Published baseline: `af8ea55`
+Current P1 follow-up: uncommitted on `af8ea55`
 ```

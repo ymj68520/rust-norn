@@ -40,7 +40,7 @@ pub struct ProtocolResourceLimits {
 }
 
 fn default_max_consensus_round() -> u32 {
-    1_000_000
+    63
 }
 
 fn default_max_durable_attempts_per_height() -> u32 {
@@ -104,11 +104,20 @@ impl ProtocolResourceLimits {
             || self.max_block_bytes > MAX_BLOCK_MESSAGE_BYTES as u64
             || self.max_transaction_bytes > MAX_TRANSACTION_MESSAGE_BYTES as u64
             || self.max_block_gas > i64::MAX as u64
+            || self.max_block_timestamp_step > i64::MAX as u64
             || self.max_block_bytes > usize::MAX as u64
             || self.max_transaction_bytes > usize::MAX as u64
         {
             return Err(NornError::Config(
                 "Genesis resource limits exceed protocol bounds".into(),
+            ));
+        }
+        let max_round_attempts = self.max_consensus_round.checked_add(1).ok_or_else(|| {
+            NornError::Config("Genesis maximum consensus round overflows attempt accounting".into())
+        })?;
+        if self.max_durable_attempts_per_height < max_round_attempts {
+            return Err(NornError::Config(
+                "Genesis durable attempt bound must cover every consensus round".into(),
             ));
         }
         Ok(())
@@ -664,5 +673,23 @@ mod tests {
             .insert("unexpected_field".into(), serde_json::Value::Null);
 
         assert!(serde_json::from_value::<GenesisConfig>(value).is_err());
+    }
+
+    #[test]
+    fn resource_limits_reject_timestamp_steps_outside_i64() {
+        let mut limits = ProtocolResourceLimits::default();
+        limits.max_block_timestamp_step = i64::MAX as u64 + 1;
+        assert!(limits.validate().is_err());
+    }
+
+    #[test]
+    fn resource_limits_round_bound_covers_durable_attempts() {
+        let mut limits = ProtocolResourceLimits::default();
+        limits.max_consensus_round = 10;
+        limits.max_durable_attempts_per_height = 10;
+        assert!(limits.validate().is_err());
+
+        limits.max_durable_attempts_per_height = 11;
+        assert!(limits.validate().is_ok());
     }
 }

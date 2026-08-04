@@ -62,6 +62,25 @@ impl Default for BlockProducerConfig {
     }
 }
 
+/// Select a protocol-valid V5 timestamp even when the local clock is far
+/// ahead after a long outage.  Wall-clock time is only a proposal hint; the
+/// parent-relative bounds are consensus rules and are always applied.
+fn bounded_v2_timestamp(
+    parent_timestamp: i64,
+    max_timestamp_step: u64,
+    wall_clock_timestamp: i64,
+) -> Result<i64> {
+    let max_step = i64::try_from(max_timestamp_step)
+        .map_err(|_| anyhow!("block timestamp step exceeds i64 range"))?;
+    let minimum = parent_timestamp
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("minimum block timestamp overflows i64"))?;
+    let maximum = parent_timestamp
+        .checked_add(max_step)
+        .ok_or_else(|| anyhow!("maximum block timestamp overflows i64"))?;
+    Ok(wall_clock_timestamp.max(minimum).min(maximum))
+}
+
 /// Block producer state
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProducerState {
@@ -414,29 +433,19 @@ impl BlockProducer {
         let builder_vrf =
             VRFCalculator::calculate_with_context(&self.vrf_key_pair, &builder_vrf_context)?;
 
-        let timestamp = chrono::Utc::now()
-            .timestamp()
-            .max(tip.timestamp.saturating_add(1));
-        if timestamp <= tip.timestamp {
-            return Err(anyhow!(
-                "local clock did not advance beyond the canonical parent timestamp"
-            ));
-        }
-        let max_timestamp = tip
-            .timestamp
-            .checked_add(limits.max_block_timestamp_step as i64)
-            .ok_or_else(|| anyhow!("block timestamp upper bound overflow"))?;
-        if timestamp > max_timestamp {
-            return Err(anyhow!(
-                "local clock is beyond the protocol block timestamp window"
-            ));
-        }
+        let timestamp = bounded_v2_timestamp(
+            tip.timestamp,
+            limits.max_block_timestamp_step,
+            chrono::Utc::now().timestamp(),
+        )?;
+        let block_timestamp =
+            u64::try_from(timestamp).map_err(|_| anyhow!("block timestamp is negative"))?;
         let evm_context = self
             .v2_code_storage
             .as_ref()
             .map(|code_storage| V2ExecutionContext {
                 block_number: new_height,
-                block_timestamp: timestamp.max(0) as u64,
+                block_timestamp,
                 block_coinbase: Address(proposer.0[..20].try_into().unwrap_or([0u8; 20])),
                 block_gas_limit: limits.max_block_gas,
                 code_storage: code_storage.clone(),
@@ -720,6 +729,14 @@ mod tests {
     use super::*;
     use crate::state::AccountStateManager;
     use norn_storage::SledDB;
+
+    #[test]
+    fn v2_timestamp_clamps_a_clock_jump_to_the_protocol_window() {
+        assert_eq!(bounded_v2_timestamp(100, 30, 10_000).unwrap(), 130);
+        assert_eq!(bounded_v2_timestamp(100, 30, 101).unwrap(), 101);
+        assert_eq!(bounded_v2_timestamp(100, 30, 0).unwrap(), 101);
+        assert!(bounded_v2_timestamp(100, u64::MAX, 101).is_err());
+    }
 
     #[tokio::test]
     async fn test_block_producer_creation() {

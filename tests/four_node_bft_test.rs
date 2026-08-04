@@ -200,7 +200,7 @@ async fn test_four_node_bft_consensus_and_finality() {
             max_certificate_members: 4,
             max_future_height: 2,
             max_future_round: 2,
-            max_consensus_round: 1_000_000,
+            max_consensus_round: 63,
             max_block_timestamp_step: 30,
         };
 

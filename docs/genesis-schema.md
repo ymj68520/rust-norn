@@ -22,6 +22,12 @@ and verification task/queue bounds, plus maximum consensus round, durable
 proposal-attempt count/bytes per height, and parent-relative block timestamp
 step. Nodes may not increase these values locally.
 
+The active default permits consensus rounds `0..=63` and therefore requires
+at least 64 durable proposal attempts per height. Genesis validation rejects a
+round/attempt configuration that cannot durably cover every permitted round;
+`max_block_timestamp_step` must also fit in the signed `i64` block timestamp
+range.
+
 Validator records contain `validator_id`, `consensus_public_key`,
 `vrf_public_key`, and positive `voting_power`. Validator records are sorted by
 `validator_id` for canonical hashing, so JSON list order does not affect the

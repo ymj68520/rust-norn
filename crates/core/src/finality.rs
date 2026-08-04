@@ -265,6 +265,11 @@ impl FinalityStore {
         if proposal.round > self.resource_limits.max_consensus_round {
             bail!("proposal round exceeds the protocol consensus round bound");
         }
+        if u64::from(proposal.round)
+            >= u64::from(self.resource_limits.max_durable_attempts_per_height)
+        {
+            bail!("proposal round exceeds the durable attempt budget for this height");
+        }
         let block_key = safety_block_candidate_key(proposal.height, block_id);
         let attempt_key = safety_proposal_attempt_key(proposal.height, proposal.round, block_id);
         let height_index_key = safety_height_attempt_index_key(proposal.height);
@@ -764,9 +769,11 @@ impl FinalityStore {
             if finalized.block.header.timestamp <= current_tip.timestamp {
                 bail!("finalized block timestamp must be greater than the canonical parent");
             }
+            let max_step = i64::try_from(self.resource_limits.max_block_timestamp_step)
+                .map_err(|_| anyhow!("block timestamp step exceeds i64 range"))?;
             let max_timestamp = current_tip
                 .timestamp
-                .checked_add(self.resource_limits.max_block_timestamp_step as i64)
+                .checked_add(max_step)
                 .ok_or_else(|| anyhow!("finalized timestamp upper bound overflow"))?;
             if finalized.block.header.timestamp > max_timestamp {
                 bail!("finalized block timestamp exceeds the protocol parent-relative bound");

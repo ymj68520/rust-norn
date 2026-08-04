@@ -1232,7 +1232,7 @@ impl NornNode {
             .await?;
 
         let consensus = Arc::new(
-            PoVFEngine::new_with_parent_randomness_and_timestamp_and_limits(
+            PoVFEngine::new_with_parent_randomness_and_timestamp_and_limits_and_context(
                 consensus_config,
                 genesis_snapshot.clone(),
                 genesis_config.initial_randomness,
@@ -1240,6 +1240,7 @@ impl NornNode {
                 persistent_safety_store,
                 local_validator_id,
                 genesis_config.resource_limits.clone(),
+                Some(chain_context),
             ),
         );
         consensus.attach_finality_store(finality_store.clone());

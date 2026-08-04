@@ -441,6 +441,10 @@ pub struct PoVFEngine {
     pub finalized_blocks_v2: Arc<RwLock<HashMap<Hash, FinalizedBlockV2>>>,
     pub current_height: Arc<RwLock<u64>>,
     resource_limits: ProtocolResourceLimits,
+    /// The canonical context used when durable candidates are revalidated.
+    /// It is absent in legacy/unit-only constructors, which therefore fail
+    /// closed instead of inventing a Genesis identity during recovery.
+    chain_context: Option<ChainContext>,
     finality_store: StdRwLock<Option<Arc<FinalityStore>>>,
 }
 
@@ -492,7 +496,7 @@ impl PoVFEngine {
         local_validator_id: Option<ValidatorId>,
         resource_limits: ProtocolResourceLimits,
     ) -> Self {
-        Self::new_with_parent_randomness_and_timestamp_and_limits(
+        Self::new_with_parent_randomness_and_timestamp_and_limits_and_context(
             config,
             snapshot,
             parent_randomness,
@@ -500,6 +504,7 @@ impl PoVFEngine {
             safety_store,
             local_validator_id,
             resource_limits,
+            None,
         )
     }
 
@@ -511,6 +516,28 @@ impl PoVFEngine {
         safety_store: Arc<dyn ConsensusSafetyStore>,
         local_validator_id: Option<ValidatorId>,
         resource_limits: ProtocolResourceLimits,
+    ) -> Self {
+        Self::new_with_parent_randomness_and_timestamp_and_limits_and_context(
+            config,
+            snapshot,
+            parent_randomness,
+            parent_timestamp,
+            safety_store,
+            local_validator_id,
+            resource_limits,
+            None,
+        )
+    }
+
+    pub fn new_with_parent_randomness_and_timestamp_and_limits_and_context(
+        config: ConsensusConfig,
+        snapshot: StakeSnapshot,
+        parent_randomness: Hash,
+        parent_timestamp: i64,
+        safety_store: Arc<dyn ConsensusSafetyStore>,
+        local_validator_id: Option<ValidatorId>,
+        resource_limits: ProtocolResourceLimits,
+        chain_context: Option<ChainContext>,
     ) -> Self {
         let state_machine = TendermintStateMachine::new_with_parent_timestamp(
             config,
@@ -530,6 +557,7 @@ impl PoVFEngine {
             finalized_blocks_v2: Arc::new(RwLock::new(HashMap::new())),
             current_height: Arc::new(RwLock::new(1)),
             resource_limits,
+            chain_context,
             finality_store: StdRwLock::new(None),
         }
     }
@@ -861,6 +889,9 @@ impl PoVFEngine {
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        let Some(context) = self.chain_context else {
+            return false;
+        };
         for block_id in required {
             let present = self
                 .candidate_cache_v2
@@ -885,18 +916,12 @@ impl PoVFEngine {
                 (sm.height, sm.round)
             };
             for candidate in candidates {
-                let (context, verified_randomness) = {
+                let verified_randomness = {
                     let sm = self.state_machine.read().await;
-                    let context = ChainContext::new(
-                        4,
-                        sm.config.protocol_version,
-                        sm.config.chain_id,
-                        Hash::default(),
-                    );
                     let verified = sm
                         .validate_v2_proposal_for_recovery(&candidate.proposal, &candidate.block)
                         .ok();
-                    (context, verified.map(|output| Hash(output.randomness)))
+                    verified.map(|output| Hash(output.randomness))
                 };
                 if candidate
                     .block
@@ -1016,14 +1041,9 @@ impl PoVFEngine {
         {
             return None;
         }
+        let context = self.chain_context?;
         let (current_height, current_round, context, verified_randomness) = {
             let sm = self.state_machine.read().await;
-            let context = ChainContext::new(
-                4,
-                sm.config.protocol_version,
-                sm.config.chain_id,
-                Hash::default(),
-            );
             let verified = sm
                 .validate_v2_proposal_for_recovery(&attempt.proposal, &block)
                 .ok()

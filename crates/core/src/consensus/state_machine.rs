@@ -697,9 +697,11 @@ impl TendermintStateMachine {
                 "block timestamp must be greater than parent timestamp"
             ));
         }
+        let max_step = i64::try_from(self.config.max_block_timestamp_step)
+            .map_err(|_| anyhow!("block timestamp step exceeds i64 range"))?;
         let latest = self
             .parent_timestamp
-            .checked_add(self.config.max_block_timestamp_step as i64)
+            .checked_add(max_step)
             .ok_or_else(|| anyhow!("block timestamp upper bound overflow"))?;
         if timestamp > latest {
             return Err(anyhow!(

@@ -109,6 +109,13 @@ libFuzzer target against the same `decode_and_validate` entry point.
 - durable block candidate index updates are serialized against concurrent
   attempt writes and finality cleanup; the separate per-height attempt index
   bounds competing block IDs as well as proposal rounds;
+- producer timestamp recovery clamps wall-clock jumps to the protocol window;
+  Genesis rejects timestamp steps above `i64::MAX`, and all parent-relative
+  timestamp arithmetic uses checked conversion/addition;
+- the durable attempt budget covers every consensus round permitted by
+  Genesis, and sparse proposals beyond that budget fail closed;
+- durable candidate recovery requires the actual node `ChainContext` and
+  Genesis hash; a missing context is a recovery failure;
 - the full workspace test suite is green.
 
 These checks are completion gates, not evidence that an unreviewed deployment
