@@ -1221,6 +1221,7 @@ impl NornNode {
             local_validator_id,
             genesis_config.resource_limits.clone(),
         ));
+        consensus.attach_finality_store(finality_store.clone());
         {
             let sm = consensus.state_machine.read().await;
             info!(
@@ -1346,6 +1347,12 @@ impl NornNode {
                 "Restored consensus safety state at height {} round {} step {:?}",
                 sm.height, sm.round, sm.step
             );
+        }
+
+        if !consensus.reconcile_v2_candidate_retention().await {
+            return Err(anyhow!(
+                "durable consensus safety state references a V2 candidate that cannot be recovered"
+            ));
         }
 
         let block_producer = match (config.node_role, vrf_key_pair, signer.clone()) {

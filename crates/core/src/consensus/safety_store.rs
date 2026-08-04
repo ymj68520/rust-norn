@@ -334,6 +334,11 @@ pub struct PersistentSafetyStore {
     state: Mutex<(HashMap<SafetyIndexKey, SafetyRecord>, BufWriter<File>)>,
     consensus_state_path: PathBuf,
     consensus_state: Mutex<(Option<DurableConsensusSafetyState>, u64)>,
+    /// Serializes allocation of the monotonic companion-state sequence with
+    /// vote intent/completion frames. Without this transaction boundary two
+    /// concurrent writers can observe the same last sequence and persist
+    /// ambiguous ordering.
+    transaction_lock: Mutex<()>,
 }
 
 impl PersistentSafetyStore {
@@ -485,6 +490,7 @@ impl PersistentSafetyStore {
             state: Mutex::new((map, writer)),
             consensus_state_path,
             consensus_state: Mutex::new((durable_state, state_sequence)),
+            transaction_lock: Mutex::new(()),
         })
     }
 }
@@ -496,6 +502,10 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
         signer: &dyn ConsensusSigner,
         mut state_after: Option<DurableConsensusSafetyState>,
     ) -> Result<SignedVote, SafetyError> {
+        let _transaction_guard = self
+            .transaction_lock
+            .lock()
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
         if let Some(state) = state_after.as_mut() {
             let guard = self
                 .consensus_state
@@ -657,6 +667,10 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
         &self,
         mut state: DurableConsensusSafetyState,
     ) -> Result<(), SafetyError> {
+        let _transaction_guard = self
+            .transaction_lock
+            .lock()
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
         let mut state_guard = self
             .consensus_state
             .lock()
@@ -860,5 +874,48 @@ mod tests {
         let recovered = PersistentSafetyStore::open(&path).unwrap();
         let recovered_state = recovered.load_consensus_state().unwrap().unwrap();
         assert_eq!(recovered_state, persisted);
+    }
+
+    #[test]
+    fn persistent_sequence_allocator_is_serialized_across_threads() {
+        use std::sync::Arc;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("safety-concurrent.log");
+        let store = Arc::new(PersistentSafetyStore::open(&path).unwrap());
+        let mut workers = Vec::new();
+        for index in 0..16u64 {
+            let store = Arc::clone(&store);
+            workers.push(std::thread::spawn(move || {
+                store
+                    .persist_consensus_state(DurableConsensusSafetyState {
+                        sequence: 0,
+                        protocol_version: ProtocolVersion(2),
+                        chain_id: ChainId(Hash([12; 32])),
+                        epoch: 1,
+                        height: 20,
+                        round: index as u32,
+                        step: ConsensusStep::PrecommitWait,
+                        stake_snapshot_hash: StakeSnapshotHash([13; 32]),
+                        parent_randomness: Hash([14; 32]),
+                        locked_block: None,
+                        locked_round: None,
+                        valid_block: None,
+                        valid_round: None,
+                        valid_round_certificate: None,
+                    })
+                    .unwrap();
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(store.load_consensus_state().unwrap().unwrap().sequence, 16);
+        drop(store);
+        let recovered = PersistentSafetyStore::open(&path).unwrap();
+        assert_eq!(
+            recovered.load_consensus_state().unwrap().unwrap().sequence,
+            16
+        );
     }
 }

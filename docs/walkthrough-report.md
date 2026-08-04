@@ -2,7 +2,11 @@
 
 ## Scope
 
-This report records the published V2 follow-up on top of commit `e3c4745`, committed as `fe692408fe29e84261bca5b1c2bb4a35a2de434a`, plus the current uncommitted P0/P1 hardening work on `78fabac`. The project remains a Candidate prototype; this report does not declare production readiness.
+This report records the published V2 follow-up on top of commit `e3c4745`,
+including `fe692408fe29e84261bca5b1c2bb4a35a2de434a` and the published
+integration commit `1c35717` (parent `78fabac`). It also records the current
+uncommitted next-round hardening in the worktree. The project remains a
+Candidate prototype; this report does not declare production readiness.
 
 ## Implemented in this follow-up
 
@@ -29,7 +33,7 @@ The driver now retries only explicitly typed, idempotent action failures with a 
 - FullNode may originate the four V2 synchronization request/response payloads, but not proposal, vote, or certificate broadcasts.
 - FullNode synchronization and recovery paths now have explicit response/request logging.
 
-### Current P0/P1 follow-up
+### Published P0/P1 follow-up (`1c35717`)
 
 The uncommitted follow-up addresses the latest review findings:
 
@@ -48,11 +52,28 @@ The uncommitted follow-up addresses the latest review findings:
   the single-writer actor. High-priority timeout and consensus events therefore
   remain processable while an idempotent broadcast is waiting for its bounded
   retry.
-- Valid-round re-proposals now preserve the exact previously accepted block:
-  the proposal may advance to a later consensus round while the block header
-  retains its original valid-round, which is part of the block ID. Wire,
-  finalized-record, and pending-proposal admission all enforce this relation
-  and reject impossible round combinations.
+
+### Current next-round worktree changes
+
+- `BlockHeader.block_builder` is now the stable original block builder, while
+  `Proposal.proposer` remains the current-round proposer. A valid-round
+  re-proposal by validator B can therefore carry the exact block built by A;
+  the block ID and header commitments remain unchanged.
+- Fresh proposals require `block_builder == proposer` and equal proposal/header
+  rounds. Re-proposals require a certificate with `valid_round < proposal.round`,
+  matching certificate round/block ID, and header round equal to `valid_round`.
+  Equal, greater, missing, and mismatched valid-round inputs fail closed.
+- Complete validated candidates (Proposal, BlockV2, and derived randomness) are
+  persisted in FinalityStore, recovered before a validator resumes production,
+  and cleared only after durable finality. A missing body for a durable lock or
+  valid reference is a startup/reconciliation failure.
+- Persistent SafetyStore sequence allocation is serialized across vote and
+  companion-state WAL transactions; a concurrent regression test verifies
+  monotonic recovery without sequence reuse.
+- The header field and hash layout change is a protocol-incompatible V2 schema
+  change. It requires a new versioned Genesis/network activation or an explicit
+  activation-height migration; old serialized blocks must not be guessed into
+  the new layout.
 
 ## Verification
 
@@ -65,11 +86,11 @@ cargo test -p norn-core --test four_node_bft_test --locked
 cargo test --workspace --locked -j 1
 ```
 
-The current uncommitted changes additionally pass the focused driver,
-SafetyStore, state-machine, and wire-validation suites, the finality-timeout
-race regression, the standalone four-node BFT test, and the four-process
-Validator/FullNode recovery test, including proposer restart and valid-round
-re-proposal.
+The current next-round changes additionally pass the focused wire-validation,
+candidate-cache, durable-candidate, and concurrent SafetyStore regressions.
+The previously published workspace and four-process recovery gates remain the
+baseline for `1c35717`; the full workspace suite must be rerun after this
+worktree is reviewed.
 
 The workspace run passed. It included the four-process Validator/FullNode BFT recovery test, 258 `norn-core` unit tests, 40 `norn-common` tests, the standalone four-node BFT test, all crate tests, and doc tests.
 
@@ -90,6 +111,6 @@ Until these items are independently reviewed and accepted, the status remains:
 ```text
 Candidate prototype
 Not production-ready
-Published follow-up implementation commit: `fe692408fe29e84261bca5b1c2bb4a35a2de434a`
-Current P0/P1 follow-up: uncommitted on `78fabac`
+Published follow-up implementation commits: `fe692408fe29e84261bca5b1c2bb4a35a2de434a`, `1c35717`
+Current next-round hardening: uncommitted on `1c35717`
 ```

@@ -524,7 +524,7 @@ mod tests {
                 block_hash: Hash::default(),
                 merkle_root: Hash::default(),
                 state_root: Hash::default(),
-                proposer: norn_common::types::ValidatorId([0u8; 32]),
+                block_builder: norn_common::types::ValidatorId([0u8; 32]),
                 stake_snapshot_hash: norn_common::types::StakeSnapshotHash::default(),
                 parent_randomness: Hash::default(),
                 gas_limit: 1000000,

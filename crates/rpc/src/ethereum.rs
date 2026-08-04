@@ -444,7 +444,7 @@ impl EthereumRpcImpl {
         let mut miner_address = Address([0u8; 20]);
         miner_address
             .0
-            .copy_from_slice(&block.header.proposer.0[..20]);
+            .copy_from_slice(&block.header.block_builder.0[..20]);
         Block {
             hash: format!("0x{}", block.header.block_hash),
             parent_hash: format!("0x{}", block.header.prev_block_hash),
@@ -611,7 +611,7 @@ impl EthereumRpcServer for EthereumRpcImpl {
         let mut coinbase_addr = Address([0u8; 20]);
         coinbase_addr
             .0
-            .copy_from_slice(&latest.header.proposer.0[..20]);
+            .copy_from_slice(&latest.header.block_builder.0[..20]);
         let ctx = EVMContext {
             block_number: latest.header.height as u64,
             block_timestamp: latest.header.timestamp as u64,

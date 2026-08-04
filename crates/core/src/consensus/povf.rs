@@ -8,6 +8,7 @@ use crate::evm::CodeStorage;
 use crate::execution::{
     calculate_v2_execution_data_hash, execute_v2_block, V2BlockExecution, V2ExecutionContext,
 };
+use crate::finality::FinalityStore;
 use crate::state::AccountStateManager;
 use k256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use norn_common::chain_context::ChainContext;
@@ -19,7 +20,7 @@ use norn_common::error::{NornError, Result};
 use norn_common::genesis::ProtocolResourceLimits;
 use norn_common::types::{Block, BlockHeader, BlockId, BlockV2, Hash, ValidatorId};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -169,9 +170,27 @@ impl V2CandidateCache {
             .count()
     }
 
+    fn count_for_proposer_except(
+        &self,
+        height: u64,
+        proposer: ValidatorId,
+        except: (u64, BlockId),
+    ) -> usize {
+        self.entries
+            .iter()
+            .filter(|(key, entry)| {
+                **key != except
+                    && entry.proposal.height == height
+                    && entry.proposal.proposer == proposer
+            })
+            .count()
+    }
+
     /// Admit a candidate after enforcing future windows, TTL, per-height,
-    /// per-proposer and total-byte limits. Existing identical entries are
-    /// idempotent; conflicting content for one block ID is rejected.
+    /// per-proposer and total-byte limits. A valid-round re-proposal may carry
+    /// a new Proposal (and derived VRF randomness) for the same exact block;
+    /// the candidate body and block ID remain immutable while the proposal
+    /// metadata is refreshed. Conflicting content for one block ID is rejected.
     pub fn insert(
         &mut self,
         proposal: Proposal,
@@ -183,10 +202,45 @@ impl V2CandidateCache {
         let now = Instant::now();
         self.prune_expired(now);
         let key = (proposal.height, proposal.block_id);
-        if let Some(existing) = self.entries.get(&key) {
-            return existing.proposal == proposal
-                && existing.block == block
-                && existing.derived_randomness == derived_randomness;
+        if let Some(existing) = self.entries.get(&key).cloned() {
+            if existing.block != block {
+                return false;
+            }
+            if proposal.height > current_height.saturating_add(self.limits.max_future_height)
+                || proposal.round > current_round.saturating_add(self.limits.max_future_round)
+            {
+                return false;
+            }
+            let Some(encoded_bytes) = Self::encoded_size(&proposal, &block) else {
+                return false;
+            };
+            if encoded_bytes > self.limits.max_total_bytes {
+                return false;
+            }
+            if proposal.proposer != existing.proposal.proposer
+                && self.count_for_proposer_except(proposal.height, proposal.proposer, key)
+                    >= self.limits.max_items_per_proposer
+            {
+                return false;
+            }
+            let new_total = self
+                .total_bytes
+                .saturating_sub(existing.encoded_bytes)
+                .saturating_add(encoded_bytes);
+            if new_total > self.limits.max_total_bytes {
+                return false;
+            }
+            self.total_bytes = new_total;
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.proposal = proposal;
+                entry.block = block;
+                entry.derived_randomness = derived_randomness;
+                entry.inserted_at = now;
+                entry.encoded_bytes = encoded_bytes;
+                // Keep consensus-driven retention and pending-finality pins.
+                entry.retention = existing.retention;
+            }
+            return true;
         }
         if proposal.height > current_height.saturating_add(self.limits.max_future_height)
             || proposal.round > current_round.saturating_add(self.limits.max_future_round)
@@ -360,6 +414,7 @@ pub struct PoVFEngine {
     pub finalized_blocks: Arc<RwLock<HashMap<Hash, FinalizedBlock>>>,
     pub finalized_blocks_v2: Arc<RwLock<HashMap<Hash, FinalizedBlockV2>>>,
     pub current_height: Arc<RwLock<u64>>,
+    finality_store: StdRwLock<Option<Arc<FinalityStore>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -426,7 +481,38 @@ impl PoVFEngine {
             finalized_blocks: Arc::new(RwLock::new(HashMap::new())),
             finalized_blocks_v2: Arc::new(RwLock::new(HashMap::new())),
             current_height: Arc::new(RwLock::new(1)),
+            finality_store: StdRwLock::new(None),
         }
+    }
+
+    pub fn attach_finality_store(&self, finality_store: Arc<FinalityStore>) {
+        if let Ok(mut slot) = self.finality_store.write() {
+            *slot = Some(finality_store);
+        }
+    }
+
+    fn attached_finality_store(&self) -> Option<Arc<FinalityStore>> {
+        self.finality_store
+            .read()
+            .ok()
+            .and_then(|store| store.clone())
+    }
+
+    async fn persist_candidate_durably(
+        &self,
+        proposal: &Proposal,
+        block: &BlockV2,
+        derived_randomness: Hash,
+    ) -> Result<()> {
+        if let Some(store) = self.attached_finality_store() {
+            store
+                .persist_safety_candidate(proposal, block, derived_randomness)
+                .await
+                .map_err(|error| {
+                    NornError::ConsensusError(format!("persist safety candidate: {error}"))
+                })?;
+        }
+        Ok(())
     }
 
     pub async fn handle_proposal(
@@ -477,7 +563,7 @@ impl PoVFEngine {
             block_number: block.header.height.max(0) as u64,
             block_timestamp: block.header.timestamp.max(0) as u64,
             block_coinbase: norn_common::types::Address(
-                block.header.proposer.0[..20]
+                block.header.block_builder.0[..20]
                     .try_into()
                     .map_err(|_| NornError::ConsensusError("invalid proposer ID".into()))?,
             ),
@@ -525,6 +611,8 @@ impl PoVFEngine {
                 NornError::ConsensusError("V2 proposal is missing derived randomness".into())
             })?;
         drop(sm);
+        self.persist_candidate_durably(&proposal, &block, derived_randomness)
+            .await?;
         if !self.candidate_cache_v2.write().await.insert(
             proposal,
             block,
@@ -565,6 +653,8 @@ impl PoVFEngine {
         if proposal.height != current_height || proposal.round != current_round {
             return Ok(None);
         }
+        self.persist_candidate_durably(&proposal, &block, derived_randomness)
+            .await?;
         if !self.candidate_cache_v2.write().await.insert(
             proposal.clone(),
             block.clone(),
@@ -633,7 +723,7 @@ impl PoVFEngine {
             block_number: block.header.height.max(0) as u64,
             block_timestamp: block.header.timestamp.max(0) as u64,
             block_coinbase: norn_common::types::Address(
-                block.header.proposer.0[..20]
+                block.header.block_builder.0[..20]
                     .try_into()
                     .map_err(|_| NornError::ConsensusError("invalid proposer ID".into()))?,
             ),
@@ -682,6 +772,17 @@ impl PoVFEngine {
             let sm = self.state_machine.read().await;
             (sm.height, sm.round)
         };
+        if self
+            .persist_candidate_durably(
+                &candidate.proposal,
+                &candidate.block,
+                candidate.derived_randomness,
+            )
+            .await
+            .is_err()
+        {
+            return false;
+        }
         self.candidate_cache_v2.write().await.insert(
             candidate.proposal.clone(),
             candidate.block.clone(),
@@ -700,6 +801,40 @@ impl PoVFEngine {
             let sm = self.state_machine.read().await;
             (sm.height, sm.valid_block, sm.locked_block)
         };
+        let required = [valid_block, locked_block]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        for block_id in required {
+            let present = self
+                .candidate_cache_v2
+                .write()
+                .await
+                .get(height, block_id)
+                .is_some();
+            if present {
+                continue;
+            }
+            let Some(store) = self.attached_finality_store() else {
+                return false;
+            };
+            let Ok(Some(candidate)) = store.recover_safety_candidate(height, block_id).await else {
+                return false;
+            };
+            let (current_height, current_round) = {
+                let sm = self.state_machine.read().await;
+                (sm.height, sm.round)
+            };
+            if !self.candidate_cache_v2.write().await.insert(
+                candidate.proposal,
+                candidate.block,
+                candidate.derived_randomness,
+                current_height,
+                current_round,
+            ) {
+                return false;
+            }
+        }
         self.candidate_cache_v2
             .write()
             .await
@@ -707,6 +842,21 @@ impl PoVFEngine {
     }
 
     pub async fn pin_v2_candidate_for_finality(&self, height: u64, block_id: BlockId) -> bool {
+        let candidate = self.candidate_cache_v2.write().await.get(height, block_id);
+        let Some(candidate) = candidate else {
+            return false;
+        };
+        if self
+            .persist_candidate_durably(
+                &candidate.proposal,
+                &candidate.block,
+                candidate.derived_randomness,
+            )
+            .await
+            .is_err()
+        {
+            return false;
+        }
         self.candidate_cache_v2
             .write()
             .await
@@ -771,7 +921,7 @@ impl PoVFEngine {
             block_number: block.header.height.max(0) as u64,
             block_timestamp: block.header.timestamp.max(0) as u64,
             block_coinbase: norn_common::types::Address(
-                block.header.proposer.0[..20]
+                block.header.block_builder.0[..20]
                     .try_into()
                     .map_err(|_| NornError::ConsensusError("invalid proposer ID".into()))?,
             ),
@@ -1116,6 +1266,17 @@ impl PoVFEngine {
                 finalized_blocks.insert(hash, finalized.clone());
             }
         }
+        if let Some(store) = self.attached_finality_store() {
+            store
+                .clear_safety_candidate(
+                    finalized.block.header.height as u64,
+                    BlockId(finalized.block.header.block_hash),
+                )
+                .await
+                .map_err(|error| {
+                    NornError::ConsensusError(format!("clear durable safety candidate: {error}"))
+                })?;
+        }
         self.candidate_cache_v2
             .write()
             .await
@@ -1212,6 +1373,31 @@ mod tests {
             1,
             0
         ));
+    }
+
+    #[test]
+    fn valid_round_reproposal_updates_metadata_without_changing_candidate_body() {
+        let mut cache = V2CandidateCache::new(V2CandidateCacheLimits {
+            max_total_bytes: 1_000_000,
+            max_items_per_height: 1,
+            max_items_per_proposer: 1,
+            max_future_height: 0,
+            max_future_round: 1,
+            ttl: Duration::from_secs(60),
+        });
+        let first = cache_proposal(1, 0, 7, 1);
+        let block = BlockV2::default();
+        assert!(cache.insert(first.clone(), block.clone(), Hash([1; 32]), 1, 0));
+
+        let mut reproposal = first.clone();
+        reproposal.proposer = ValidatorId([2; 32]);
+        reproposal.round = 1;
+        assert!(cache.insert(reproposal.clone(), block.clone(), Hash([2; 32]), 1, 1));
+        let recovered = cache.get(1, first.block_id).expect("candidate retained");
+        assert_eq!(recovered.block, block);
+        assert_eq!(recovered.proposal.proposer, ValidatorId([2; 32]));
+        assert_eq!(recovered.derived_randomness, Hash([2; 32]));
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]

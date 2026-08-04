@@ -839,6 +839,7 @@ impl TendermintStateMachine {
         block: &BlockV2,
         signer: &dyn ConsensusSigner,
     ) -> Result<SignedVote> {
+        validate_v2_proposal_builder_relation(proposal, &block.header)?;
         self.handle_proposal_header(proposal, &block.header, signer)
             .map(|(vote, _)| vote)
     }
@@ -851,6 +852,7 @@ impl TendermintStateMachine {
         block: &BlockV2,
         signer: &dyn ConsensusSigner,
     ) -> Result<(SignedVote, Option<VerifiedVrfOutput>)> {
+        validate_v2_proposal_builder_relation(proposal, &block.header)?;
         self.handle_proposal_header(proposal, &block.header, signer)
     }
 
@@ -879,6 +881,7 @@ impl TendermintStateMachine {
         {
             return Err(anyhow!("V2 proposal context mismatch"));
         }
+        validate_v2_proposal_builder_relation(proposal, &block.header)?;
         let expected_proposer = self
             .get_current_proposer()
             .ok_or_else(|| anyhow!("no deterministic proposer is available"))?;
@@ -1478,4 +1481,44 @@ impl TendermintStateMachine {
         self.persist_durable_safety_state()?;
         Ok(())
     }
+}
+
+fn validate_v2_proposal_builder_relation(
+    proposal: &Proposal,
+    block_header: &BlockHeader,
+) -> Result<()> {
+    if block_header.block_builder.0 == [0u8; 32] {
+        return Err(anyhow!("V2 proposal block builder must be non-zero"));
+    }
+    match (
+        proposal.valid_round,
+        proposal.valid_round_certificate.as_ref(),
+    ) {
+        (None, None) if proposal.proposer == block_header.block_builder => {
+            if block_header.round != proposal.round {
+                return Err(anyhow!(
+                    "fresh V2 proposal round does not match block round"
+                ));
+            }
+        }
+        (Some(valid_round), Some(certificate))
+            if valid_round < proposal.round
+                && certificate.round == valid_round
+                && certificate.block_id == proposal.block_id
+                && block_header.round == valid_round => {}
+        (None, Some(_)) => {
+            return Err(anyhow!(
+                "fresh V2 proposal cannot carry a valid-round certificate"
+            ));
+        }
+        (Some(_), None) => {
+            return Err(anyhow!(
+                "V2 valid-round proposal is missing its certificate"
+            ));
+        }
+        _ => {
+            return Err(anyhow!("V2 proposal valid-round relation is invalid"));
+        }
+    }
+    Ok(())
 }

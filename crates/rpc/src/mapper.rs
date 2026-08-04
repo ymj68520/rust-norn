@@ -13,7 +13,7 @@ impl From<Block> for proto::Block {
                 block_hash: hex::encode(b.header.block_hash.0),
                 prev_block_hash: hex::encode(b.header.prev_block_hash.0),
                 merkle_root: hex::encode(b.header.merkle_root.0),
-                public: hex::encode(b.header.proposer.0),
+                public: hex::encode(b.header.block_builder.0),
                 params: hex::encode(b.header.parent_randomness.0),
                 gas_limit: b.header.gas_limit as u64,
             }),
@@ -146,7 +146,7 @@ impl From<proto::Block> for Block {
                 hash
             },
             state_root: Hash::default(),
-            proposer: {
+            block_builder: {
                 let mut validator_id = norn_common::types::ValidatorId([0u8; 32]);
                 if let Ok(bytes) = hex::decode(&proto_header.public) {
                     if bytes.len() == 32 {

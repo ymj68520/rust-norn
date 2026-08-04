@@ -120,7 +120,7 @@ async fn test_four_node_bft_consensus_and_finality() {
         block_hash: Hash::default(),
         merkle_root: Hash::default(),
         state_root: Hash::default(),
-        proposer: expected_proposer,
+        block_builder: expected_proposer,
         stake_snapshot_hash: snapshot.snapshot_hash.clone(),
         parent_randomness,
         gas_limit: 10000000,

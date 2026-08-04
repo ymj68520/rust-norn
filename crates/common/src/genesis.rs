@@ -346,7 +346,7 @@ fn append_block_header(bytes: &mut Vec<u8>, header: &BlockHeader) {
     bytes.extend_from_slice(&header.block_hash.0);
     bytes.extend_from_slice(&header.merkle_root.0);
     bytes.extend_from_slice(&header.state_root.0);
-    bytes.extend_from_slice(&header.proposer.0);
+    bytes.extend_from_slice(&header.block_builder.0);
     bytes.extend_from_slice(&header.stake_snapshot_hash.0);
     bytes.extend_from_slice(&header.parent_randomness.0);
     bytes.extend_from_slice(&header.gas_limit.to_be_bytes());
@@ -378,7 +378,7 @@ pub fn get_genesis_block() -> Block {
         block_hash: GENESIS_BLOCK_HASH,
         merkle_root: Hash::default(),
         state_root: Hash::default(),
-        proposer: crate::types::ValidatorId([0u8; 32]),
+        block_builder: crate::types::ValidatorId([0u8; 32]),
         stake_snapshot_hash: crate::types::StakeSnapshotHash::default(),
         parent_randomness: GENESIS_SEED,
         gas_limit: GENESIS_GAS_LIMIT,

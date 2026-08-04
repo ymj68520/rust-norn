@@ -267,11 +267,16 @@ impl ConsensusEnvelope {
                     || proposal.chain_id != block.header.chain_id
                     || proposal.epoch != block.header.epoch
                     || proposal.stake_snapshot_hash != block.header.stake_snapshot_hash
-                    || proposal.proposer != block.header.proposer
+                    || (proposal.valid_round.is_none()
+                        && proposal.proposer != block.header.block_builder)
                 {
                     return Err(protocol_error("proposal and block contexts do not match"));
                 }
-                validate_proposal_block_round(proposal, block.header.round)?;
+                validate_proposal_block_round(
+                    proposal,
+                    block.header.round,
+                    block.header.block_builder,
+                )?;
                 if block.header.height < 0 || proposal.height != block.header.height as u64 {
                     return Err(protocol_error(
                         "proposal height does not match block header",
@@ -314,7 +319,8 @@ impl ConsensusEnvelope {
                     || proposal.chain_id != block.header.chain_id
                     || proposal.epoch != block.header.epoch
                     || proposal.stake_snapshot_hash != block.header.stake_snapshot_hash
-                    || proposal.proposer != block.header.proposer
+                    || (proposal.valid_round.is_none()
+                        && proposal.proposer != block.header.block_builder)
                     || block.header.height < 0
                     || proposal.height != block.header.height as u64
                 {
@@ -322,7 +328,11 @@ impl ConsensusEnvelope {
                         "V2 proposal and block contexts do not match",
                     ));
                 }
-                validate_proposal_block_round(proposal, block.header.round)?;
+                validate_proposal_block_round(
+                    proposal,
+                    block.header.round,
+                    block.header.block_builder,
+                )?;
                 // Apply the active Genesis limits at the same admission
                 // boundary as the context and commitment checks.
                 block.validate_structure(
@@ -377,7 +387,8 @@ impl ConsensusEnvelope {
                     || proposal.chain_id != block.header.chain_id
                     || proposal.epoch != block.header.epoch
                     || proposal.stake_snapshot_hash != block.header.stake_snapshot_hash
-                    || proposal.proposer != block.header.proposer
+                    || (proposal.valid_round.is_none()
+                        && proposal.proposer != block.header.block_builder)
                     || block.header.height < 0
                     || proposal.height != block.header.height as u64
                 {
@@ -385,7 +396,11 @@ impl ConsensusEnvelope {
                         "V2 block response proposal and block contexts do not match",
                     ));
                 }
-                validate_proposal_block_round(proposal, block.header.round)?;
+                validate_proposal_block_round(
+                    proposal,
+                    block.header.round,
+                    block.header.block_builder,
+                )?;
                 block.validate_structure(
                     &ChainContext {
                         wire_version: self.wire_version,
@@ -561,7 +576,7 @@ fn validate_finalized_v2(
         || proposal.chain_id != block.header.chain_id
         || proposal.epoch != block.header.epoch
         || proposal.stake_snapshot_hash != block.header.stake_snapshot_hash
-        || proposal.proposer != block.header.proposer
+        || (proposal.valid_round.is_none() && proposal.proposer != block.header.block_builder)
         || block.header.height < 0
         || proposal.height != block.header.height as u64
     {
@@ -569,7 +584,7 @@ fn validate_finalized_v2(
             "V2 finalized record proposal and block contexts do not match",
         ));
     }
-    validate_proposal_block_round(proposal, block.header.round)?;
+    validate_proposal_block_round(proposal, block.header.round, block.header.block_builder)?;
     block.validate_structure(
         &ChainContext {
             wire_version: envelope.wire_version,
@@ -722,16 +737,41 @@ fn validate_prevote_certificate(
 /// Polka. The proposal's consensus round therefore advances while the block
 /// header's original round remains part of the block ID. Fresh proposals have
 /// no valid-round certificate and must use the same round in both objects.
-fn validate_proposal_block_round(proposal: &Proposal, block_round: u32) -> Result<()> {
-    let expected_block_round = proposal.valid_round.unwrap_or(proposal.round);
-    if proposal
-        .valid_round
-        .is_some_and(|valid_round| valid_round > proposal.round)
-        || block_round != expected_block_round
-    {
-        return Err(protocol_error(
-            "proposal valid-round and block round relation is invalid",
-        ));
+/// The block builder is deliberately independent from the current-round
+/// proposer so a valid block can be re-proposed after proposer rotation.
+fn validate_proposal_block_round(
+    proposal: &Proposal,
+    block_round: u32,
+    block_builder: ValidatorId,
+) -> Result<()> {
+    if block_builder.0 == [0u8; 32] {
+        return Err(protocol_error("proposal block builder must be non-zero"));
+    }
+    match (
+        proposal.valid_round,
+        proposal.valid_round_certificate.as_ref(),
+    ) {
+        (None, None) if proposal.proposer == block_builder && block_round == proposal.round => {}
+        (None, Some(_)) => {
+            return Err(protocol_error(
+                "proposal without valid round cannot carry a certificate",
+            ));
+        }
+        (Some(_), None) => {
+            return Err(protocol_error(
+                "proposal valid round is missing its certificate",
+            ));
+        }
+        (Some(valid_round), Some(certificate))
+            if valid_round < proposal.round
+                && certificate.round == valid_round
+                && certificate.block_id == proposal.block_id
+                && block_round == valid_round => {}
+        _ => {
+            return Err(protocol_error(
+                "proposal valid-round and block round relation is invalid",
+            ));
+        }
     }
     Ok(())
 }
@@ -765,7 +805,7 @@ mod wire_validation_tests {
         block.header.prev_block_hash = parent_hash;
         block.header.block_hash = block_hash;
         block.header.stake_snapshot_hash = snapshot_hash;
-        block.header.proposer = proposer;
+        block.header.block_builder = proposer;
 
         ConsensusEnvelope {
             wire_version: context.wire_version,
@@ -815,7 +855,8 @@ mod wire_validation_tests {
     fn v2_proposal_validates_block_commitments_without_legacy_fallback() {
         let context = context();
         let snapshot_hash = StakeSnapshotHash([8u8; 32]);
-        let proposer = ValidatorId([7u8; 32]);
+        let builder = ValidatorId([7u8; 32]);
+        let proposer = builder;
         let mut block = BlockV2::default();
         block.header.protocol_version = context.protocol_version;
         block.header.chain_id = context.chain_id;
@@ -824,7 +865,7 @@ mod wire_validation_tests {
         block.header.round = 0;
         block.header.prev_block_hash = Hash([6u8; 32]);
         block.header.stake_snapshot_hash = snapshot_hash;
-        block.header.proposer = proposer;
+        block.header.block_builder = proposer;
         block.header.gas_limit = 2;
         block.finalize_header().unwrap();
 
@@ -857,6 +898,7 @@ mod wire_validation_tests {
 
         let mut valid_round_reproposal = envelope.clone();
         if let ConsensusMessage::ProposalV2 { proposal, .. } = &mut valid_round_reproposal.payload {
+            proposal.proposer = ValidatorId([9u8; 32]);
             proposal.round = 1;
             proposal.valid_round = Some(0);
             proposal.valid_round_certificate = Some(PrevoteCertificate {
@@ -884,6 +926,35 @@ mod wire_validation_tests {
         assert!(valid_round_reproposal
             .validate_for_context(&context)
             .is_ok());
+
+        // The valid block remains built by A while B is the current-round
+        // proposer. Its block ID and body are unchanged across re-proposal.
+        if let ConsensusMessage::ProposalV2 { proposal, block } = &valid_round_reproposal.payload {
+            assert_eq!(proposal.proposer, ValidatorId([9u8; 32]));
+            assert_eq!(block.header.block_builder, builder);
+            assert_eq!(proposal.block_id, BlockId(block.header.block_hash));
+        }
+
+        let mut equal_valid_round = valid_round_reproposal.clone();
+        if let ConsensusMessage::ProposalV2 { proposal, .. } = &mut equal_valid_round.payload {
+            proposal.valid_round = Some(proposal.round);
+            proposal.valid_round_certificate.as_mut().unwrap().round = proposal.round;
+        }
+        assert!(equal_valid_round.validate_for_context(&context).is_err());
+
+        let mut missing_certificate = valid_round_reproposal.clone();
+        if let ConsensusMessage::ProposalV2 { proposal, .. } = &mut missing_certificate.payload {
+            proposal.valid_round_certificate = None;
+        }
+        assert!(missing_certificate.validate_for_context(&context).is_err());
+
+        let mut mismatched_certificate = valid_round_reproposal.clone();
+        if let ConsensusMessage::ProposalV2 { proposal, .. } = &mut mismatched_certificate.payload {
+            proposal.valid_round_certificate.as_mut().unwrap().block_id = BlockId(Hash([10; 32]));
+        }
+        assert!(mismatched_certificate
+            .validate_for_context(&context)
+            .is_err());
 
         let mut invalid_round_reproposal = valid_round_reproposal;
         if let ConsensusMessage::ProposalV2 { proposal, .. } = &mut invalid_round_reproposal.payload

@@ -81,6 +81,14 @@ libFuzzer target against the same `decode_and_validate` entry point.
   round equals `valid_round`, while the proposal round may be later; fresh
   proposals require equal proposal/header rounds, and all other combinations
   fail closed;
+- a valid-round re-proposal may change `Proposal.proposer` after proposer
+  rotation, but its `BlockHeader.block_builder`, block body, commitments, and
+  block ID remain unchanged; fresh proposals require builder/proposer equality;
+- complete candidate material (Proposal, BlockV2, and derived randomness) is
+  durably recoverable for every live `valid_block`/`locked_block` reference;
+  restoring an ID without its body is a startup failure;
+- SafetyStore sequence allocation is serialized across vote and companion
+  state WAL transactions, and concurrent recovery shows no sequence reuse;
 - a conflicting candidate for the same `(height, block_id)` is rejected,
   identical replay is idempotent, and candidates through finalized height are
   removed;
@@ -94,6 +102,11 @@ libFuzzer target against the same `decode_and_validate` entry point.
 These checks are completion gates, not evidence that an unreviewed deployment
 is production-ready. Protocol upgrades continue to require a new versioned
 Genesis or an explicitly specified activation-height migration.
+
+The `BlockHeader` V2 builder-identity field and hash layout are protocol
+incompatible with older serialized blocks. No node may infer compatibility by
+deserialization; it must select exactly one schema from the active protocol
+version/Genesis activation and reject unknown versions.
 
 The validator-change queue and epoch snapshot transition are deterministic and
 durable, but they are not by themselves a governance transaction format. The

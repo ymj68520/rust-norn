@@ -257,7 +257,7 @@ impl BlockProducer {
             block_hash: Hash::default(),
             merkle_root,
             state_root,
-            proposer: local_proposer,
+            block_builder: local_proposer,
             stake_snapshot_hash: snapshot.snapshot_hash.clone(),
             parent_randomness: parent_rand,
             gas_limit: self.config.max_gas_per_block,
@@ -439,7 +439,7 @@ impl BlockProducer {
             block_hash: Hash::default(),
             merkle_root: Hash::default(),
             state_root,
-            proposer,
+            block_builder: proposer,
             stake_snapshot_hash: snapshot.snapshot_hash,
             parent_randomness,
             gas_limit: i64::try_from(limits.max_block_gas)

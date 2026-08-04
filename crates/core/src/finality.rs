@@ -30,6 +30,18 @@ const STATE_CODE_PREFIX: &[u8] = b"state/v2/code/";
 const STATE_TOMBSTONE: &[u8] = b"NORN_STATE_TOMBSTONE_V2";
 const SNAPSHOT_PREFIX: &[u8] = b"finality/v2/snapshot/";
 const PENDING_PROPOSAL_PREFIX: &[u8] = b"consensus/v2/pending-proposal/";
+const SAFETY_CANDIDATE_PREFIX: &[u8] = b"consensus/v2/safety-candidate/";
+
+/// Complete validated candidate material required to recover a durable
+/// Tendermint valid/locked reference after a process restart.  Persisting
+/// only the block ID is insufficient: a producer must be able to re-propose
+/// the exact bytes and preserve the original block builder identity.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DurableSafetyCandidate {
+    pub proposal: Proposal,
+    pub block: BlockV2,
+    pub derived_randomness: Hash,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalityCommitResult {
@@ -109,11 +121,23 @@ impl FinalityStore {
     ) -> Result<()> {
         if proposal.height != block.header.height as u64
             || proposal.block_id != BlockId(block.header.block_hash)
-            || proposal
-                .valid_round
-                .map(|valid_round| valid_round > proposal.round)
-                .unwrap_or(false)
-            || block.header.round != proposal.valid_round.unwrap_or(proposal.round)
+            || block.header.block_builder.0 == [0u8; 32]
+            || match (
+                proposal.valid_round,
+                proposal.valid_round_certificate.as_ref(),
+            ) {
+                (None, None) => {
+                    proposal.proposer != block.header.block_builder
+                        || block.header.round != proposal.round
+                }
+                (Some(valid_round), Some(certificate)) => {
+                    valid_round >= proposal.round
+                        || certificate.round != valid_round
+                        || certificate.block_id != proposal.block_id
+                        || block.header.round != valid_round
+                }
+                _ => true,
+            }
         {
             bail!("pending V2 proposal does not match its block identity");
         }
@@ -138,6 +162,52 @@ impl FinalityStore {
     pub async fn clear_pending_proposal(&self, height: u64, round: u32) -> Result<()> {
         self.db
             .batch_delete(&[pending_proposal_key(height, round)])
+            .await
+    }
+
+    pub async fn persist_safety_candidate(
+        &self,
+        proposal: &Proposal,
+        block: &BlockV2,
+        derived_randomness: Hash,
+    ) -> Result<()> {
+        if block.header.height < 0
+            || proposal.height != block.header.height as u64
+            || proposal.block_id != BlockId(block.header.block_hash)
+            || block.header.block_builder.0 == [0u8; 32]
+        {
+            bail!("safety candidate identity does not match its block");
+        }
+        let candidate = DurableSafetyCandidate {
+            proposal: proposal.clone(),
+            block: block.clone(),
+            derived_randomness,
+        };
+        self.db
+            .batch_insert(
+                &[safety_candidate_key(proposal.height, proposal.block_id)],
+                &[encode(&candidate)?],
+            )
+            .await
+    }
+
+    pub async fn recover_safety_candidate(
+        &self,
+        height: u64,
+        block_id: BlockId,
+    ) -> Result<Option<DurableSafetyCandidate>> {
+        self.db
+            .get(&safety_candidate_key(height, block_id))
+            .await?
+            .map(|bytes| decode(&bytes, "durable safety candidate"))
+            .transpose()
+    }
+
+    /// Candidate cleanup is intentionally only allowed after the finalized
+    /// transaction has been durably committed.
+    pub async fn clear_safety_candidate(&self, height: u64, block_id: BlockId) -> Result<()> {
+        self.db
+            .batch_delete(&[safety_candidate_key(height, block_id)])
             .await
     }
 
@@ -863,6 +933,13 @@ fn pending_proposal_key(height: u64, round: u32) -> Vec<u8> {
     key
 }
 
+fn safety_candidate_key(height: u64, block_id: BlockId) -> Vec<u8> {
+    let mut key = SAFETY_CANDIDATE_PREFIX.to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key.extend_from_slice(&block_id.0 .0);
+    key
+}
+
 fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
     norn_common::utils::codec::serialize(value)
 }
@@ -966,7 +1043,7 @@ mod tests {
                 block_hash: block_id,
                 merkle_root: Hash([4; 32]),
                 state_root: Hash([5; 32]),
-                proposer: ValidatorId([6; 32]),
+                block_builder: ValidatorId([6; 32]),
                 stake_snapshot_hash: snapshot_hash,
                 parent_randomness: Hash([7; 32]),
                 gas_limit: 10,
@@ -1016,6 +1093,37 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn durable_safety_candidate_round_trips_full_block_material() {
+        let db = Arc::new(MemoryDb::default());
+        let store = FinalityStore::new(db);
+        let finalized = finalized();
+        let derived = Hash([42; 32]);
+
+        store
+            .persist_safety_candidate(&finalized.proposal, &finalized.block, derived)
+            .await
+            .unwrap();
+        let recovered = store
+            .recover_safety_candidate(1, finalized.commit.block_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.proposal, finalized.proposal);
+        assert_eq!(recovered.block, finalized.block);
+        assert_eq!(recovered.derived_randomness, derived);
+
+        store
+            .clear_safety_candidate(1, finalized.commit.block_id)
+            .await
+            .unwrap();
+        assert!(store
+            .recover_safety_candidate(1, finalized.commit.block_id)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     fn genesis_block() -> Block {
         Block {
             header: BlockHeader {
@@ -1029,7 +1137,7 @@ mod tests {
                 block_hash: Hash([8; 32]),
                 merkle_root: Hash::default(),
                 state_root: Hash::default(),
-                proposer: ValidatorId([0; 32]),
+                block_builder: ValidatorId([0; 32]),
                 stake_snapshot_hash: StakeSnapshotHash([3; 32]),
                 parent_randomness: Hash::default(),
                 gas_limit: 0,

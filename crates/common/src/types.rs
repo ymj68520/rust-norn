@@ -829,7 +829,10 @@ pub struct BlockHeader {
     pub block_hash: Hash,
     pub merkle_root: Hash,
     pub state_root: Hash,
-    pub proposer: ValidatorId,
+    /// Validator that originally built this block.  This identity is part of
+    /// the block ID and remains stable when the block is re-proposed in a
+    /// later Tendermint round by a different proposer.
+    pub block_builder: ValidatorId,
     pub stake_snapshot_hash: StakeSnapshotHash,
     pub parent_randomness: Hash,
     pub gas_limit: i64,
@@ -851,7 +854,7 @@ impl BlockHeader {
         hasher.update(&self.prev_block_hash.0);
         hasher.update(&self.merkle_root.0);
         hasher.update(&self.state_root.0);
-        hasher.update(&self.proposer.0);
+        hasher.update(&self.block_builder.0);
         hasher.update(&self.stake_snapshot_hash.0);
         hasher.update(&self.parent_randomness.0);
         hasher.update(&self.gas_limit.to_be_bytes());
@@ -1085,7 +1088,7 @@ mod block_v2_tests {
                 block_hash: Hash::default(),
                 merkle_root: Hash::default(),
                 state_root: Hash([8; 32]),
-                proposer: ValidatorId([7; 32]),
+                block_builder: ValidatorId([7; 32]),
                 stake_snapshot_hash: StakeSnapshotHash([6; 32]),
                 parent_randomness: Hash([5; 32]),
                 gas_limit: 10_000_000,
