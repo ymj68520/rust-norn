@@ -266,12 +266,12 @@ impl ConsensusEnvelope {
                 if proposal.protocol_version != block.header.protocol_version
                     || proposal.chain_id != block.header.chain_id
                     || proposal.epoch != block.header.epoch
-                    || proposal.round != block.header.round
                     || proposal.stake_snapshot_hash != block.header.stake_snapshot_hash
                     || proposal.proposer != block.header.proposer
                 {
                     return Err(protocol_error("proposal and block contexts do not match"));
                 }
+                validate_proposal_block_round(proposal, block.header.round)?;
                 if block.header.height < 0 || proposal.height != block.header.height as u64 {
                     return Err(protocol_error(
                         "proposal height does not match block header",
@@ -313,7 +313,6 @@ impl ConsensusEnvelope {
                     || proposal.protocol_version != block.header.protocol_version
                     || proposal.chain_id != block.header.chain_id
                     || proposal.epoch != block.header.epoch
-                    || proposal.round != block.header.round
                     || proposal.stake_snapshot_hash != block.header.stake_snapshot_hash
                     || proposal.proposer != block.header.proposer
                     || block.header.height < 0
@@ -323,6 +322,7 @@ impl ConsensusEnvelope {
                         "V2 proposal and block contexts do not match",
                     ));
                 }
+                validate_proposal_block_round(proposal, block.header.round)?;
                 // Apply the active Genesis limits at the same admission
                 // boundary as the context and commitment checks.
                 block.validate_structure(
@@ -376,7 +376,6 @@ impl ConsensusEnvelope {
                     || proposal.protocol_version != block.header.protocol_version
                     || proposal.chain_id != block.header.chain_id
                     || proposal.epoch != block.header.epoch
-                    || proposal.round != block.header.round
                     || proposal.stake_snapshot_hash != block.header.stake_snapshot_hash
                     || proposal.proposer != block.header.proposer
                     || block.header.height < 0
@@ -386,6 +385,7 @@ impl ConsensusEnvelope {
                         "V2 block response proposal and block contexts do not match",
                     ));
                 }
+                validate_proposal_block_round(proposal, block.header.round)?;
                 block.validate_structure(
                     &ChainContext {
                         wire_version: self.wire_version,
@@ -560,7 +560,6 @@ fn validate_finalized_v2(
         || proposal.protocol_version != block.header.protocol_version
         || proposal.chain_id != block.header.chain_id
         || proposal.epoch != block.header.epoch
-        || proposal.round != block.header.round
         || proposal.stake_snapshot_hash != block.header.stake_snapshot_hash
         || proposal.proposer != block.header.proposer
         || block.header.height < 0
@@ -570,6 +569,7 @@ fn validate_finalized_v2(
             "V2 finalized record proposal and block contexts do not match",
         ));
     }
+    validate_proposal_block_round(proposal, block.header.round)?;
     block.validate_structure(
         &ChainContext {
             wire_version: envelope.wire_version,
@@ -718,6 +718,24 @@ fn validate_prevote_certificate(
     Ok(())
 }
 
+/// A valid-round re-proposal carries the exact block that reached the earlier
+/// Polka. The proposal's consensus round therefore advances while the block
+/// header's original round remains part of the block ID. Fresh proposals have
+/// no valid-round certificate and must use the same round in both objects.
+fn validate_proposal_block_round(proposal: &Proposal, block_round: u32) -> Result<()> {
+    let expected_block_round = proposal.valid_round.unwrap_or(proposal.round);
+    if proposal
+        .valid_round
+        .is_some_and(|valid_round| valid_round > proposal.round)
+        || block_round != expected_block_round
+    {
+        return Err(protocol_error(
+            "proposal valid-round and block round relation is invalid",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod wire_validation_tests {
     use super::*;
@@ -836,6 +854,47 @@ mod wire_validation_tests {
             },
         };
         envelope.validate_for_context(&context).unwrap();
+
+        let mut valid_round_reproposal = envelope.clone();
+        if let ConsensusMessage::ProposalV2 { proposal, .. } = &mut valid_round_reproposal.payload {
+            proposal.round = 1;
+            proposal.valid_round = Some(0);
+            proposal.valid_round_certificate = Some(PrevoteCertificate {
+                protocol_version: context.protocol_version,
+                chain_id: context.chain_id,
+                epoch: 1,
+                height: 1,
+                round: 0,
+                block_id: proposal.block_id,
+                stake_snapshot_hash: snapshot_hash,
+                prevotes: vec![SignedVote {
+                    protocol_version: context.protocol_version,
+                    chain_id: context.chain_id,
+                    epoch: 1,
+                    height: 1,
+                    round: 0,
+                    step: VoteStep::Prevote,
+                    block_id: Some(proposal.block_id),
+                    stake_snapshot_hash: snapshot_hash,
+                    validator: ValidatorId([6u8; 32]),
+                    signature: [4u8; 64],
+                }],
+            });
+        }
+        assert!(valid_round_reproposal
+            .validate_for_context(&context)
+            .is_ok());
+
+        let mut invalid_round_reproposal = valid_round_reproposal;
+        if let ConsensusMessage::ProposalV2 { proposal, .. } = &mut invalid_round_reproposal.payload
+        {
+            proposal.round = 0;
+            proposal.valid_round = Some(1);
+            proposal.valid_round_certificate.as_mut().unwrap().round = 1;
+        }
+        assert!(invalid_round_reproposal
+            .validate_for_context(&context)
+            .is_err());
 
         let mut strict_limits = crate::genesis::ProtocolResourceLimits::default();
         strict_limits.max_block_gas = 1;

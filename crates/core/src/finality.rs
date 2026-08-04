@@ -108,8 +108,12 @@ impl FinalityStore {
         block: &BlockV2,
     ) -> Result<()> {
         if proposal.height != block.header.height as u64
-            || proposal.round != block.header.round
             || proposal.block_id != BlockId(block.header.block_hash)
+            || proposal
+                .valid_round
+                .map(|valid_round| valid_round > proposal.round)
+                .unwrap_or(false)
+            || block.header.round != proposal.valid_round.unwrap_or(proposal.round)
         {
             bail!("pending V2 proposal does not match its block identity");
         }

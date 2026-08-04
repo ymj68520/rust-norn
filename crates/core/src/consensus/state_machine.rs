@@ -1,6 +1,8 @@
 //! Tendermint-style BFT State Machine (Propose, Prevote, Precommit, Commit)
 
-use super::safety_store::{ConsensusSafetyStore, ConsensusSigner, VoteSignRequest};
+use super::safety_store::{
+    ConsensusSafetyStore, ConsensusSigner, DurableConsensusSafetyState, VoteSignRequest,
+};
 use super::types::{ConsensusConfig, ConsensusStep, ElectionMath};
 use super::vote_pool::{AddVoteResult, VotePool};
 use anyhow::{anyhow, Result};
@@ -241,6 +243,44 @@ mod tests {
         assert!(state_machine.on_timeout_propose(&FailingSigner).is_err());
         assert_eq!(state_machine.step, ConsensusStep::NewHeight);
         assert!(state_machine.locked_block.is_none());
+    }
+
+    #[test]
+    fn durable_lock_state_restores_before_processing_new_round() {
+        let snapshot = StakeSnapshot {
+            epoch: 1,
+            validators: BTreeMap::new(),
+            snapshot_hash: StakeSnapshotHash([8; 32]),
+        };
+        let safety_store = Arc::new(MemorySafetyStore::new());
+        let config = ConsensusConfig::default();
+        let mut source = TendermintStateMachine::new(
+            config.clone(),
+            snapshot.clone(),
+            Hash([1; 32]),
+            safety_store.clone(),
+            None,
+        );
+        source.locked_block = Some(BlockId(Hash([4; 32])));
+        source.locked_round = Some(2);
+        source.round = 3;
+        source.step = ConsensusStep::Propose;
+        safety_store
+            .persist_consensus_state(source.durable_safety_state().unwrap())
+            .unwrap();
+
+        let recovered_state = safety_store.load_consensus_state().unwrap().unwrap();
+        let mut recovered =
+            TendermintStateMachine::new(config, snapshot, Hash([1; 32]), safety_store, None);
+        recovered
+            .restore_durable_safety_state(recovered_state)
+            .unwrap();
+        assert_eq!(recovered.round, 3);
+        assert_eq!(recovered.step, ConsensusStep::Propose);
+        assert_eq!(recovered.locked_block, source.locked_block);
+        assert_eq!(recovered.locked_round, source.locked_round);
+        assert_eq!(recovered.valid_block, None);
+        assert_eq!(recovered.valid_round, None);
     }
 
     #[test]
@@ -606,6 +646,119 @@ impl TendermintStateMachine {
 
     pub fn current_epoch(&self) -> Result<u64> {
         self.config.epoch_for_height(self.height)
+    }
+
+    pub fn durable_safety_state(&self) -> Result<DurableConsensusSafetyState> {
+        Ok(DurableConsensusSafetyState {
+            sequence: 0,
+            protocol_version: self.config.protocol_version,
+            chain_id: self.config.chain_id,
+            epoch: self.current_epoch()?,
+            height: self.height,
+            round: self.round,
+            step: self.step,
+            stake_snapshot_hash: self.snapshot.snapshot_hash,
+            parent_randomness: self.parent_randomness,
+            locked_block: self.locked_block,
+            locked_round: self.locked_round,
+            valid_block: self.valid_block,
+            valid_round: self.valid_round,
+            valid_round_certificate: self.valid_round_certificate.clone(),
+        })
+    }
+
+    pub fn restore_durable_safety_state(
+        &mut self,
+        state: DurableConsensusSafetyState,
+    ) -> Result<()> {
+        if state.protocol_version != self.config.protocol_version
+            || state.chain_id != self.config.chain_id
+            || state.height != self.height
+            || state.epoch != self.current_epoch()?
+            || state.stake_snapshot_hash != self.snapshot.snapshot_hash
+            || state.parent_randomness != self.parent_randomness
+        {
+            return Err(anyhow!(
+                "durable consensus safety state does not match the active context"
+            ));
+        }
+        if state.locked_block.is_some() != state.locked_round.is_some()
+            || state.valid_block.is_some() != state.valid_round.is_some()
+        {
+            return Err(anyhow!(
+                "durable consensus safety state has an incomplete lock or valid-round pair"
+            ));
+        }
+        if state
+            .locked_round
+            .is_some_and(|locked_round| locked_round > state.round)
+            || state
+                .valid_round
+                .is_some_and(|valid_round| valid_round > state.round)
+        {
+            return Err(anyhow!(
+                "durable consensus safety state references a future lock or valid round"
+            ));
+        }
+        if let Some(certificate) = &state.valid_round_certificate {
+            if state.valid_block != Some(certificate.block_id)
+                || state.valid_round != Some(certificate.round)
+                || certificate.height != state.height
+                || certificate.stake_snapshot_hash != state.stake_snapshot_hash
+                || certificate.protocol_version != state.protocol_version
+                || certificate.chain_id != state.chain_id
+            {
+                return Err(anyhow!(
+                    "durable valid-round certificate does not match safety state"
+                ));
+            }
+            Self::verify_prevote_certificate(certificate, &self.snapshot)?;
+        } else if state.valid_block.is_some() || state.valid_round.is_some() {
+            return Err(anyhow!(
+                "durable valid-round state is missing its certificate"
+            ));
+        }
+        self.round = state.round;
+        self.step = state.step;
+        self.locked_block = state.locked_block;
+        self.locked_round = state.locked_round;
+        self.valid_block = state.valid_block;
+        self.valid_round = state.valid_round;
+        self.valid_round_certificate = state.valid_round_certificate;
+        Ok(())
+    }
+
+    fn persist_durable_safety_state(&self) -> Result<()> {
+        self.safety_store
+            .persist_consensus_state(self.durable_safety_state()?)
+            .map_err(|error| anyhow!("failed to persist consensus safety state: {error}"))
+    }
+
+    fn durable_safety_state_after(
+        &self,
+        step: ConsensusStep,
+        locked_block: Option<BlockId>,
+        locked_round: Option<u32>,
+        valid_block: Option<BlockId>,
+        valid_round: Option<u32>,
+        valid_round_certificate: Option<PrevoteCertificate>,
+    ) -> Result<DurableConsensusSafetyState> {
+        Ok(DurableConsensusSafetyState {
+            sequence: 0,
+            protocol_version: self.config.protocol_version,
+            chain_id: self.config.chain_id,
+            epoch: self.current_epoch()?,
+            height: self.height,
+            round: self.round,
+            step,
+            stake_snapshot_hash: self.snapshot.snapshot_hash,
+            parent_randomness: self.parent_randomness,
+            locked_block,
+            locked_round,
+            valid_block,
+            valid_round,
+            valid_round_certificate,
+        })
     }
 
     /// Check if local node is current round's proposer
@@ -1037,8 +1190,21 @@ impl TendermintStateMachine {
                             | ConsensusStep::Propose
                             | ConsensusStep::PrevoteWait
                     ) {
+                        let next_safety_state = self.durable_safety_state_after(
+                            ConsensusStep::PrecommitWait,
+                            Some(bid),
+                            Some(round),
+                            Some(bid),
+                            Some(round),
+                            Some(certificate.clone()),
+                        )?;
                         let precommit_vote = if self.local_validator_id.is_some() {
-                            Some(self.cast_vote(VoteStep::Precommit, Some(bid), signer)?)
+                            Some(self.cast_vote_with_state(
+                                VoteStep::Precommit,
+                                Some(bid),
+                                signer,
+                                Some(next_safety_state),
+                            )?)
                         } else {
                             None
                         };
@@ -1055,6 +1221,7 @@ impl TendermintStateMachine {
                         if let Some(precommit_vote) = precommit_vote {
                             return Ok((Some(precommit_vote), None));
                         }
+                        self.persist_durable_safety_state()?;
                     }
                 }
             }
@@ -1082,6 +1249,7 @@ impl TendermintStateMachine {
                         bid
                     );
                     self.step = ConsensusStep::Commit;
+                    self.persist_durable_safety_state()?;
                     return Ok((None, Some(cert)));
                 }
             }
@@ -1097,8 +1265,22 @@ impl TendermintStateMachine {
         block_id: Option<BlockId>,
         signer: &dyn ConsensusSigner,
     ) -> Result<SignedVote> {
+        self.cast_vote_with_state(step, block_id, signer, None)
+    }
+
+    fn cast_vote_with_state(
+        &self,
+        step: VoteStep,
+        block_id: Option<BlockId>,
+        signer: &dyn ConsensusSigner,
+        state_after: Option<DurableConsensusSafetyState>,
+    ) -> Result<SignedVote> {
         let intent = self.build_vote_intent(step, block_id)?;
-        let event = self.execute_action(ConsensusAction::SignVote(intent.clone()), signer)?;
+        let signed_vote = self
+            .safety_store
+            .sign_vote_once_with_state(intent.request.clone(), signer, state_after)
+            .map_err(|e| anyhow!("Safety store signing error: {:?}", e))?;
+        let event = ConsensusEvent::VotePersisted(signed_vote);
         self.apply_consensus_event(&intent, event)
     }
 
@@ -1178,7 +1360,15 @@ impl TendermintStateMachine {
             "Proposal timeout in round {}, casting NIL Prevote",
             self.round
         );
-        let vote = self.cast_vote(VoteStep::Prevote, None, signer)?;
+        let state_after = self.durable_safety_state_after(
+            ConsensusStep::PrevoteWait,
+            self.locked_block,
+            self.locked_round,
+            self.valid_block,
+            self.valid_round,
+            self.valid_round_certificate.clone(),
+        )?;
+        let vote = self.cast_vote_with_state(VoteStep::Prevote, None, signer, Some(state_after))?;
         self.step = ConsensusStep::PrevoteWait;
         Ok(vote)
     }
@@ -1189,19 +1379,29 @@ impl TendermintStateMachine {
             "Prevote timeout in round {}, casting NIL Precommit",
             self.round
         );
-        let vote = self.cast_vote(VoteStep::Precommit, None, signer)?;
+        let state_after = self.durable_safety_state_after(
+            ConsensusStep::PrecommitWait,
+            self.locked_block,
+            self.locked_round,
+            self.valid_block,
+            self.valid_round,
+            self.valid_round_certificate.clone(),
+        )?;
+        let vote =
+            self.cast_vote_with_state(VoteStep::Precommit, None, signer, Some(state_after))?;
         self.step = ConsensusStep::PrecommitWait;
         Ok(vote)
     }
 
     /// Precommit timeout trigger -> advance to next round
-    pub fn on_timeout_precommit(&mut self) {
+    pub fn on_timeout_precommit(&mut self) -> Result<()> {
         info!(
             "Precommit timeout in round {}, advancing to round {}",
             self.round,
             self.round + 1
         );
         self.start_new_round(self.round + 1);
+        self.persist_durable_safety_state()
     }
 
     /// Advance only after the finalized block and its consensus state have
@@ -1244,6 +1444,7 @@ impl TendermintStateMachine {
         self.pending_validator_changes
             .changes
             .retain(|change| change.effective_epoch > self.snapshot.epoch);
+        self.persist_durable_safety_state()?;
         Ok(())
     }
 
@@ -1274,6 +1475,7 @@ impl TendermintStateMachine {
         self.pending_validator_changes
             .changes
             .retain(|change| change.effective_epoch > self.snapshot.epoch);
+        self.persist_durable_safety_state()?;
         Ok(())
     }
 }

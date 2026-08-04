@@ -4,9 +4,10 @@
 //! is atomically checked for double-signing conflicts, committed to disk
 //! with `sync_all()` and `flush()`, and signed fail-closed.
 
+use super::types::ConsensusStep;
 use anyhow::Result;
-use norn_common::consensus_types::{SignedVote, VoteStep};
-use norn_common::types::{BlockId, ChainId, ProtocolVersion, StakeSnapshotHash, ValidatorId};
+use norn_common::consensus_types::{PrevoteCertificate, SignedVote, VoteStep};
+use norn_common::types::{BlockId, ChainId, Hash, ProtocolVersion, StakeSnapshotHash, ValidatorId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -67,6 +68,32 @@ pub struct SafetyRecord {
     /// contains the exact signature that may be replayed after restart.
     #[serde(default)]
     pub signature: Option<Vec<u8>>,
+    /// A completed vote may carry the consensus safety state that became
+    /// durable with that exact vote. This closes the crash window between a
+    /// block Precommit and its lock/valid-round update.
+    #[serde(default)]
+    pub consensus_state_after: Option<DurableConsensusSafetyState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableConsensusSafetyState {
+    /// Monotonic ordering across the vote WAL and the companion state WAL.
+    /// The store assigns this value when the state is made durable.
+    #[serde(default)]
+    pub sequence: u64,
+    pub protocol_version: ProtocolVersion,
+    pub chain_id: ChainId,
+    pub epoch: u64,
+    pub height: u64,
+    pub round: u32,
+    pub step: ConsensusStep,
+    pub stake_snapshot_hash: StakeSnapshotHash,
+    pub parent_randomness: Hash,
+    pub locked_block: Option<BlockId>,
+    pub locked_round: Option<u32>,
+    pub valid_block: Option<BlockId>,
+    pub valid_round: Option<u32>,
+    pub valid_round_certificate: Option<PrevoteCertificate>,
 }
 
 fn decode_signature(signature: &Option<Vec<u8>>) -> Result<Option<[u8; 64]>, SafetyError> {
@@ -89,7 +116,23 @@ pub trait ConsensusSafetyStore: Send + Sync {
         &self,
         request: VoteSignRequest,
         signer: &dyn ConsensusSigner,
+    ) -> Result<SignedVote, SafetyError> {
+        self.sign_vote_once_with_state(request, signer, None)
+    }
+
+    fn sign_vote_once_with_state(
+        &self,
+        request: VoteSignRequest,
+        signer: &dyn ConsensusSigner,
+        state_after: Option<DurableConsensusSafetyState>,
     ) -> Result<SignedVote, SafetyError>;
+
+    fn load_consensus_state(&self) -> Result<Option<DurableConsensusSafetyState>, SafetyError>;
+
+    fn persist_consensus_state(
+        &self,
+        state: DurableConsensusSafetyState,
+    ) -> Result<(), SafetyError>;
 
     /// Return completed votes whose broadcast may have been interrupted by a
     /// process crash or a transient network failure.
@@ -101,12 +144,14 @@ type SafetyIndexKey = (ChainId, ValidatorId, u64, u64, u32, VoteStep);
 /// In-memory ConsensusSafetyStore
 pub struct MemorySafetyStore {
     state: Mutex<HashMap<SafetyIndexKey, SafetyRecord>>,
+    consensus_state: Mutex<Option<DurableConsensusSafetyState>>,
 }
 
 impl MemorySafetyStore {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(HashMap::new()),
+            consensus_state: Mutex::new(None),
         }
     }
 }
@@ -118,10 +163,11 @@ impl Default for MemorySafetyStore {
 }
 
 impl ConsensusSafetyStore for MemorySafetyStore {
-    fn sign_vote_once(
+    fn sign_vote_once_with_state(
         &self,
         request: VoteSignRequest,
         signer: &dyn ConsensusSigner,
+        state_after: Option<DurableConsensusSafetyState>,
     ) -> Result<SignedVote, SafetyError> {
         let mut guard = self
             .state
@@ -174,6 +220,13 @@ impl ConsensusSafetyStore for MemorySafetyStore {
         if let Some(existing) = guard.get(&key) {
             if existing.sign_bytes_hash == sign_bytes_hash {
                 if let Some(signature) = decode_signature(&existing.signature)? {
+                    if let Some(state_after) = state_after {
+                        *self
+                            .consensus_state
+                            .lock()
+                            .map_err(|e| SafetyError::StorageIoError(e.to_string()))? =
+                            Some(state_after);
+                    }
                     return Ok(SignedVote {
                         protocol_version: request.protocol_version,
                         chain_id: request.chain_id,
@@ -204,6 +257,7 @@ impl ConsensusSafetyStore for MemorySafetyStore {
                 block_id: request.block_id.clone(),
                 sign_bytes_hash,
                 signature: None,
+                consensus_state_after: None,
             },
         );
 
@@ -217,8 +271,33 @@ impl ConsensusSafetyStore for MemorySafetyStore {
         };
         if let Some(record) = guard.get_mut(&key) {
             record.signature = Some(signed_vote.signature.to_vec());
+            record.consensus_state_after = state_after.clone();
+        }
+        if let Some(state_after) = state_after {
+            *self
+                .consensus_state
+                .lock()
+                .map_err(|e| SafetyError::StorageIoError(e.to_string()))? = Some(state_after);
         }
         Ok(signed_vote)
+    }
+
+    fn load_consensus_state(&self) -> Result<Option<DurableConsensusSafetyState>, SafetyError> {
+        self.consensus_state
+            .lock()
+            .map(|state| state.clone())
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))
+    }
+
+    fn persist_consensus_state(
+        &self,
+        state: DurableConsensusSafetyState,
+    ) -> Result<(), SafetyError> {
+        *self
+            .consensus_state
+            .lock()
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))? = Some(state);
+        Ok(())
     }
 
     fn recover_signed_votes(&self) -> Vec<SignedVote> {
@@ -253,6 +332,8 @@ pub struct PersistentSafetyStore {
     #[allow(dead_code)]
     file_path: PathBuf,
     state: Mutex<(HashMap<SafetyIndexKey, SafetyRecord>, BufWriter<File>)>,
+    consensus_state_path: PathBuf,
+    consensus_state: Mutex<(Option<DurableConsensusSafetyState>, u64)>,
 }
 
 impl PersistentSafetyStore {
@@ -262,7 +343,9 @@ impl PersistentSafetyStore {
             std::fs::create_dir_all(parent)?;
         }
 
+        let consensus_state_path = file_path.with_extension("consensus_state");
         let mut map = HashMap::new();
+        let mut wal_consensus_state = None;
         let mut valid_wal_len = 0u64;
 
         if file_path.exists() {
@@ -308,6 +391,15 @@ impl PersistentSafetyStore {
                         rec.round,
                         rec.step,
                     );
+                    if rec.consensus_state_after.as_ref().is_some_and(|state| {
+                        wal_consensus_state.as_ref().is_none_or(
+                            |current: &DurableConsensusSafetyState| {
+                                state.sequence >= current.sequence
+                            },
+                        )
+                    }) {
+                        wal_consensus_state = rec.consensus_state_after.clone();
+                    }
                     map.insert(key, rec);
                 } else {
                     return Err(anyhow::anyhow!("Corrupted Safety WAL record encountered"));
@@ -333,19 +425,84 @@ impl PersistentSafetyStore {
         file.seek(SeekFrom::End(0))?;
         let writer = BufWriter::new(file);
 
+        let mut companion_state = None;
+        let mut valid_state_len = 0u64;
+        if consensus_state_path.exists() {
+            let f = File::open(&consensus_state_path)?;
+            let mut reader = BufReader::new(f);
+            let mut len_bytes = [0u8; 4];
+            loop {
+                let frame_start = reader.stream_position()?;
+                match reader.read_exact(&mut len_bytes) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => return Err(err.into()),
+                }
+                let len = u32::from_le_bytes(len_bytes) as usize;
+                if len > 1024 * 1024 {
+                    return Err(anyhow::anyhow!(
+                        "Consensus safety state exceeds max length threshold"
+                    ));
+                }
+                let mut buf = vec![0u8; len];
+                match reader.read_exact(&mut buf) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(err) => return Err(err.into()),
+                }
+                let state = bincode::deserialize::<DurableConsensusSafetyState>(&buf)
+                    .map_err(|err| anyhow::anyhow!("Corrupted consensus safety state: {err}"))?;
+                if companion_state
+                    .as_ref()
+                    .is_none_or(|current: &DurableConsensusSafetyState| {
+                        state.sequence >= current.sequence
+                    })
+                {
+                    companion_state = Some(state);
+                }
+                valid_state_len = reader.stream_position()?.max(frame_start);
+            }
+        }
+        if consensus_state_path.exists() {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&consensus_state_path)?;
+            if file.metadata()?.len() > valid_state_len {
+                file.set_len(valid_state_len)?;
+                file.sync_all()?;
+            }
+        }
+        let durable_state = match (wal_consensus_state, companion_state) {
+            (Some(wal), Some(companion)) if companion.sequence > wal.sequence => Some(companion),
+            (Some(wal), _) => Some(wal),
+            (None, companion) => companion,
+        };
+        let state_sequence = durable_state.as_ref().map_or(0, |state| state.sequence);
+
         Ok(Self {
             file_path,
             state: Mutex::new((map, writer)),
+            consensus_state_path,
+            consensus_state: Mutex::new((durable_state, state_sequence)),
         })
     }
 }
 
 impl ConsensusSafetyStore for PersistentSafetyStore {
-    fn sign_vote_once(
+    fn sign_vote_once_with_state(
         &self,
         request: VoteSignRequest,
         signer: &dyn ConsensusSigner,
+        mut state_after: Option<DurableConsensusSafetyState>,
     ) -> Result<SignedVote, SafetyError> {
+        if let Some(state) = state_after.as_mut() {
+            let guard = self
+                .consensus_state
+                .lock()
+                .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
+            state.sequence = guard.1.saturating_add(1);
+        }
         let mut guard = self
             .state
             .lock()
@@ -421,6 +578,7 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
             block_id: request.block_id.clone(),
             sign_bytes_hash,
             signature: None,
+            consensus_state_after: None,
         };
 
         let encoded = bincode::serialize(&record)
@@ -464,6 +622,7 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
             block_id: request.block_id,
             sign_bytes_hash,
             signature: Some(signed_vote.signature.to_vec()),
+            consensus_state_after: state_after.clone(),
         };
         let completion_encoded = bincode::serialize(&completion)
             .map_err(|e| SafetyError::SerializationError(e.to_string()))?;
@@ -476,7 +635,48 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
             .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
         map.insert(key, completion);
 
+        if let Some(state_after) = state_after {
+            let mut state_guard = self
+                .consensus_state
+                .lock()
+                .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
+            *state_guard = (Some(state_after.clone()), state_after.sequence);
+        }
+
         Ok(signed_vote)
+    }
+
+    fn load_consensus_state(&self) -> Result<Option<DurableConsensusSafetyState>, SafetyError> {
+        self.consensus_state
+            .lock()
+            .map(|state| state.0.clone())
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))
+    }
+
+    fn persist_consensus_state(
+        &self,
+        mut state: DurableConsensusSafetyState,
+    ) -> Result<(), SafetyError> {
+        let mut state_guard = self
+            .consensus_state
+            .lock()
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
+        state.sequence = state_guard.1.saturating_add(1);
+        let encoded = bincode::serialize(&state)
+            .map_err(|e| SafetyError::SerializationError(e.to_string()))?;
+        let len = encoded.len() as u32;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.consensus_state_path)
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
+        file.write_all(&len.to_le_bytes())
+            .and_then(|_| file.write_all(&encoded))
+            .and_then(|_| file.flush())
+            .and_then(|_| file.sync_all())
+            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
+        *state_guard = (Some(state.clone()), state.sequence);
+        Ok(())
     }
 
     fn recover_signed_votes(&self) -> Vec<SignedVote> {
@@ -622,5 +822,43 @@ mod tests {
             store.sign_vote_once(conflicting, &DummySigner),
             Err(SafetyError::EquivocationDetected { .. })
         ));
+    }
+
+    #[test]
+    fn consensus_safety_state_survives_restart_and_torn_companion_frame() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("safety-state.log");
+        let store = PersistentSafetyStore::open(&path).unwrap();
+        let state = DurableConsensusSafetyState {
+            sequence: 0,
+            protocol_version: ProtocolVersion(2),
+            chain_id: ChainId(norn_common::types::Hash([9u8; 32])),
+            epoch: 1,
+            height: 10,
+            round: 2,
+            step: ConsensusStep::PrecommitWait,
+            stake_snapshot_hash: StakeSnapshotHash([8u8; 32]),
+            parent_randomness: Hash([7u8; 32]),
+            locked_block: Some(BlockId(Hash([6u8; 32]))),
+            locked_round: Some(1),
+            valid_block: None,
+            valid_round: None,
+            valid_round_certificate: None,
+        };
+        store.persist_consensus_state(state.clone()).unwrap();
+        let persisted = store.load_consensus_state().unwrap().unwrap();
+        assert_eq!(persisted.sequence, 1);
+        drop(store);
+
+        let companion_path = path.with_extension("consensus_state");
+        OpenOptions::new()
+            .append(true)
+            .open(&companion_path)
+            .unwrap()
+            .write_all(&[1u8, 2u8])
+            .unwrap();
+        let recovered = PersistentSafetyStore::open(&path).unwrap();
+        let recovered_state = recovered.load_consensus_state().unwrap().unwrap();
+        assert_eq!(recovered_state, persisted);
     }
 }

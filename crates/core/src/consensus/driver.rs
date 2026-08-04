@@ -165,6 +165,12 @@ pub enum ConsensusDriverEvent {
         deadline: tokio::time::Instant,
     },
     Timeout(TimeoutToken),
+    /// The timeout executor confirmed that the state-machine step matched
+    /// the timer and applied the timeout transition.
+    TimeoutApplied(TimeoutToken),
+    /// The timeout executor observed that the timer was no longer applicable
+    /// (for example because finality had already been formed).
+    TimeoutIgnored(TimeoutToken),
     ProposalValidationCompleted {
         request_id: ValidationRequestId,
         context: ConsensusContextToken,
@@ -200,6 +206,12 @@ pub enum ConsensusDriverEvent {
     /// be proven after a persistence error. The node must fail-stop and
     /// reconcile from durable state on restart.
     FinalityIndeterminate(String),
+    /// Re-submit one exact idempotent action after a non-blocking backoff.
+    RetryAction {
+        action: ConsensusDriverAction,
+        attempt: usize,
+        max_retries: usize,
+    },
     Shutdown,
 }
 
@@ -246,6 +258,12 @@ pub enum ConsensusDriverAction {
     ScheduleTimeout(TimeoutToken),
     CancelTimeout(TimeoutToken),
     BroadcastCommit(CommitCertificate),
+    /// Release a pending-finality cache pin after a preparation result was
+    /// discarded as stale by the single-writer driver.
+    UnpinPendingFinality {
+        height: u64,
+        block_id: norn_common::types::BlockId,
+    },
 }
 
 /// A worker/executor receives actions only from the driver.  It may spawn
@@ -314,7 +332,14 @@ struct DriverState {
     active_parent_block_hash: Option<Hash>,
     active_snapshot_hash: Option<StakeSnapshotHash>,
     pending: HashMap<ValidationRequestId, ConsensusContextToken>,
-    pending_finality: HashMap<ValidationRequestId, ConsensusContextToken>,
+    pending_finality: HashMap<ValidationRequestId, PendingFinality>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingFinality {
+    context: ConsensusContextToken,
+    height: u64,
+    block_id: norn_common::types::BlockId,
 }
 
 impl ConsensusDriver {
@@ -347,12 +372,20 @@ impl ConsensusDriver {
                     ConsensusDriverEvent::ActivationFailed(_)
                         | ConsensusDriverEvent::FinalityIndeterminate(_)
                 );
+                let retry_context = match &request.event {
+                    ConsensusDriverEvent::RetryAction {
+                        attempt,
+                        max_retries,
+                        ..
+                    } => Some((*attempt, *max_retries)),
+                    _ => None,
+                };
                 let result = process_event(&mut state, request.event).await;
                 match result {
                     Ok(actions) => {
                         let mut execution_error = None;
                         'actions: for action in actions.iter().cloned() {
-                            let mut retries = 0usize;
+                            let mut retries = retry_context.map_or(0, |(attempt, _)| attempt);
                             loop {
                                 match executor
                                     .execute(action.clone(), worker_handle.clone())
@@ -360,10 +393,17 @@ impl ConsensusDriver {
                                 {
                                     Ok(()) => break,
                                     Err(error) => {
-                                        let retry_limit = error
-                                            .downcast_ref::<RetryableConsensusActionError>()
-                                            .map(RetryableConsensusActionError::max_retries)
-                                            .unwrap_or(0);
+                                        let Some(retryable) =
+                                            error.downcast_ref::<RetryableConsensusActionError>()
+                                        else {
+                                            execution_error = Some(error);
+                                            break 'actions;
+                                        };
+                                        let retry_limit = retry_context
+                                            .map(|(_, max_retries)| max_retries)
+                                            .map_or(retryable.max_retries(), |max_retries| {
+                                                max_retries.min(retryable.max_retries())
+                                            });
                                         if retries < retry_limit {
                                             retries += 1;
                                             let delay = action_retry_delay(retries);
@@ -373,7 +413,19 @@ impl ConsensusDriver {
                                                 delay_ms = delay.as_millis() as u64,
                                                 "retrying idempotent consensus action after transient failure"
                                             );
-                                            tokio::time::sleep(delay).await;
+                                            let retry_handle = worker_handle.clone();
+                                            let retry_action = action.clone();
+                                            tokio::spawn(async move {
+                                                tokio::time::sleep(delay).await;
+                                                let _ = retry_handle
+                                                    .submit(ConsensusDriverEvent::RetryAction {
+                                                        action: retry_action,
+                                                        attempt: retries,
+                                                        max_retries: retry_limit,
+                                                    })
+                                                    .await;
+                                            });
+                                            break;
                                         } else {
                                             execution_error = Some(error);
                                             break 'actions;
@@ -441,6 +493,8 @@ fn is_high_priority(event: &ConsensusDriverEvent) -> bool {
     matches!(
         event,
         ConsensusDriverEvent::Timeout(_)
+            | ConsensusDriverEvent::TimeoutApplied(_)
+            | ConsensusDriverEvent::TimeoutIgnored(_)
             | ConsensusDriverEvent::RoundStarted { .. }
             | ConsensusDriverEvent::StepStarted { .. }
             | ConsensusDriverEvent::VotePersisted(_)
@@ -539,6 +593,11 @@ fn replace_timeout(
     state.active_round = Some(round);
     state.generation = state.generation.saturating_add(1);
     state.pending.clear();
+    let stale_finality = state
+        .pending_finality
+        .values()
+        .map(|pending| (pending.height, pending.block_id))
+        .collect::<Vec<_>>();
     state.pending_finality.clear();
     let token = TimeoutToken {
         height,
@@ -547,7 +606,11 @@ fn replace_timeout(
         generation: state.generation,
         deadline,
     };
-    let mut actions = Vec::with_capacity(2);
+    let mut actions = stale_finality
+        .into_iter()
+        .map(|(height, block_id)| ConsensusDriverAction::UnpinPendingFinality { height, block_id })
+        .collect::<Vec<_>>();
+    actions.reserve(2);
     if let Some(previous) = state.active_timeout.replace(token) {
         actions.push(ConsensusDriverAction::CancelTimeout(previous));
     }
@@ -597,10 +660,29 @@ fn context_is_current(state: &DriverState, context: &ConsensusContextToken) -> b
             })
 }
 
-fn invalidate_after_finality(state: &mut DriverState, finalized_height: u64) {
+fn invalidate_after_finality(
+    state: &mut DriverState,
+    finalized_height: u64,
+) -> Vec<ConsensusDriverAction> {
     state.generation = state.generation.saturating_add(1);
     state.pending.clear();
-    state.pending_finality.clear();
+    let stale_finality = state
+        .pending_finality
+        .iter()
+        .filter_map(|(request_id, pending)| {
+            (pending.height <= finalized_height).then_some((*request_id, *pending))
+        })
+        .collect::<Vec<_>>();
+    let actions = stale_finality
+        .iter()
+        .map(|(_, pending)| ConsensusDriverAction::UnpinPendingFinality {
+            height: pending.height,
+            block_id: pending.block_id,
+        })
+        .collect::<Vec<_>>();
+    for (request_id, _) in stale_finality {
+        state.pending_finality.remove(&request_id);
+    }
     let next_height = finalized_height.saturating_add(1);
     if state
         .active_height
@@ -611,6 +693,7 @@ fn invalidate_after_finality(state: &mut DriverState, finalized_height: u64) {
         state.active_parent_block_hash = None;
         state.active_snapshot_hash = None;
     }
+    actions
 }
 
 async fn process_event(
@@ -659,6 +742,7 @@ async fn process_event(
                 commit,
             }]
         }
+        ConsensusDriverEvent::RetryAction { action, .. } => vec![action],
         ConsensusDriverEvent::RoundStarted {
             height,
             round,
@@ -674,12 +758,24 @@ async fn process_event(
             if state.active_timeout != Some(token) {
                 return Ok(Vec::new());
             }
-            state.active_timeout = None;
-            state.generation = state.generation.saturating_add(1);
-            vec![
-                ConsensusDriverAction::CancelTimeout(token),
-                ConsensusDriverAction::HandleTimeout(token),
-            ]
+            // The executor validates the real state-machine step before the
+            // timeout is allowed to invalidate the active context.
+            vec![ConsensusDriverAction::HandleTimeout(token)]
+        }
+        ConsensusDriverEvent::TimeoutApplied(token) => {
+            if state.active_timeout == Some(token) {
+                state.active_timeout = None;
+                state.generation = state.generation.saturating_add(1);
+            }
+            Vec::new()
+        }
+        ConsensusDriverEvent::TimeoutIgnored(token) => {
+            if state.active_timeout == Some(token) {
+                state.active_timeout = None;
+                vec![ConsensusDriverAction::CancelTimeout(token)]
+            } else {
+                Vec::new()
+            }
         }
         ConsensusDriverEvent::ProposalValidationCompleted {
             request_id,
@@ -737,12 +833,24 @@ async fn process_event(
             }
             match result {
                 CommitValidationResult::Accepted => {
-                    state.pending_finality.insert(request_id, context);
-                    vec![ConsensusDriverAction::PrepareFinality {
+                    state.pending_finality.insert(
+                        request_id,
+                        PendingFinality {
+                            context,
+                            height: commit.height,
+                            block_id: commit.block_id,
+                        },
+                    );
+                    let mut actions = Vec::with_capacity(2);
+                    if let Some(previous) = state.active_timeout.take() {
+                        actions.push(ConsensusDriverAction::CancelTimeout(previous));
+                    }
+                    actions.push(ConsensusDriverAction::PrepareFinality {
                         request_id,
                         context,
                         commit,
-                    }]
+                    });
+                    actions
                 }
                 CommitValidationResult::Rejected(_) => Vec::new(),
             }
@@ -752,10 +860,24 @@ async fn process_event(
             context,
             result,
         } => {
-            if state.pending_finality.remove(&request_id) != Some(context)
-                || !context_is_current(state, &context)
-            {
+            let Some(pending) = state.pending_finality.remove(&request_id) else {
                 return Ok(Vec::new());
+            };
+            if pending.context != context {
+                // The completion is not authoritative for the request that
+                // installed the pin.  It must nevertheless release that
+                // request's pin; otherwise an out-of-order worker result can
+                // permanently consume candidate-cache capacity.
+                return Ok(vec![ConsensusDriverAction::UnpinPendingFinality {
+                    height: pending.height,
+                    block_id: pending.block_id,
+                }]);
+            }
+            if !context_is_current(state, &context) {
+                return Ok(vec![ConsensusDriverAction::UnpinPendingFinality {
+                    height: pending.height,
+                    block_id: pending.block_id,
+                }]);
             }
             match result {
                 FinalityPreparationResult::Prepared(prepared) => {
@@ -766,10 +888,16 @@ async fn process_event(
                     }]
                 }
                 FinalityPreparationResult::AlreadyDurable(commit) => {
-                    invalidate_after_finality(state, commit.height);
-                    vec![ConsensusDriverAction::BroadcastCommit(commit)]
+                    let mut actions = invalidate_after_finality(state, commit.height);
+                    actions.push(ConsensusDriverAction::BroadcastCommit(commit));
+                    actions
                 }
-                FinalityPreparationResult::Rejected(_) => Vec::new(),
+                FinalityPreparationResult::Rejected(_) => {
+                    vec![ConsensusDriverAction::UnpinPendingFinality {
+                        height: pending.height,
+                        block_id: pending.block_id,
+                    }]
+                }
             }
         }
         ConsensusDriverEvent::VotePersisted(vote)
@@ -778,8 +906,8 @@ async fn process_event(
         }
         ConsensusDriverEvent::FinalityPersisted(commit)
         | ConsensusDriverEvent::FinalityDurable(commit) => {
-            invalidate_after_finality(state, commit.height);
-            let mut actions = Vec::with_capacity(2);
+            let mut actions = invalidate_after_finality(state, commit.height);
+            actions.reserve(2);
             if let Some(previous) = state.active_timeout.take() {
                 actions.push(ConsensusDriverAction::CancelTimeout(previous));
             }
@@ -824,6 +952,19 @@ mod tests {
             vrf_preout: [1; 32],
             vrf_proof: [2; 64],
             signature: [3; 64],
+        }
+    }
+
+    fn commit(height: u64, round: u32, id: u8) -> CommitCertificate {
+        CommitCertificate {
+            protocol_version: Default::default(),
+            chain_id: Default::default(),
+            epoch: 0,
+            height,
+            round,
+            block_id: BlockId(Hash([id; 32])),
+            stake_snapshot_hash: StakeSnapshotHash([8; 32]),
+            precommits: Vec::new(),
         }
     }
 
@@ -1075,10 +1216,11 @@ mod tests {
             .unwrap();
         assert!(timeout_actions
             .iter()
-            .any(|action| matches!(action, ConsensusDriverAction::CancelTimeout(token) if *token == first)));
-        assert!(timeout_actions
-            .iter()
             .any(|action| matches!(action, ConsensusDriverAction::HandleTimeout(token) if *token == first)));
+        driver
+            .dispatch(ConsensusDriverEvent::TimeoutApplied(first))
+            .await
+            .unwrap();
 
         let second_actions = driver
             .dispatch(ConsensusDriverEvent::StepStarted {
@@ -1103,6 +1245,88 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn accepted_finality_cancels_old_timeout_before_executor_can_apply_it() {
+        let mut state = DriverState::default();
+        let round_actions = process_event(
+            &mut state,
+            ConsensusDriverEvent::RoundStarted {
+                height: 1,
+                round: 0,
+                deadline: tokio::time::Instant::now(),
+            },
+        )
+        .await
+        .unwrap();
+        let timeout = round_actions
+            .iter()
+            .find_map(|action| match action {
+                ConsensusDriverAction::ScheduleTimeout(token) => Some(*token),
+                _ => None,
+            })
+            .expect("round start must schedule a timeout");
+
+        let commit_actions = process_event(
+            &mut state,
+            ConsensusDriverEvent::NetworkCommit(commit(1, 0, 7)),
+        )
+        .await
+        .unwrap();
+        let (request_id, context) = match &commit_actions[0] {
+            ConsensusDriverAction::ValidateCommit {
+                request_id,
+                context,
+                ..
+            } => (*request_id, *context),
+            other => panic!("unexpected action: {other:?}"),
+        };
+
+        let finality_actions = process_event(
+            &mut state,
+            ConsensusDriverEvent::CommitValidationCompleted {
+                request_id,
+                context,
+                commit: commit(1, 0, 7),
+                result: CommitValidationResult::Accepted,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(finality_actions.iter().any(|action| matches!(
+            action,
+            ConsensusDriverAction::CancelTimeout(token) if *token == timeout
+        )));
+        assert!(finality_actions.iter().any(|action| matches!(
+            action,
+            ConsensusDriverAction::PrepareFinality { request_id: id, .. } if *id == request_id
+        )));
+
+        let rejected_actions = process_event(
+            &mut state,
+            ConsensusDriverEvent::FinalityPreparationCompleted {
+                request_id,
+                context,
+                result: FinalityPreparationResult::Rejected("candidate unavailable".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(rejected_actions.iter().any(|action| matches!(
+            action,
+            ConsensusDriverAction::UnpinPendingFinality { height: 1, block_id }
+                if *block_id == BlockId(Hash([7; 32]))
+        )));
+
+        // A timeout already queued by the timer task must not be allowed to
+        // race the finality preparation after the driver cancelled it.
+        assert!(
+            process_event(&mut state, ConsensusDriverEvent::Timeout(timeout))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     struct RecordingExecutor {
@@ -1345,6 +1569,44 @@ mod tests {
             .dispatch(ConsensusDriverEvent::Shutdown)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_does_not_block_following_high_priority_events() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let driver = ConsensusDriver::start_with_executor(
+            8,
+            Arc::new(RetryingExecutor {
+                attempts,
+                failures: 8,
+            }),
+        )
+        .unwrap();
+        let started = tokio::time::Instant::now();
+        driver
+            .dispatch(ConsensusDriverEvent::NetworkProposal {
+                proposal: proposal(1, 0, 1),
+                block: BlockV2::default(),
+            })
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        let actions = driver
+            .dispatch(ConsensusDriverEvent::RoundStarted {
+                height: 1,
+                round: 0,
+                deadline: tokio::time::Instant::now(),
+            })
+            .await
+            .unwrap();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            ConsensusDriverAction::ScheduleTimeout(TimeoutToken {
+                step: TimeoutStep::Propose,
+                ..
+            })
+        )));
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@ use norn_common::consensus_types::{
 use norn_common::error::{NornError, Result};
 use norn_common::genesis::ProtocolResourceLimits;
 use norn_common::types::{Block, BlockHeader, BlockId, BlockV2, Hash, ValidatorId};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -85,7 +85,10 @@ struct V2CandidateEntry {
 pub struct V2CandidateCache {
     limits: V2CandidateCacheLimits,
     entries: HashMap<(u64, BlockId), V2CandidateEntry>,
-    pending_finality: HashSet<(u64, BlockId)>,
+    /// Number of in-flight finality preparations holding each candidate pin.
+    /// Duplicate certificates may start duplicate workers; one worker must
+    /// not release another worker's retention dependency.
+    pending_finality: HashMap<(u64, BlockId), usize>,
     total_bytes: usize,
 }
 
@@ -94,7 +97,7 @@ impl V2CandidateCache {
         Self {
             limits,
             entries: HashMap::new(),
-            pending_finality: HashSet::new(),
+            pending_finality: HashMap::new(),
             total_bytes: 0,
         }
     }
@@ -249,7 +252,8 @@ impl V2CandidateCache {
     pub fn pin_pending_finality(&mut self, height: u64, block_id: BlockId) -> bool {
         let key = (height, block_id);
         if let Some(entry) = self.entries.get_mut(&key) {
-            self.pending_finality.insert(key);
+            let pin_count = self.pending_finality.entry(key).or_insert(0);
+            *pin_count = pin_count.saturating_add(1);
             entry.retention = CandidateRetention::PendingFinalityPinned;
             true
         } else {
@@ -258,9 +262,22 @@ impl V2CandidateCache {
     }
 
     pub fn unpin_pending_finality(&mut self, height: u64, block_id: BlockId) {
-        self.pending_finality.remove(&(height, block_id));
-        if let Some(entry) = self.entries.get_mut(&(height, block_id)) {
-            entry.retention = CandidateRetention::Normal;
+        let key = (height, block_id);
+        let still_pinned = match self.pending_finality.get_mut(&key) {
+            Some(pin_count) if *pin_count > 1 => {
+                *pin_count -= 1;
+                true
+            }
+            Some(_) => {
+                self.pending_finality.remove(&key);
+                false
+            }
+            None => false,
+        };
+        if !still_pinned {
+            if let Some(entry) = self.entries.get_mut(&key) {
+                entry.retention = CandidateRetention::Normal;
+            }
         }
     }
 
@@ -282,7 +299,10 @@ impl V2CandidateCache {
             if *entry_height != height {
                 continue;
             }
-            entry.retention = if self.pending_finality.contains(&(*entry_height, *block_id)) {
+            entry.retention = if self
+                .pending_finality
+                .contains_key(&(*entry_height, *block_id))
+            {
                 CandidateRetention::PendingFinalityPinned
             } else if locked_block == Some(*block_id) {
                 CandidateRetention::LockedPinned
@@ -1236,6 +1256,7 @@ mod tests {
         let pinned = cache_proposal(1, 0, 1, 1);
         assert!(cache.insert(pinned.clone(), BlockV2::default(), Hash([4; 32]), 1, 0));
         assert!(cache.pin_pending_finality(1, pinned.block_id));
+        assert!(cache.pin_pending_finality(1, pinned.block_id));
         assert_eq!(
             cache.retention(1, pinned.block_id),
             Some(CandidateRetention::PendingFinalityPinned)
@@ -1251,6 +1272,11 @@ mod tests {
         ));
         assert!(cache.get(1, pinned.block_id).is_some());
 
+        cache.unpin_pending_finality(1, pinned.block_id);
+        assert_eq!(
+            cache.retention(1, pinned.block_id),
+            Some(CandidateRetention::PendingFinalityPinned)
+        );
         cache.unpin_pending_finality(1, pinned.block_id);
         assert!(cache.get(1, pinned.block_id).is_none());
     }

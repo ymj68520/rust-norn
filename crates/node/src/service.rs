@@ -865,22 +865,12 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                     }
                 };
                 let finality_context = self.finality_context.clone();
-                let commit_for_pin = commit.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
                     let result = match finality_context.prepare_commit(commit).await {
                         Ok(result) => result,
                         Err(error) => FinalityPreparationResult::Rejected(error.to_string()),
                     };
-                    if matches!(&result, FinalityPreparationResult::Rejected(_)) {
-                        let _ = finality_context
-                            .consensus
-                            .unpin_v2_candidate_for_finality(
-                                commit_for_pin.height,
-                                commit_for_pin.block_id,
-                            )
-                            .await;
-                    }
                     let _ = handle
                         .submit(ConsensusDriverEvent::FinalityPreparationCompleted {
                             request_id,
@@ -943,45 +933,65 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
             }
             ConsensusDriverAction::HandleTimeout(token) => {
                 let Some(signer) = self.signer.as_ref() else {
+                    handle
+                        .submit(ConsensusDriverEvent::TimeoutIgnored(token))
+                        .await?;
                     return Ok(());
                 };
+                let mut timeout_is_current = true;
                 let vote = {
                     let mut state_machine = self.consensus.state_machine.write().await;
                     if state_machine.height != token.height || state_machine.round != token.round {
-                        return Ok(());
-                    }
-                    let timeout_is_current = match token.step {
-                        TimeoutStep::Propose => matches!(
-                            state_machine.step,
-                            norn_core::consensus::types::ConsensusStep::NewHeight
-                                | norn_core::consensus::types::ConsensusStep::NewRound
-                                | norn_core::consensus::types::ConsensusStep::Propose
-                        ),
-                        TimeoutStep::PrevoteWait => {
-                            state_machine.step
-                                == norn_core::consensus::types::ConsensusStep::PrevoteWait
-                        }
-                        TimeoutStep::PrecommitWait => {
-                            state_machine.step
-                                == norn_core::consensus::types::ConsensusStep::PrecommitWait
-                        }
-                    };
-                    if !timeout_is_current {
-                        return Ok(());
-                    }
-                    match token.step {
-                        TimeoutStep::Propose => {
-                            Some(state_machine.on_timeout_propose(signer.as_ref())?)
-                        }
-                        TimeoutStep::PrevoteWait => {
-                            Some(state_machine.on_timeout_prevote(signer.as_ref())?)
-                        }
-                        TimeoutStep::PrecommitWait => {
-                            state_machine.on_timeout_precommit();
+                        timeout_is_current = false;
+                        None
+                    } else {
+                        let step_matches = match token.step {
+                            TimeoutStep::Propose => matches!(
+                                state_machine.step,
+                                norn_core::consensus::types::ConsensusStep::NewHeight
+                                    | norn_core::consensus::types::ConsensusStep::NewRound
+                                    | norn_core::consensus::types::ConsensusStep::Propose
+                            ),
+                            TimeoutStep::PrevoteWait => {
+                                state_machine.step
+                                    == norn_core::consensus::types::ConsensusStep::PrevoteWait
+                            }
+                            TimeoutStep::PrecommitWait => {
+                                state_machine.step
+                                    == norn_core::consensus::types::ConsensusStep::PrecommitWait
+                            }
+                        };
+                        if !step_matches {
+                            timeout_is_current = false;
                             None
+                        } else {
+                            match token.step {
+                                TimeoutStep::Propose => {
+                                    Some(state_machine.on_timeout_propose(signer.as_ref())?)
+                                }
+                                TimeoutStep::PrevoteWait => {
+                                    Some(state_machine.on_timeout_prevote(signer.as_ref())?)
+                                }
+                                TimeoutStep::PrecommitWait => {
+                                    state_machine.on_timeout_precommit()?;
+                                    None
+                                }
+                            }
                         }
                     }
                 };
+                if !timeout_is_current {
+                    handle
+                        .submit(ConsensusDriverEvent::TimeoutIgnored(token))
+                        .await?;
+                    return Ok(());
+                }
+                // Only now does the driver advance generation. A timeout
+                // that lost a race with Commit/finality has no effect on
+                // pending finality preparation.
+                handle
+                    .submit(ConsensusDriverEvent::TimeoutApplied(token))
+                    .await?;
                 if let Some(vote) = vote {
                     handle
                         .submit(ConsensusDriverEvent::VotePersisted(vote))
@@ -1055,6 +1065,18 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                     })?;
             }
             ConsensusDriverAction::CancelTimeout(_) => {}
+            ConsensusDriverAction::UnpinPendingFinality { height, block_id } => {
+                if !self
+                    .consensus
+                    .unpin_v2_candidate_for_finality(height, block_id)
+                    .await
+                {
+                    warn!(
+                        "stale finality preparation could not release candidate pin at height {}",
+                        height
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1292,6 +1314,37 @@ impl NornNode {
                 "Recovered finalized V2 state at height {}; consensus resumes at {}",
                 finalized.consensus_state.height,
                 finalized.consensus_state.height.saturating_add(1)
+            );
+        }
+
+        // Restore Tendermint lock/valid-round state only after the canonical
+        // finalized tip has been recovered. A state record from a finalized
+        // older height is stale and is replaced by the current-height state;
+        // a record ahead of the durable tip is a fail-closed corruption.
+        let safety_store = consensus.state_machine.read().await.safety_store.clone();
+        let durable_safety_state = safety_store
+            .load_consensus_state()
+            .map_err(|error| anyhow!("failed to load durable consensus safety state: {error}"))?;
+        {
+            let mut sm = consensus.state_machine.write().await;
+            if let Some(state) = durable_safety_state {
+                if state.height > sm.height {
+                    return Err(anyhow!(
+                        "durable consensus safety state is ahead of canonical consensus height"
+                    ));
+                }
+                if state.height == sm.height {
+                    sm.restore_durable_safety_state(state).map_err(|error| {
+                        anyhow!("failed to restore durable consensus safety state: {error}")
+                    })?;
+                }
+            }
+            safety_store
+                .persist_consensus_state(sm.durable_safety_state()?)
+                .map_err(|error| anyhow!("failed to checkpoint consensus safety state: {error}"))?;
+            info!(
+                "Restored consensus safety state at height {} round {} step {:?}",
+                sm.height, sm.round, sm.step
             );
         }
 

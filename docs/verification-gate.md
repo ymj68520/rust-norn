@@ -43,6 +43,10 @@ libFuzzer target against the same `decode_and_validate` entry point.
 - Validator and FullNode behavior is tested separately;
 - a signer/WAL failure produces no broadcast and no state transition;
 - a torn safety-WAL tail is recoverable;
+- Tendermint `locked_block`, `locked_round`, `valid_block`, `valid_round`,
+  and the valid-round certificate are recovered from durable safety state before
+  the validator resumes signing; a mismatched or ahead-of-tip record fails
+  closed;
 - finality commit retry is idempotent after an apply/flush ambiguity;
 - a conflicting block at an already finalized height is rejected;
 - the finalized record, pending validator changes, and next validator snapshot
@@ -54,12 +58,17 @@ libFuzzer target against the same `decode_and_validate` entry point.
   discarded even if the request entry was not cleared by the test harness;
 - worker completions are rechecked against generation, height, round, snapshot,
   and parent context before application;
+- finality preparation cancels the active timeout before work is dispatched,
+  and timeout generation changes only after the executor confirms the live
+  state-machine step; stale completion paths release their candidate pins;
 - an internal Action error without a oneshot reply is observable and puts the
   driver into fail-stop instead of being silently dropped;
 - only idempotent `BroadcastCommit` and `BroadcastVote` enqueue paths may
   return a typed retryable Action error; Commit retries are bounded to three
   retries and Vote retries to eight retries, both with exponential backoff,
   while unknown errors and retry exhaustion fail-stop;
+- retry backoff is delivered as a delayed driver event and does not block the
+  single-writer actor from processing high-priority consensus events;
 - V2 candidate proposal, block, and derived randomness are admitted as one
   bounded cache entry; byte, per-height, per-proposer, future-height,
   future-round, and TTL limits are enforced from protocol parameters or a
@@ -68,6 +77,10 @@ libFuzzer target against the same `decode_and_validate` entry point.
   are pinned against TTL/capacity eviction; a missing required dependency
   fails closed, and a late prevote Polka never signs a second precommit after a
   durable NIL precommit;
+- a valid-round re-proposal carries the exact earlier block: its block header
+  round equals `valid_round`, while the proposal round may be later; fresh
+  proposals require equal proposal/header rounds, and all other combinations
+  fail closed;
 - a conflicting candidate for the same `(height, block_id)` is rejected,
   identical replay is idempotent, and candidates through finalized height are
   removed;
