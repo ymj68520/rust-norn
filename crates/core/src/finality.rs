@@ -91,11 +91,17 @@ pub enum DurableCommitOutcome {
 
 pub struct FinalityStore {
     db: Arc<dyn DBInterface>,
+    /// Serializes durable block-record read-modify-write and finality cleanup
+    /// so `attempt_rounds` cannot lose a concurrent writer's index update.
+    candidate_write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl FinalityStore {
     pub fn new(db: Arc<dyn DBInterface>) -> Self {
-        Self { db }
+        Self {
+            db,
+            candidate_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     /// Initialize the canonical V2 tip for a fresh database. Existing state is
@@ -201,6 +207,7 @@ impl FinalityStore {
         block: &BlockV2,
         derived_randomness: Hash,
     ) -> Result<()> {
+        let _candidate_guard = self.candidate_write_lock.lock().await;
         if block.header.height < 0
             || proposal.height != block.header.height as u64
             || proposal.block_id != BlockId(block.header.block_hash)
@@ -361,6 +368,7 @@ impl FinalityStore {
     /// Candidate cleanup is intentionally only allowed after the finalized
     /// transaction has been durably committed.
     pub async fn clear_safety_candidate(&self, height: u64, block_id: BlockId) -> Result<()> {
+        let _candidate_guard = self.candidate_write_lock.lock().await;
         let mut keys = vec![
             safety_block_candidate_key(height, block_id),
             safety_candidate_key(height, block_id),
@@ -425,6 +433,7 @@ impl FinalityStore {
         checkpoint: Option<&CanonicalStateCheckpoint>,
         next_snapshot: Option<&StakeSnapshot>,
     ) -> Result<FinalityCommitResult> {
+        let _candidate_guard = self.candidate_write_lock.lock().await;
         let id = FinalizeTransactionId::from_v2(finalized);
         if finalized.block.header.height < 0
             || finalized.block.header.height as u64 != id.height
@@ -1307,6 +1316,7 @@ mod tests {
                 consensus_data_hash: Hash([8; 32]),
             },
             transactions: Vec::new(),
+            consensus_data: norn_common::types::BlockConsensusData::default(),
         };
         let commit = CommitCertificate {
             protocol_version,
@@ -1414,6 +1424,46 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_attempt_persistence_keeps_the_complete_round_index() {
+        let db = Arc::new(MemoryDb::default());
+        let store = Arc::new(FinalityStore::new(db));
+        let finalized = finalized();
+        let mut round_one = finalized.proposal.clone();
+        round_one.round = 1;
+        round_one.valid_round = Some(0);
+        round_one.valid_round_certificate = Some(PrevoteCertificate {
+            protocol_version: round_one.protocol_version,
+            chain_id: round_one.chain_id,
+            epoch: round_one.epoch,
+            height: round_one.height,
+            round: 0,
+            block_id: round_one.block_id,
+            stake_snapshot_hash: round_one.stake_snapshot_hash,
+            prevotes: Vec::new(),
+        });
+        round_one.proposer = ValidatorId([9; 32]);
+
+        let (first, second) = tokio::join!(
+            store.persist_safety_candidate(&finalized.proposal, &finalized.block, Hash([1; 32])),
+            store.persist_safety_candidate(&round_one, &finalized.block, Hash([2; 32])),
+        );
+        first.unwrap();
+        second.unwrap();
+
+        let candidates = store
+            .recover_safety_candidates(1, finalized.commit.block_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.proposal.round)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 
     fn genesis_block() -> Block {

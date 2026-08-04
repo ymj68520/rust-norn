@@ -73,10 +73,11 @@ libFuzzer target against the same `decode_and_validate` entry point.
   separately; attempt identity is `(height, round, block_id)`, and byte,
   per-height, per-proposer, future-height, future-round, and TTL limits are
   enforced from protocol parameters or a versioned protocol invariant;
-- candidates referenced by `valid_block`, `locked_block`, or pending finality
-  are pinned against TTL/capacity eviction; a missing required dependency
-  fails closed, and a late prevote Polka never signs a second precommit after a
-  durable NIL precommit;
+- immutable blocks referenced by `valid_block` or `locked_block` remain
+  available, while historical proposal attempts may leave memory only after
+  their exact durable records are retained; pending-finality attempts are
+  pinned, and a missing required dependency fails closed. A late prevote Polka
+  never signs a second precommit after a durable NIL precommit;
 - a valid-round re-proposal carries the exact earlier block: its block header
   round equals `valid_round`, while the proposal round may be later; fresh
   proposals require equal proposal/header rounds, and all other combinations
@@ -87,7 +88,7 @@ libFuzzer target against the same `decode_and_validate` entry point.
 - finality retrieves the exact `(height, commit.round, block_id)` proposal
   attempt; `commit.round` equals the proposal round, while the block header
   round equals the valid round only for a valid-round re-proposal;
-- complete candidate material (Proposal, BlockV2, and derived randomness) is
+- complete candidate material (Proposal, BlockV2, and attempt randomness) is
   durably recoverable for every live `valid_block`/`locked_block` reference;
   immutable block records and each round-specific attempt carry a format
   version and checksum, and missing indexed attempts fail closed;
@@ -102,6 +103,11 @@ libFuzzer target against the same `decode_and_validate` entry point.
   when the live height/round has advanced;
 - four independent configurations derive the same snapshot hash and proposer
   sequence;
+- V4 `BlockConsensusData` commits the original builder VRF and execution
+  commitment; finality derives one next randomness from immutable block data,
+  regardless of the Commit/Proposal round;
+- durable block candidate index updates are serialized against concurrent
+  attempt writes and finality cleanup;
 - the full workspace test suite is green.
 
 These checks are completion gates, not evidence that an unreviewed deployment
@@ -109,7 +115,7 @@ is production-ready. Protocol upgrades continue to require a new versioned
 Genesis or an explicitly specified activation-height migration.
 
 Protocol upgrades use a new versioned Genesis/network identity. The active
-implementation is Genesis schema 3 / protocol 3 / wire 3; old V2 Genesis
+implementation is Genesis schema 4 / protocol 4 / wire 4; old V2/V3 Genesis
 records are rejected rather than guessed into the new format. The
 `BlockHeader` builder-identity field and hash layout therefore cannot be
 interpreted through a mixed-version deserialization path.

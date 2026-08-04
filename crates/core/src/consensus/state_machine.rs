@@ -882,6 +882,9 @@ impl TendermintStateMachine {
             return Err(anyhow!("V2 proposal context mismatch"));
         }
         validate_v2_proposal_builder_relation(proposal, &block.header)?;
+        if block.header.protocol_version.0 >= 4 {
+            self.verify_block_builder_vrf(block)?;
+        }
         let expected_proposer = self
             .get_current_proposer()
             .ok_or_else(|| anyhow!("no deterministic proposer is available"))?;
@@ -945,6 +948,9 @@ impl TendermintStateMachine {
             return Err(anyhow!("durable V2 proposal context mismatch"));
         }
         validate_v2_proposal_builder_relation(proposal, &block.header)?;
+        if block.header.protocol_version.0 >= 4 {
+            self.verify_block_builder_vrf(block)?;
+        }
         let record = self
             .snapshot
             .validators
@@ -986,6 +992,58 @@ impl TendermintStateMachine {
             &VRFProofBytes(proposal.vrf_proof),
         )
         .map_err(|e| anyhow!("durable V2 proposal VRF verification failed: {e}"))
+    }
+
+    /// Verify the VRF commitment that belongs to the immutable block builder.
+    /// This is separate from the current Proposal VRF: a later-round proposer
+    /// may replace the latter, but never the builder material committed by the
+    /// block ID.
+    pub fn verify_block_builder_vrf(&self, block: &BlockV2) -> Result<VerifiedVrfOutput> {
+        if block.header.protocol_version.0 < 4
+            || block.consensus_data.builder_round != block.header.round
+            || block.header.height < 0
+            || block.header.protocol_version != self.config.protocol_version
+            || block.header.chain_id != self.config.chain_id
+            || block.header.epoch != self.current_epoch()?
+            || block.header.stake_snapshot_hash != self.snapshot.snapshot_hash
+            || block.header.parent_randomness != self.parent_randomness
+        {
+            return Err(anyhow!("immutable builder VRF context mismatch"));
+        }
+        let builder = block.header.block_builder;
+        let record = self
+            .snapshot
+            .validators
+            .get(&builder)
+            .ok_or_else(|| anyhow!("immutable block builder is not in the active snapshot"))?;
+        if !record.is_active_at(self.snapshot.epoch) {
+            return Err(anyhow!(
+                "immutable block builder is jailed or slashed in the active snapshot"
+            ));
+        }
+        if record.vrf_public_key.0 == [0u8; 32]
+            || block.consensus_data.builder_vrf_preout == [0u8; 32]
+            || block.consensus_data.builder_vrf_proof == [0u8; 64]
+        {
+            return Err(anyhow!("immutable builder VRF material is zero"));
+        }
+        let context = VrfContext {
+            protocol_version: block.header.protocol_version,
+            chain_id: block.header.chain_id,
+            epoch: block.header.epoch,
+            height: block.header.height as u64,
+            round: block.consensus_data.builder_round,
+            parent_block_hash: block.header.prev_block_hash,
+            stake_snapshot_hash: block.header.stake_snapshot_hash,
+            validator_id: builder,
+        };
+        norn_crypto::vrf::verify_and_derive(
+            &record.vrf_public_key.0,
+            &context,
+            &VRFPreOutBytes(block.consensus_data.builder_vrf_preout),
+            &VRFProofBytes(block.consensus_data.builder_vrf_proof),
+        )
+        .map_err(|e| anyhow!("immutable builder VRF verification failed: {e}"))
     }
 
     /// Verify the proposer VRF against the complete active-height context.
@@ -1566,7 +1624,7 @@ fn validate_v2_proposal_builder_relation(
         && (proposal.valid_round.is_some() || proposal.valid_round_certificate.is_some())
     {
         return Err(anyhow!(
-            "valid-round re-proposals require the active V3 protocol"
+            "valid-round re-proposals require protocol version 3 or newer"
         ));
     }
     match (

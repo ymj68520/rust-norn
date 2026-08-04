@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub const GENESIS_SCHEMA_VERSION: u16 = 3;
-pub const GENESIS_IDENTITY_KEY: &[u8] = b"genesis_identity_v3";
+pub const GENESIS_SCHEMA_VERSION: u16 = 4;
+pub const GENESIS_IDENTITY_KEY: &[u8] = b"genesis_identity_v4";
 
 fn default_epoch_delay() -> u64 {
     1
@@ -160,7 +160,7 @@ impl GenesisConfig {
         }
         if self.protocol_version != ChainContext::CURRENT_PROTOCOL_VERSION {
             return Err(NornError::Config(
-                "Genesis protocol version is not the active V3 protocol".into(),
+                "Genesis protocol version is not the active V4 protocol".into(),
             ));
         }
         if self.chain_id.0 == Hash::default() {
@@ -296,7 +296,7 @@ impl GenesisConfig {
     /// Canonical, order-independent encoding used for Genesis identity.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(512 + self.validators.len() * 105);
-        bytes.extend_from_slice(b"NORN_GENESIS_V3");
+        bytes.extend_from_slice(b"NORN_GENESIS_V4");
         bytes.extend_from_slice(&self.schema_version.to_be_bytes());
         bytes.extend_from_slice(&self.protocol_version.0.to_be_bytes());
         bytes.extend_from_slice(&self.chain_id.0 .0);

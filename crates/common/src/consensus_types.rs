@@ -1,8 +1,8 @@
 use crate::chain_context::{protocol_error, ChainContext};
 use crate::error::{NornError, Result};
 use crate::types::{
-    Block, BlockId, BlockV2, ChainId, ConsensusPublicKey, Hash, ProtocolVersion, StakeSnapshotHash,
-    ValidatorId, VrfPublicKey,
+    derive_chain_randomness_v4, Block, BlockId, BlockV2, ChainId, ConsensusPublicKey, Hash,
+    ProtocolVersion, StakeSnapshotHash, ValidatorId, VrfPublicKey,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -48,7 +48,9 @@ pub struct Proposal {
 impl Proposal {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        if self.protocol_version.0 >= 3 {
+        if self.protocol_version.0 >= 4 {
+            bytes.extend_from_slice(b"NORN_BFT_V4_PROPOSAL");
+        } else if self.protocol_version.0 >= 3 {
             bytes.extend_from_slice(b"NORN_BFT_V3_PROPOSAL");
         } else {
             bytes.extend_from_slice(b"NORN_BFT_V2_PROPOSAL");
@@ -93,8 +95,14 @@ impl SignedVote {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         match self.step {
+            VoteStep::Prevote if self.protocol_version.0 >= 4 => {
+                bytes.extend_from_slice(b"NORN_BFT_V4_PREVOTE")
+            }
             VoteStep::Prevote if self.protocol_version.0 >= 3 => {
                 bytes.extend_from_slice(b"NORN_BFT_V3_PREVOTE")
+            }
+            VoteStep::Precommit if self.protocol_version.0 >= 4 => {
+                bytes.extend_from_slice(b"NORN_BFT_V4_PRECOMMIT")
             }
             VoteStep::Precommit if self.protocol_version.0 >= 3 => {
                 bytes.extend_from_slice(b"NORN_BFT_V3_PRECOMMIT")
@@ -138,7 +146,9 @@ impl CommitCertificate {
     /// cannot produce a different state hash.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(128 + self.precommits.len() * 256);
-        if self.protocol_version.0 >= 3 {
+        if self.protocol_version.0 >= 4 {
+            bytes.extend_from_slice(b"NORN_COMMIT_CERTIFICATE_V4");
+        } else if self.protocol_version.0 >= 3 {
             bytes.extend_from_slice(b"NORN_COMMIT_CERTIFICATE_V3");
         } else {
             bytes.extend_from_slice(b"NORN_COMMIT_CERTIFICATE_V2");
@@ -770,7 +780,7 @@ fn validate_proposal_block_round(
         && (proposal.valid_round.is_some() || proposal.valid_round_certificate.is_some())
     {
         return Err(protocol_error(
-            "valid-round re-proposals require the active V3 protocol",
+            "valid-round re-proposals require protocol version 3 or newer",
         ));
     }
     match (
@@ -1212,7 +1222,7 @@ impl FinalizedConsensusState {
         proposal: &Proposal,
         block: &BlockV2,
         commit: &CommitCertificate,
-        next_randomness: Hash,
+        builder_vrf_randomness: Hash,
     ) -> Result<Self> {
         if block.header.height < 0
             || block.header.block_hash == Hash::default()
@@ -1254,6 +1264,22 @@ impl FinalizedConsensusState {
                 "Finalized consensus state does not match block/certificate".into(),
             ));
         }
+        let next_randomness = if block.header.protocol_version.0 >= 4 {
+            derive_chain_randomness_v4(
+                block.header.parent_randomness,
+                builder_vrf_randomness,
+                commit.block_id,
+                block.header.chain_id,
+                block.header.protocol_version,
+                block.header.epoch,
+                commit.height,
+                block.header.stake_snapshot_hash,
+            )
+        } else {
+            // V3 is retained only for explicit compatibility/unit fixtures;
+            // the active V4 Genesis path always uses the immutable formula.
+            builder_vrf_randomness
+        };
         Ok(Self {
             height: commit.height,
             finalized_block_id: commit.block_id,
@@ -1833,7 +1859,7 @@ mod finalized_consensus_state_tests {
 
     #[test]
     fn finalized_state_accepts_valid_round_reproposal_certificate_round() {
-        let protocol_version = ProtocolVersion(3);
+        let protocol_version = ProtocolVersion(4);
         let chain_id = ChainId(Hash([1; 32]));
         let block_id = BlockId(Hash([9; 32]));
         let snapshot_hash = StakeSnapshotHash([8; 32]);
@@ -1857,6 +1883,7 @@ mod finalized_consensus_state_tests {
                 consensus_data_hash: Hash([4; 32]),
             },
             transactions: Vec::new(),
+            consensus_data: crate::types::BlockConsensusData::default(),
         };
         let valid_round_certificate = PrevoteCertificate {
             protocol_version,
@@ -1899,5 +1926,30 @@ mod finalized_consensus_state_tests {
             FinalizedConsensusState::from_v2(&proposal, &block, &commit, Hash([3; 32])).unwrap();
         assert_eq!(finalized.height, 1);
         assert_eq!(finalized.commit_certificate_hash, commit.certificate_hash());
+
+        let mut fresh_proposal = proposal.clone();
+        fresh_proposal.round = 0;
+        fresh_proposal.valid_round = None;
+        fresh_proposal.valid_round_certificate = None;
+        fresh_proposal.proposer = block.header.block_builder;
+        let mut fresh_commit = commit.clone();
+        fresh_commit.round = 0;
+        let fresh =
+            FinalizedConsensusState::from_v2(&fresh_proposal, &block, &fresh_commit, Hash([3; 32]))
+                .unwrap();
+        assert_eq!(fresh.next_randomness, finalized.next_randomness);
+        assert_eq!(
+            finalized.next_randomness,
+            derive_chain_randomness_v4(
+                block.header.parent_randomness,
+                Hash([3; 32]),
+                block_id,
+                chain_id,
+                protocol_version,
+                block.header.epoch,
+                block.header.height as u64,
+                snapshot_hash,
+            )
+        );
     }
 }

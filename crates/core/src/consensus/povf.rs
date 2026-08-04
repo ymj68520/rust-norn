@@ -19,7 +19,7 @@ use norn_common::consensus_types::{
 use norn_common::error::{NornError, Result};
 use norn_common::genesis::ProtocolResourceLimits;
 use norn_common::types::{Block, BlockHeader, BlockId, BlockV2, Hash, ValidatorId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -94,6 +94,10 @@ pub struct V2CandidateCache {
     /// Duplicate certificates may start duplicate workers; one worker must
     /// not release another worker's retention dependency.
     pending_finality: HashMap<(u64, u32, BlockId), usize>,
+    /// Immutable block bodies needed by the live lock/valid dependencies may
+    /// outlive every in-memory proposal attempt. Historical attempts remain
+    /// durable and are loaded by exact key when a Commit arrives.
+    required_blocks: HashSet<(u64, BlockId)>,
     total_bytes: usize,
 }
 
@@ -104,6 +108,7 @@ impl V2CandidateCache {
             entries: HashMap::new(),
             blocks: HashMap::new(),
             pending_finality: HashMap::new(),
+            required_blocks: HashSet::new(),
             total_bytes: 0,
         }
     }
@@ -126,6 +131,7 @@ impl V2CandidateCache {
                 .entries
                 .keys()
                 .any(|candidate_key| (candidate_key.0, candidate_key.2) == block_key)
+                && !self.required_blocks.contains(&block_key)
             {
                 self.blocks.remove(&block_key);
             }
@@ -321,13 +327,21 @@ impl V2CandidateCache {
     pub fn reconcile_state(
         &mut self,
         height: u64,
+        current_round: u32,
         valid_block: Option<BlockId>,
         locked_block: Option<BlockId>,
     ) -> bool {
         let required = [valid_block, locked_block]
             .into_iter()
             .flatten()
-            .all(|block_id| self.blocks.contains_key(&(height, block_id)));
+            .collect::<HashSet<_>>();
+        let all_required_present = required
+            .iter()
+            .all(|block_id| self.blocks.contains_key(&(height, *block_id)));
+        self.required_blocks
+            .retain(|(entry_height, _)| *entry_height != height);
+        self.required_blocks
+            .extend(required.iter().copied().map(|block_id| (height, block_id)));
         for ((entry_height, _round, block_id), entry) in &mut self.entries {
             if *entry_height != height {
                 continue;
@@ -338,15 +352,15 @@ impl V2CandidateCache {
                     .contains_key(&(*entry_height, *_round, *block_id))
                 {
                     CandidateRetention::PendingFinalityPinned
-                } else if locked_block == Some(*block_id) {
+                } else if locked_block == Some(*block_id) && *_round == current_round {
                     CandidateRetention::LockedPinned
-                } else if valid_block == Some(*block_id) {
+                } else if valid_block == Some(*block_id) && *_round == current_round {
                     CandidateRetention::ValidRoundPinned
                 } else {
                     CandidateRetention::Normal
                 };
         }
-        required
+        all_required_present
     }
 
     pub fn get(&mut self, height: u64, block_id: BlockId) -> Option<ValidatedCandidate> {
@@ -393,6 +407,10 @@ impl V2CandidateCache {
         for key in keys {
             self.remove_key(&key);
         }
+        self.required_blocks
+            .retain(|(height, _)| *height > finalized_height);
+        self.blocks
+            .retain(|(height, _), _| *height > finalized_height);
     }
 
     pub fn len(&self) -> usize {
@@ -598,7 +616,8 @@ impl PoVFEngine {
                 "V2 proposal state_root does not match deterministic execution".into(),
             ));
         }
-        if calculate_v2_execution_data_hash(&execution.results) != block.header.consensus_data_hash
+        if calculate_v2_execution_data_hash(&execution.results)
+            != block.consensus_data.execution_data_hash
         {
             return Err(NornError::ConsensusError(
                 "V2 proposal execution commitment does not match deterministic execution".into(),
@@ -758,7 +777,8 @@ impl PoVFEngine {
                 "V2 proposal state_root does not match deterministic execution".into(),
             ));
         }
-        if calculate_v2_execution_data_hash(&execution.results) != block.header.consensus_data_hash
+        if calculate_v2_execution_data_hash(&execution.results)
+            != block.consensus_data.execution_data_hash
         {
             return Err(NornError::ConsensusError(
                 "V2 proposal execution commitment does not match deterministic execution".into(),
@@ -807,9 +827,9 @@ impl PoVFEngine {
     /// reported so the caller can fail-stop rather than continue with a
     /// state-machine reference that cannot be re-proposed or finalized.
     pub async fn reconcile_v2_candidate_retention(&self) -> bool {
-        let (height, valid_block, locked_block) = {
+        let (height, current_round, valid_block, locked_block) = {
             let sm = self.state_machine.read().await;
-            (sm.height, sm.valid_block, sm.locked_block)
+            (sm.height, sm.round, sm.valid_block, sm.locked_block)
         };
         let required = [valid_block, locked_block]
             .into_iter()
@@ -842,7 +862,7 @@ impl PoVFEngine {
                 let (context, verified_randomness) = {
                     let sm = self.state_machine.read().await;
                     let context = ChainContext::new(
-                        3,
+                        4,
                         sm.config.protocol_version,
                         sm.config.chain_id,
                         Hash::default(),
@@ -871,10 +891,12 @@ impl PoVFEngine {
                 }
             }
         }
-        self.candidate_cache_v2
-            .write()
-            .await
-            .reconcile_state(height, valid_block, locked_block)
+        self.candidate_cache_v2.write().await.reconcile_state(
+            height,
+            current_round,
+            valid_block,
+            locked_block,
+        )
     }
 
     pub async fn pin_v2_candidate_for_finality(
@@ -944,16 +966,85 @@ impl PoVFEngine {
             .map(|candidate| (candidate.proposal, candidate.block))
     }
 
+    async fn load_durable_candidate_attempt(
+        &self,
+        height: u64,
+        round: u32,
+        block_id: BlockId,
+    ) -> Option<ValidatedCandidate> {
+        let store = self.attached_finality_store()?;
+        let attempt = store
+            .recover_safety_candidate_attempt(height, round, block_id)
+            .await
+            .ok()
+            .flatten()?;
+        let block = store
+            .recover_safety_block(height, block_id)
+            .await
+            .ok()
+            .flatten()?
+            .block;
+        if attempt.proposal.height != height
+            || attempt.proposal.round != round
+            || attempt.proposal.block_id != block_id
+        {
+            return None;
+        }
+        let (current_height, current_round, context, verified_randomness) = {
+            let sm = self.state_machine.read().await;
+            let context = ChainContext::new(
+                4,
+                sm.config.protocol_version,
+                sm.config.chain_id,
+                Hash::default(),
+            );
+            let verified = sm
+                .validate_v2_proposal_for_recovery(&attempt.proposal, &block)
+                .ok()
+                .map(|output| Hash(output.randomness));
+            (sm.height, sm.round, context, verified)
+        };
+        if block
+            .validate_structure(&context, &self.resource_limits)
+            .is_err()
+            || verified_randomness != Some(attempt.derived_randomness)
+        {
+            return None;
+        }
+        let candidate = ValidatedCandidate {
+            proposal: attempt.proposal,
+            block,
+            derived_randomness: attempt.derived_randomness,
+        };
+        let mut cache = self.candidate_cache_v2.write().await;
+        if !cache.insert(
+            candidate.proposal.clone(),
+            candidate.block.clone(),
+            candidate.derived_randomness,
+            current_height,
+            current_round,
+        ) {
+            return cache.get_attempt(height, round, block_id);
+        }
+        cache.get_attempt(height, round, block_id)
+    }
+
     pub async fn get_validated_candidate_for_commit(
         &self,
         height: u64,
         round: u32,
         block_id: BlockId,
     ) -> Option<(Proposal, BlockV2)> {
-        self.candidate_cache_v2
+        if let Some(candidate) = self
+            .candidate_cache_v2
             .write()
             .await
             .get_attempt(height, round, block_id)
+        {
+            return Some((candidate.proposal, candidate.block));
+        }
+        self.load_durable_candidate_attempt(height, round, block_id)
+            .await
             .map(|candidate| (candidate.proposal, candidate.block))
     }
 
@@ -1008,7 +1099,7 @@ impl PoVFEngine {
             })?;
         if projected_state_root != block.header.state_root
             || calculate_v2_execution_data_hash(&execution.results)
-                != block.header.consensus_data_hash
+                != block.consensus_data.execution_data_hash
         {
             return Err(NornError::ConsensusError(
                 "V2 finality execution commitment mismatch".into(),
@@ -1297,8 +1388,19 @@ impl PoVFEngine {
         }
         self.verify_commit_certificate_v2(&block, &commit, &snapshot)?;
 
+        let builder_vrf_randomness = if block.header.protocol_version.0 >= 4 {
+            let sm = self.state_machine.read().await;
+            Hash(
+                sm.verify_block_builder_vrf(&block)
+                    .map_err(|error| NornError::ConsensusError(error.to_string()))?
+                    .randomness,
+            )
+        } else {
+            next_randomness
+        };
+
         let mut consensus_state =
-            FinalizedConsensusState::from_v2(&proposal, &block, &commit, next_randomness)?;
+            FinalizedConsensusState::from_v2(&proposal, &block, &commit, builder_vrf_randomness)?;
         consensus_state.pending_validator_changes = pending_validator_changes;
 
         let finalized = FinalizedBlockV2 {
@@ -1467,6 +1569,35 @@ mod tests {
             .expect("original round candidate retained");
         assert_eq!(original.derived_randomness, Hash([1; 32]));
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn historical_attempts_can_be_evicted_while_required_block_stays_available() {
+        let mut cache = V2CandidateCache::new(V2CandidateCacheLimits {
+            max_total_bytes: 1_000_000,
+            max_items_per_height: 2,
+            max_items_per_proposer: 4,
+            max_future_height: 0,
+            max_future_round: 2,
+            ttl: Duration::from_secs(60),
+        });
+        let first = cache_proposal(1, 0, 8, 1);
+        let block = BlockV2::default();
+        assert!(cache.insert(first.clone(), block.clone(), Hash([1; 32]), 1, 0));
+        let mut second = first.clone();
+        second.round = 1;
+        second.proposer = ValidatorId([2; 32]);
+        assert!(cache.insert(second.clone(), block.clone(), Hash([2; 32]), 1, 1));
+        assert!(cache.reconcile_state(1, 1, Some(first.block_id), None));
+
+        let mut third = second.clone();
+        third.round = 2;
+        third.proposer = ValidatorId([3; 32]);
+        assert!(cache.insert(third.clone(), block.clone(), Hash([3; 32]), 1, 2));
+        assert!(cache.get_attempt(1, 0, first.block_id).is_none());
+        assert!(cache.get_attempt(1, 1, first.block_id).is_some());
+        assert!(cache.get_attempt(1, 2, first.block_id).is_some());
+        assert_eq!(cache.get_block(1, first.block_id), Some(block));
     }
 
     #[test]

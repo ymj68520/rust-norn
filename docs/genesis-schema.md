@@ -1,7 +1,7 @@
-# Genesis schema v2
+# Genesis schema v4
 
 `genesis.json` is a versioned network identity document. The node accepts it
-only when `schema_version` is `2`; unknown versions fail closed.
+only when `schema_version` is `4`; unknown versions fail closed.
 
 Required top-level fields:
 

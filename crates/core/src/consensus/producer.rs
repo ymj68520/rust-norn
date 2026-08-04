@@ -15,7 +15,8 @@ use norn_common::consensus_types::{
 };
 use norn_common::genesis::ProtocolResourceLimits;
 use norn_common::types::{
-    Address, Block, BlockHeader, BlockId, BlockV2, Hash, PublicKey, Transaction, TransactionV2,
+    Address, Block, BlockConsensusData, BlockHeader, BlockId, BlockV2, Hash, PublicKey,
+    Transaction, TransactionV2,
 };
 use norn_crypto::vrf::{VRFCalculator, VRFKeyPair, VrfContext};
 
@@ -400,6 +401,19 @@ impl BlockProducer {
             ));
         }
 
+        let builder_vrf_context = VrfContext {
+            protocol_version: context.protocol_version,
+            chain_id: context.chain_id,
+            epoch,
+            height: new_height,
+            round,
+            parent_block_hash: prev_hash,
+            stake_snapshot_hash: snapshot.snapshot_hash,
+            validator_id: proposer,
+        };
+        let builder_vrf =
+            VRFCalculator::calculate_with_context(&self.vrf_key_pair, &builder_vrf_context)?;
+
         let timestamp = chrono::Utc::now().timestamp();
         let evm_context = self
             .v2_code_storage
@@ -445,11 +459,17 @@ impl BlockProducer {
             gas_limit: i64::try_from(limits.max_block_gas)
                 .map_err(|_| anyhow!("Genesis block gas limit exceeds header range"))?,
             base_fee,
-            consensus_data_hash: calculate_v2_execution_data_hash(&execution.results),
+            consensus_data_hash: Hash::default(),
         };
         let mut block = BlockV2 {
             header,
             transactions,
+            consensus_data: BlockConsensusData {
+                builder_vrf_preout: builder_vrf.preout.0,
+                builder_vrf_proof: builder_vrf.proof.0,
+                builder_round: round,
+                execution_data_hash: calculate_v2_execution_data_hash(&execution.results),
+            },
         };
         block.finalize_header()?;
         block.validate_structure(context, limits)?;

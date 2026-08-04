@@ -454,7 +454,9 @@ impl TransactionV2 {
     /// intentionally excluded from this preimage.
     pub fn signing_bytes(&self) -> Result<Vec<u8>, TransactionV2Error> {
         let mut bytes = Vec::with_capacity(256);
-        if self.protocol_version.0 >= 3 {
+        if self.protocol_version.0 >= 4 {
+            bytes.extend_from_slice(b"NORN_TRANSACTION_V4");
+        } else if self.protocol_version.0 >= 3 {
             bytes.extend_from_slice(b"NORN_TRANSACTION_V3");
         } else {
             bytes.extend_from_slice(Self::DOMAIN);
@@ -519,7 +521,9 @@ impl TransactionV2 {
     pub fn calculate_id(&self) -> Result<TransactionId, TransactionV2Error> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        if self.protocol_version.0 >= 3 {
+        if self.protocol_version.0 >= 4 {
+            hasher.update(b"NORN_TRANSACTION_ID_V4");
+        } else if self.protocol_version.0 >= 3 {
             hasher.update(b"NORN_TRANSACTION_ID_V3");
         } else {
             hasher.update(b"NORN_TRANSACTION_ID_V2");
@@ -852,7 +856,9 @@ impl BlockHeader {
     pub fn calculate_hash(&self) -> Result<Hash, crate::error::NornError> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        if self.protocol_version.0 >= 3 {
+        if self.protocol_version.0 >= 4 {
+            hasher.update(b"NORN_BLOCK_HEADER_V4");
+        } else if self.protocol_version.0 >= 3 {
             hasher.update(b"NORN_BLOCK_HEADER_V3");
         } else {
             hasher.update(b"NORN_BLOCK_HEADER_V2");
@@ -876,6 +882,77 @@ impl BlockHeader {
     }
 }
 
+/// Immutable consensus material committed by a block builder.
+///
+/// Proposal VRF material is intentionally absent: a later-round proposer may
+/// sign the same block with a different attempt VRF, but that must not change
+/// the chain randomness derived from the finalized block.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlockConsensusData {
+    pub builder_vrf_preout: [u8; 32],
+    #[serde(with = "hex_serde_fixed_64")]
+    pub builder_vrf_proof: [u8; 64],
+    pub builder_round: u32,
+    /// Deterministic execution commitment retained separately so the header's
+    /// consensus_data_hash can commit to both execution and builder VRF data.
+    pub execution_data_hash: Hash,
+}
+
+impl Default for BlockConsensusData {
+    fn default() -> Self {
+        Self {
+            builder_vrf_preout: [0u8; 32],
+            builder_vrf_proof: [0u8; 64],
+            builder_round: 0,
+            execution_data_hash: Hash::default(),
+        }
+    }
+}
+
+impl BlockConsensusData {
+    pub fn calculate_hash(&self, protocol_version: ProtocolVersion) -> Hash {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        if protocol_version.0 >= 4 {
+            hasher.update(b"NORN_BLOCK_CONSENSUS_DATA_V4");
+        } else {
+            hasher.update(b"NORN_BLOCK_CONSENSUS_DATA_V3");
+        }
+        hasher.update(self.builder_vrf_preout);
+        hasher.update(self.builder_vrf_proof);
+        hasher.update(self.builder_round.to_be_bytes());
+        hasher.update(self.execution_data_hash.0);
+        Hash(hasher.finalize().into())
+    }
+}
+
+/// Derive the only randomness that may become the next height's parent seed.
+/// It is bound to immutable block material and deliberately excludes the
+/// round-specific Proposal, proposer, and Commit certificate.
+pub fn derive_chain_randomness_v4(
+    parent_randomness: Hash,
+    builder_vrf_randomness: Hash,
+    block_id: BlockId,
+    chain_id: ChainId,
+    protocol_version: ProtocolVersion,
+    epoch: u64,
+    height: u64,
+    stake_snapshot_hash: StakeSnapshotHash,
+) -> Hash {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"NORN_CHAIN_RANDOMNESS_V4");
+    hasher.update(parent_randomness.0);
+    hasher.update(builder_vrf_randomness.0);
+    hasher.update(block_id.0 .0);
+    hasher.update(chain_id.0 .0);
+    hasher.update(protocol_version.0.to_be_bytes());
+    hasher.update(epoch.to_be_bytes());
+    hasher.update(height.to_be_bytes());
+    hasher.update(stake_snapshot_hash.0);
+    Hash(hasher.finalize().into())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct Block {
     pub header: BlockHeader,
@@ -892,6 +969,8 @@ pub struct Block {
 pub struct BlockV2 {
     pub header: BlockHeader,
     pub transactions: Vec<TransactionV2>,
+    #[serde(default)]
+    pub consensus_data: BlockConsensusData,
 }
 
 impl BlockV2 {
@@ -937,6 +1016,11 @@ impl BlockV2 {
     /// execution result are finalized.
     pub fn finalize_header(&mut self) -> crate::error::Result<()> {
         self.header.merkle_root = Self::calculate_merkle_root(&self.transactions)?;
+        if self.header.protocol_version.0 >= 4 {
+            self.header.consensus_data_hash = self
+                .consensus_data
+                .calculate_hash(self.header.protocol_version);
+        }
         self.header.block_hash = self.header.calculate_hash()?;
         Ok(())
     }
@@ -970,6 +1054,30 @@ impl BlockV2 {
             return Err(crate::chain_context::protocol_error(
                 "V2 block gas limit is outside Genesis bounds",
             ));
+        }
+
+        if self.header.protocol_version.0 >= 4 {
+            if self.consensus_data.builder_vrf_preout == [0u8; 32]
+                || self.consensus_data.builder_vrf_proof == [0u8; 64]
+            {
+                return Err(crate::chain_context::protocol_error(
+                    "V4 block is missing immutable builder VRF material",
+                ));
+            }
+            if self.consensus_data.builder_round != self.header.round {
+                return Err(crate::chain_context::protocol_error(
+                    "V4 builder VRF round does not match block round",
+                ));
+            }
+            if self.header.consensus_data_hash
+                != self
+                    .consensus_data
+                    .calculate_hash(self.header.protocol_version)
+            {
+                return Err(crate::chain_context::protocol_error(
+                    "V4 consensus data commitment mismatch",
+                ));
+            }
         }
 
         let mut declared_gas = 0u64;
@@ -1108,6 +1216,7 @@ mod block_v2_tests {
                 consensus_data_hash: Hash([4; 32]),
             },
             transactions: vec![tx.clone()],
+            consensus_data: BlockConsensusData::default(),
         };
         block.finalize_header().unwrap();
         block
@@ -1140,6 +1249,7 @@ mod block_v2_tests {
                 ..BlockHeader::default()
             },
             transactions: vec![transaction()],
+            consensus_data: BlockConsensusData::default(),
         };
         block.finalize_header().unwrap();
         block.header.state_root = Hash([2; 32]);

@@ -78,11 +78,22 @@ The uncommitted follow-up addresses the latest review findings:
 - Persistent SafetyStore sequence allocation is serialized across vote and
   companion-state WAL transactions; a concurrent regression test verifies
   monotonic recovery without sequence reuse.
-- Protocol activation is explicit: the active network uses Genesis schema 3,
-  protocol version 3, wire version 3, `NORN_BLOCK_HEADER_V3`,
-  `NORN_GENESIS_V3`, V3 transaction IDs, and V3 consensus signing domains.
-  Legacy V2 Genesis/configuration is rejected; there is no mixed-height
+- Protocol activation is explicit: the active network uses Genesis schema 4,
+  protocol version 4, wire version 4, `NORN_BLOCK_HEADER_V4`,
+  `NORN_GENESIS_V4`, V4 transaction IDs, and V4 consensus signing domains.
+  Legacy V2/V3 Genesis/configuration is rejected; there is no mixed-height
   deserialization fallback.
+- The V4 activation carries immutable `BlockConsensusData`
+  with the original builder's VRF preout/proof and builder round. Its
+  `consensus_data_hash` commits this material with the execution commitment,
+  and finality derives `next_randomness` with `NORN_CHAIN_RANDOMNESS_V4` from
+  immutable block data and chain context. Proposal/Commit rounds cannot alter
+  the next-height seed.
+- Historical proposal attempts may leave memory after their exact durable
+  `(height, round, block_id)` record is retained. Exact Commit lookup reloads
+  and revalidates the attempt; required locked/valid immutable block bodies
+  remain available. Durable block-index read-modify-write is serialized with
+  finality cleanup.
 
 ## Verification
 
@@ -102,7 +113,9 @@ The previously published workspace and four-process recovery gates remain the
 baseline for `1c35717`; the full workspace suite must be rerun after this
 worktree is reviewed.
 
-The workspace run passed. It included the four-process Validator/FullNode BFT recovery test, 258 `norn-core` unit tests, 40 `norn-common` tests, the standalone four-node BFT test, all crate tests, and doc tests.
+The prior workspace run passed. The current focused run includes 262
+`norn-core` unit tests and 42 `norn-common` tests; the full workspace gate
+must be rerun after the V4 worktree is reviewed.
 
 `cargo audit --no-fetch --no-yanked` remains a failing security gate: it reports two `hickory-proto 0.25.2` vulnerabilities and 13 allowed maintenance/unsoundness warnings. One Hickory advisory has no fixed upgrade; the other requires `hickory-proto >=0.26.1`. Clippy with `-D warnings` also remains open because of existing warnings outside this follow-up.
 
@@ -122,5 +135,5 @@ Until these items are independently reviewed and accepted, the status remains:
 Candidate prototype
 Not production-ready
 Published follow-up implementation commits: `fe692408fe29e84261bca5b1c2bb4a35a2de434a`, `1c35717`
-Current next-round hardening: uncommitted on `65a9f3d`
+Current next-round hardening: uncommitted on `e75ad8f`
 ```
