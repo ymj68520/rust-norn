@@ -411,7 +411,6 @@ impl FinalityContext {
             || persisted.commit.protocol_version != received.protocol_version
             || persisted.commit.chain_id != received.chain_id
             || persisted.commit.epoch != received.epoch
-            || persisted.commit.round != received.round
             || persisted.commit.stake_snapshot_hash != received.stake_snapshot_hash
         {
             return Err(anyhow!(
@@ -1214,11 +1213,16 @@ impl NornNode {
             max_certificate_members: genesis_config.resource_limits.max_certificate_members,
             max_future_height: genesis_config.resource_limits.max_future_height,
             max_future_round: genesis_config.resource_limits.max_future_round,
+            max_consensus_round: genesis_config.resource_limits.max_consensus_round,
+            max_block_timestamp_step: genesis_config.resource_limits.max_block_timestamp_step,
         };
 
         let safety_path = Path::new(&config.data_dir).join("safety_store.log");
         let persistent_safety_store = Arc::new(PersistentSafetyStore::open(safety_path)?);
-        let finality_store = Arc::new(FinalityStore::new(db.clone()));
+        let finality_store = Arc::new(FinalityStore::new_with_limits(
+            db.clone(),
+            genesis_config.resource_limits.clone(),
+        ));
         let initialized_tip = finality_store
             .initialize_genesis_tip(
                 &genesis_config.genesis_block,
@@ -1227,14 +1231,17 @@ impl NornNode {
             )
             .await?;
 
-        let consensus = Arc::new(PoVFEngine::new_with_parent_randomness_and_limits(
-            consensus_config,
-            genesis_snapshot.clone(),
-            genesis_config.initial_randomness,
-            persistent_safety_store,
-            local_validator_id,
-            genesis_config.resource_limits.clone(),
-        ));
+        let consensus = Arc::new(
+            PoVFEngine::new_with_parent_randomness_and_timestamp_and_limits(
+                consensus_config,
+                genesis_snapshot.clone(),
+                genesis_config.initial_randomness,
+                initialized_tip.timestamp,
+                persistent_safety_store,
+                local_validator_id,
+                genesis_config.resource_limits.clone(),
+            ),
+        );
         consensus.attach_finality_store(finality_store.clone());
         {
             let sm = consensus.state_machine.read().await;

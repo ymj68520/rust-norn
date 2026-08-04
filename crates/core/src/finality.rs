@@ -5,6 +5,7 @@ use anyhow::{anyhow, bail, Result};
 use norn_common::consensus_types::{
     CanonicalFinalizedTip, FinalizeTransactionId, FinalizedBlockV2, Proposal, StakeSnapshot,
 };
+use norn_common::genesis::ProtocolResourceLimits;
 use norn_common::traits::DBInterface;
 use norn_common::types::{Block, BlockId, BlockV2, Hash, StakeSnapshotHash, TransactionId};
 use sha2::{Digest, Sha256};
@@ -34,6 +35,7 @@ const PENDING_PROPOSAL_PREFIX: &[u8] = b"consensus/v2/pending-proposal/";
 const SAFETY_CANDIDATE_PREFIX: &[u8] = b"consensus/v2/safety-candidate/";
 const SAFETY_BLOCK_CANDIDATE_PREFIX: &[u8] = b"consensus/v2/safety-candidate-block/";
 const SAFETY_ATTEMPT_PREFIX: &[u8] = b"consensus/v2/safety-proposal-attempt/";
+const SAFETY_HEIGHT_INDEX_PREFIX: &[u8] = b"consensus/v2/safety-proposal-height-index/";
 const SAFETY_RECORD_FORMAT_VERSION: u16 = 1;
 
 /// Complete validated candidate material required to recover a durable
@@ -71,6 +73,23 @@ pub struct DurableProposalAttempt {
     pub payload_hash: Hash,
 }
 
+/// Durable per-height index for every proposal attempt. The block record's
+/// `attempt_rounds` field is per block, so it cannot enforce a protocol limit
+/// that applies across multiple competing block IDs at one height.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct DurableHeightAttemptIndex {
+    format_version: u16,
+    height: u64,
+    attempts: Vec<DurableAttemptRef>,
+    payload_hash: Hash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct DurableAttemptRef {
+    round: u32,
+    block_id: BlockId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalityCommitResult {
     Applied,
@@ -91,6 +110,7 @@ pub enum DurableCommitOutcome {
 
 pub struct FinalityStore {
     db: Arc<dyn DBInterface>,
+    resource_limits: ProtocolResourceLimits,
     /// Serializes durable block-record read-modify-write and finality cleanup
     /// so `attempt_rounds` cannot lose a concurrent writer's index update.
     candidate_write_lock: Arc<tokio::sync::Mutex<()>>,
@@ -98,8 +118,16 @@ pub struct FinalityStore {
 
 impl FinalityStore {
     pub fn new(db: Arc<dyn DBInterface>) -> Self {
+        Self::new_with_limits(db, ProtocolResourceLimits::default())
+    }
+
+    pub fn new_with_limits(
+        db: Arc<dyn DBInterface>,
+        resource_limits: ProtocolResourceLimits,
+    ) -> Self {
         Self {
             db,
+            resource_limits,
             candidate_write_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -234,9 +262,15 @@ impl FinalityStore {
             bail!("safety candidate identity does not match its block");
         }
         let block_id = proposal.block_id;
+        if proposal.round > self.resource_limits.max_consensus_round {
+            bail!("proposal round exceeds the protocol consensus round bound");
+        }
         let block_key = safety_block_candidate_key(proposal.height, block_id);
         let attempt_key = safety_proposal_attempt_key(proposal.height, proposal.round, block_id);
-        let mut block_record = if let Some(bytes) = self.db.get(&block_key).await? {
+        let height_index_key = safety_height_attempt_index_key(proposal.height);
+        let existing_block_bytes = self.db.get(&block_key).await?;
+        let existing_block_present = existing_block_bytes.is_some();
+        let mut block_record = if let Some(bytes) = existing_block_bytes.as_ref() {
             let record: DurableBlockCandidate = decode(&bytes, "durable safety block candidate")?;
             validate_durable_block_candidate(&record)?;
             if record.height != proposal.height
@@ -253,6 +287,24 @@ impl FinalityStore {
                 block_id,
                 block: block.clone(),
                 attempt_rounds: Vec::new(),
+                payload_hash: Hash::default(),
+            }
+        };
+        let mut height_index = if let Some(bytes) = self.db.get(&height_index_key).await? {
+            let index: DurableHeightAttemptIndex =
+                decode(&bytes, "durable safety proposal height index")?;
+            validate_durable_height_attempt_index(&index)?;
+            if index.height != proposal.height {
+                bail!("durable safety proposal height index key does not match payload");
+            }
+            index
+        } else if existing_block_present {
+            bail!("durable safety block candidate exists without its per-height attempt index");
+        } else {
+            DurableHeightAttemptIndex {
+                format_version: SAFETY_RECORD_FORMAT_VERSION,
+                height: proposal.height,
+                attempts: Vec::new(),
                 payload_hash: Hash::default(),
             }
         };
@@ -273,16 +325,113 @@ impl FinalityStore {
                 bail!("durable safety proposal attempt conflicts with existing attempt");
             }
         }
-        if !block_record.attempt_rounds.contains(&proposal.round) {
+        let current_attempt_ref = DurableAttemptRef {
+            round: proposal.round,
+            block_id,
+        };
+        let has_indexed_attempt = height_index.attempts.contains(&current_attempt_ref);
+        if has_indexed_attempt != self.db.get(&attempt_key).await?.is_some() {
+            bail!("durable safety proposal attempt index disagrees with its record");
+        }
+        if !has_indexed_attempt {
+            height_index.attempts.push(current_attempt_ref.clone());
+            height_index.attempts.sort_by(compare_durable_attempt_refs);
+        }
+        let is_new_attempt = !has_indexed_attempt;
+        let is_new_round = !block_record.attempt_rounds.contains(&proposal.round);
+        if is_new_round {
+            let max_rounds = usize::try_from(self.resource_limits.max_durable_attempts_per_height)
+                .map_err(|_| anyhow!("durable proposal attempt bound exceeds platform limits"))?;
+            if block_record.attempt_rounds.len() >= max_rounds {
+                bail!("durable proposal attempt count exceeds the protocol bound");
+            }
+        }
+        let max_attempts = usize::try_from(self.resource_limits.max_durable_attempts_per_height)
+            .map_err(|_| anyhow!("durable proposal attempt bound exceeds platform limits"))?;
+        if is_new_attempt && height_index.attempts.len() > max_attempts {
+            bail!("durable proposal attempt count exceeds the protocol bound");
+        }
+        if is_new_round {
             block_record.attempt_rounds.push(proposal.round);
             block_record.attempt_rounds.sort_unstable();
         }
         block_record.payload_hash = durable_block_payload_hash(&block_record)?;
         let attempt = attempt_with_hash(&attempt)?;
+        let encoded_block_record = encode(&block_record)?;
+        let encoded_attempt = encode(&attempt)?;
+        if is_new_attempt {
+            let mut durable_bytes = encoded_block_record.len();
+            let mut indexed_block_ids = HashSet::new();
+            indexed_block_ids.insert(block_id);
+            for attempt_ref in &height_index.attempts {
+                indexed_block_ids.insert(attempt_ref.block_id);
+            }
+            for indexed_block_id in indexed_block_ids {
+                if indexed_block_id == block_id {
+                    continue;
+                }
+                let existing_block = self
+                    .db
+                    .get(&safety_block_candidate_key(
+                        proposal.height,
+                        indexed_block_id,
+                    ))
+                    .await?
+                    .ok_or_else(|| anyhow!("durable attempt index references a missing block"))?;
+                let existing_block: DurableBlockCandidate =
+                    decode(&existing_block, "durable safety block candidate")?;
+                validate_durable_block_candidate(&existing_block)?;
+                durable_bytes = durable_bytes
+                    .checked_add(encode(&existing_block)?.len())
+                    .ok_or_else(|| anyhow!("durable attempt byte count overflow"))?;
+            }
+            for attempt_ref in &height_index.attempts {
+                let attempt_bytes = if attempt_ref == &current_attempt_ref {
+                    encoded_attempt.clone()
+                } else {
+                    self.db
+                        .get(&safety_proposal_attempt_key(
+                            proposal.height,
+                            attempt_ref.round,
+                            attempt_ref.block_id,
+                        ))
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!("durable attempt index references a missing record")
+                        })?
+                };
+                let existing_attempt: DurableProposalAttempt =
+                    decode(&attempt_bytes, "durable safety proposal attempt")?;
+                validate_durable_proposal_attempt(&existing_attempt)?;
+                if existing_attempt.height != proposal.height
+                    || existing_attempt.round != attempt_ref.round
+                    || existing_attempt.block_id != attempt_ref.block_id
+                {
+                    bail!("durable attempt index references a mismatched record");
+                }
+                durable_bytes = durable_bytes
+                    .checked_add(attempt_bytes.len())
+                    .ok_or_else(|| anyhow!("durable attempt byte count overflow"))?;
+            }
+            let max_bytes =
+                usize::try_from(self.resource_limits.max_durable_attempt_bytes_per_height)
+                    .map_err(|_| anyhow!("durable attempt byte bound exceeds platform limits"))?;
+            if durable_bytes > max_bytes {
+                bail!("durable proposal attempt bytes exceed the protocol bound");
+            }
+        }
+        if !is_new_attempt {
+            return Ok(());
+        }
+        height_index.payload_hash = durable_height_attempt_index_payload_hash(&height_index)?;
         self.db
             .batch_insert(
-                &[block_key, attempt_key],
-                &[encode(&block_record)?, encode(&attempt)?],
+                &[block_key, attempt_key, height_index_key],
+                &[
+                    encoded_block_record,
+                    encoded_attempt,
+                    encode(&height_index)?,
+                ],
             )
             .await
     }
@@ -307,6 +456,34 @@ impl FinalityStore {
         let Some(block_record) = self.recover_safety_block(height, block_id).await? else {
             return Ok(Vec::new());
         };
+        let Some(index_bytes) = self
+            .db
+            .get(&safety_height_attempt_index_key(height))
+            .await?
+        else {
+            bail!("durable safety block candidate has no per-height attempt index");
+        };
+        let index: DurableHeightAttemptIndex =
+            decode(&index_bytes, "durable safety proposal height index")?;
+        validate_durable_height_attempt_index(&index)?;
+        if index.height != height
+            || index.attempts.len()
+                > usize::try_from(self.resource_limits.max_durable_attempts_per_height).map_err(
+                    |_| anyhow!("durable proposal attempt bound exceeds platform limits"),
+                )?
+        {
+            bail!("durable safety proposal height attempt bound is exceeded");
+        }
+        let mut indexed_rounds = index
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.block_id == block_id)
+            .map(|attempt| attempt.round)
+            .collect::<Vec<_>>();
+        indexed_rounds.sort_unstable();
+        if indexed_rounds != block_record.attempt_rounds {
+            bail!("durable block candidate disagrees with its height attempt index");
+        }
         let mut candidates = Vec::with_capacity(block_record.attempt_rounds.len());
         for round in block_record.attempt_rounds {
             let Some(attempt) = self
@@ -381,7 +558,37 @@ impl FinalityStore {
                     .map(|round| safety_proposal_attempt_key(height, round, block_id)),
             );
         }
-        self.db.batch_delete(&keys).await
+        let index_key = safety_height_attempt_index_key(height);
+        let mut insert_keys = Vec::new();
+        let mut insert_values = Vec::new();
+        if let Some(index_bytes) = self.db.get(&index_key).await? {
+            let mut index: DurableHeightAttemptIndex =
+                decode(&index_bytes, "durable safety proposal height index")?;
+            validate_durable_height_attempt_index(&index)?;
+            if index.height != height {
+                bail!("durable safety proposal height index key does not match payload");
+            }
+            index
+                .attempts
+                .retain(|attempt| attempt.block_id != block_id);
+            if index.attempts.is_empty() {
+                keys.push(index_key);
+            } else {
+                index.payload_hash = durable_height_attempt_index_payload_hash(&index)?;
+                insert_keys.push(index_key);
+                insert_values.push(encode(&index)?);
+            }
+        } else if self
+            .db
+            .get(&safety_block_candidate_key(height, block_id))
+            .await?
+            .is_some()
+        {
+            bail!("durable safety block candidate exists without its per-height attempt index");
+        }
+        self.db
+            .batch_write(&insert_keys, &insert_values, &keys)
+            .await
     }
 
     /// Commit a finalized block and all of its finality markers atomically.
@@ -550,6 +757,21 @@ impl FinalityStore {
         if finalized.block.header.prev_block_hash != current_tip.block_id.0 {
             bail!("finalized block does not point to the canonical finalized tip");
         }
+        if finalized.block.header.protocol_version.0 >= 5 {
+            if finalized.block.header.timestamp < 0 {
+                bail!("finalized block timestamp must be non-negative");
+            }
+            if finalized.block.header.timestamp <= current_tip.timestamp {
+                bail!("finalized block timestamp must be greater than the canonical parent");
+            }
+            let max_timestamp = current_tip
+                .timestamp
+                .checked_add(self.resource_limits.max_block_timestamp_step as i64)
+                .ok_or_else(|| anyhow!("finalized timestamp upper bound overflow"))?;
+            if finalized.block.header.timestamp > max_timestamp {
+                bail!("finalized block timestamp exceeds the protocol parent-relative bound");
+            }
+        }
         if finalized.block.header.parent_randomness != current_tip.next_randomness {
             bail!("finalized block parent randomness does not match canonical tip");
         }
@@ -633,18 +855,55 @@ impl FinalityStore {
         values.push(encode(&new_tip)?);
 
         // Candidate cleanup is part of the same mixed single-tree batch as
-        // finality. A crash therefore leaves either the old candidate plus no
-        // finalized marker, or the complete finalized transaction with all
-        // indexed attempts removed.
-        let mut safety_delete_keys = vec![safety_candidate_key(id.height, id.block_id)];
-        if let Some(record) = self.recover_safety_block(id.height, id.block_id).await? {
-            safety_delete_keys.push(safety_block_candidate_key(id.height, id.block_id));
-            safety_delete_keys.extend(
-                record
-                    .attempt_rounds
-                    .into_iter()
-                    .map(|round| safety_proposal_attempt_key(id.height, round, id.block_id)),
-            );
+        // finality. A crash therefore leaves either the old candidate set plus
+        // no finalized marker, or the complete finalized transaction with all
+        // candidate material for the finalized height removed.
+        let mut safety_delete_keys = Vec::new();
+        let height_index_key = safety_height_attempt_index_key(id.height);
+        if let Some(index_bytes) = self.db.get(&height_index_key).await? {
+            let index: DurableHeightAttemptIndex =
+                decode(&index_bytes, "durable safety proposal height index")?;
+            validate_durable_height_attempt_index(&index)?;
+            if index.height != id.height {
+                bail!("durable safety proposal height index key does not match payload");
+            }
+            let mut indexed_block_ids = HashSet::new();
+            for attempt_ref in &index.attempts {
+                indexed_block_ids.insert(attempt_ref.block_id);
+                safety_delete_keys.push(safety_proposal_attempt_key(
+                    id.height,
+                    attempt_ref.round,
+                    attempt_ref.block_id,
+                ));
+            }
+            for indexed_block_id in indexed_block_ids {
+                let record = self
+                    .recover_safety_block(id.height, indexed_block_id)
+                    .await?
+                    .ok_or_else(|| anyhow!("durable attempt index references a missing block"))?;
+                let mut indexed_rounds = index
+                    .attempts
+                    .iter()
+                    .filter(|attempt| attempt.block_id == indexed_block_id)
+                    .map(|attempt| attempt.round)
+                    .collect::<Vec<_>>();
+                indexed_rounds.sort_unstable();
+                if record.attempt_rounds != indexed_rounds {
+                    bail!("durable block candidate disagrees with its height attempt index");
+                }
+                safety_delete_keys.push(safety_candidate_key(id.height, indexed_block_id));
+                safety_delete_keys.push(safety_block_candidate_key(id.height, indexed_block_id));
+            }
+            safety_delete_keys.push(height_index_key);
+        } else if self
+            .db
+            .get(&safety_block_candidate_key(id.height, id.block_id))
+            .await?
+            .is_some()
+        {
+            bail!("durable safety block candidate exists without its per-height attempt index");
+        } else {
+            safety_delete_keys.push(safety_candidate_key(id.height, id.block_id));
         }
         self.db
             .batch_write(&keys, &values, &safety_delete_keys)
@@ -1145,6 +1404,12 @@ fn safety_proposal_attempt_key(height: u64, round: u32, block_id: BlockId) -> Ve
     key
 }
 
+fn safety_height_attempt_index_key(height: u64) -> Vec<u8> {
+    let mut key = SAFETY_HEIGHT_INDEX_PREFIX.to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
 fn durable_payload_hash<T: serde::Serialize>(payload: &T) -> Result<Hash> {
     let bytes = encode(payload)?;
     Ok(Hash(Sha256::digest(bytes).into()))
@@ -1171,6 +1436,21 @@ fn durable_attempt_payload_hash(record: &DurableProposalAttempt) -> Result<Hash>
     ))
 }
 
+fn durable_height_attempt_index_payload_hash(index: &DurableHeightAttemptIndex) -> Result<Hash> {
+    durable_payload_hash(&(index.format_version, index.height, &index.attempts))
+}
+
+fn compare_durable_attempt_refs(
+    left: &DurableAttemptRef,
+    right: &DurableAttemptRef,
+) -> std::cmp::Ordering {
+    left.block_id
+        .0
+         .0
+        .cmp(&right.block_id.0 .0)
+        .then(left.round.cmp(&right.round))
+}
+
 fn validate_durable_block_candidate(record: &DurableBlockCandidate) -> Result<()> {
     if record.format_version != SAFETY_RECORD_FORMAT_VERSION
         || record.block_id != BlockId(record.block.header.block_hash)
@@ -1195,6 +1475,18 @@ fn validate_durable_proposal_attempt(record: &DurableProposalAttempt) -> Result<
         || record.payload_hash != durable_attempt_payload_hash(record)?
     {
         bail!("invalid durable safety proposal attempt record");
+    }
+    Ok(())
+}
+
+fn validate_durable_height_attempt_index(index: &DurableHeightAttemptIndex) -> Result<()> {
+    if index.format_version != SAFETY_RECORD_FORMAT_VERSION
+        || index.attempts.windows(2).any(|attempts| {
+            compare_durable_attempt_refs(&attempts[0], &attempts[1]) != std::cmp::Ordering::Less
+        })
+        || index.payload_hash != durable_height_attempt_index_payload_hash(index)?
+    {
+        bail!("invalid durable safety proposal height index");
     }
     Ok(())
 }
@@ -1331,9 +1623,11 @@ mod tests {
         let consensus_state = FinalizedConsensusState {
             height: 1,
             finalized_block_id: BlockId(block_id),
-            commit_certificate_hash: commit.certificate_hash(),
+            state_root: Hash([5; 32]),
+            timestamp: 1,
             next_randomness: Hash([9; 32]),
             active_stake_snapshot_hash: snapshot_hash,
+            epoch: 0,
             pending_validator_changes: Default::default(),
         };
         FinalizedBlockV2 {
@@ -1466,6 +1760,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn durable_safety_attempts_fail_closed_at_protocol_bound() {
+        let db = Arc::new(MemoryDb::default());
+        let mut limits = ProtocolResourceLimits::default();
+        limits.max_durable_attempts_per_height = 1;
+        let store = FinalityStore::new_with_limits(db, limits);
+        let finalized = finalized();
+        store
+            .persist_safety_candidate(&finalized.proposal, &finalized.block, Hash([1; 32]))
+            .await
+            .unwrap();
+
+        let mut second_round = finalized.proposal.clone();
+        second_round.round = 1;
+        second_round.proposer = ValidatorId([9; 32]);
+        assert!(store
+            .persist_safety_candidate(&second_round, &finalized.block, Hash([2; 32]))
+            .await
+            .is_err());
+
+        // A competing block at the same height cannot bypass the same
+        // per-height limit by using a different block ID.
+        let mut competing = finalized.clone();
+        competing.block.header.block_hash = Hash([13; 32]);
+        competing.proposal.block_id = BlockId(competing.block.header.block_hash);
+        assert!(store
+            .persist_safety_candidate(&competing.proposal, &competing.block, Hash([3; 32]),)
+            .await
+            .is_err());
+
+        // An exact replay is idempotent and does not consume another slot.
+        store
+            .persist_safety_candidate(&finalized.proposal, &finalized.block, Hash([1; 32]))
+            .await
+            .unwrap();
+    }
+
     fn genesis_block() -> Block {
         Block {
             header: BlockHeader {
@@ -1499,10 +1830,37 @@ mod tests {
             .await
             .unwrap();
         let first = finalized();
+        store
+            .persist_safety_candidate(&first.proposal, &first.block, Hash([21; 32]))
+            .await
+            .unwrap();
+        let mut competing_candidate = first.clone();
+        competing_candidate.block.header.block_hash = Hash([22; 32]);
+        competing_candidate.proposal.block_id =
+            BlockId(competing_candidate.block.header.block_hash);
+        competing_candidate.commit.block_id = competing_candidate.proposal.block_id;
+        store
+            .persist_safety_candidate(
+                &competing_candidate.proposal,
+                &competing_candidate.block,
+                Hash([23; 32]),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             store.commit_finalized_transaction(&first).await.unwrap(),
             FinalityCommitResult::Applied
         );
+        assert!(store
+            .recover_safety_block(1, first.commit.block_id)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .recover_safety_block(1, competing_candidate.commit.block_id)
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(
             store.commit_finalized_transaction(&first).await.unwrap(),
             FinalityCommitResult::AlreadyCommitted
@@ -1526,9 +1884,6 @@ mod tests {
                 validator: norn_common::types::ValidatorId([9; 32]),
                 signature: [13; 64],
             });
-        equivalent_certificate
-            .consensus_state
-            .commit_certificate_hash = equivalent_certificate.commit.certificate_hash();
         assert_ne!(
             FinalizeTransactionId::from_v2(&first).certificate_hash,
             FinalizeTransactionId::from_v2(&equivalent_certificate).certificate_hash
@@ -1552,7 +1907,6 @@ mod tests {
         conflicting.block.header.block_hash = Hash([10; 32]);
         conflicting.commit.block_id = BlockId(Hash([10; 32]));
         conflicting.consensus_state.finalized_block_id = conflicting.commit.block_id;
-        conflicting.consensus_state.commit_certificate_hash = conflicting.commit.certificate_hash();
         assert!(store
             .commit_finalized_transaction(&conflicting)
             .await

@@ -1,7 +1,7 @@
-# Genesis schema v4
+# Genesis schema v5
 
 `genesis.json` is a versioned network identity document. The node accepts it
-only when `schema_version` is `4`; unknown versions fail closed.
+only when `schema_version` is `5`; unknown versions fail closed.
 
 Required top-level fields:
 
@@ -18,8 +18,9 @@ Required top-level fields:
 `resource_limits` is canonical Genesis data and contains the maximum block
 bytes, transaction count, block gas, transaction bytes, transaction gas,
 execution-overlay writes, certificate members, future height/round windows,
-and verification task/queue bounds. Nodes may not increase these values
-locally.
+and verification task/queue bounds, plus maximum consensus round, durable
+proposal-attempt count/bytes per height, and parent-relative block timestamp
+step. Nodes may not increase these values locally.
 
 Validator records contain `validator_id`, `consensus_public_key`,
 `vrf_public_key`, and positive `voting_power`. Validator records are sorted by

@@ -414,7 +414,23 @@ impl BlockProducer {
         let builder_vrf =
             VRFCalculator::calculate_with_context(&self.vrf_key_pair, &builder_vrf_context)?;
 
-        let timestamp = chrono::Utc::now().timestamp();
+        let timestamp = chrono::Utc::now()
+            .timestamp()
+            .max(tip.timestamp.saturating_add(1));
+        if timestamp <= tip.timestamp {
+            return Err(anyhow!(
+                "local clock did not advance beyond the canonical parent timestamp"
+            ));
+        }
+        let max_timestamp = tip
+            .timestamp
+            .checked_add(limits.max_block_timestamp_step as i64)
+            .ok_or_else(|| anyhow!("block timestamp upper bound overflow"))?;
+        if timestamp > max_timestamp {
+            return Err(anyhow!(
+                "local clock is beyond the protocol block timestamp window"
+            ));
+        }
         let evm_context = self
             .v2_code_storage
             .as_ref()

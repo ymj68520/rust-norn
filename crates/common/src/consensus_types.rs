@@ -1,8 +1,8 @@
 use crate::chain_context::{protocol_error, ChainContext};
 use crate::error::{NornError, Result};
 use crate::types::{
-    derive_chain_randomness_v4, Block, BlockId, BlockV2, ChainId, ConsensusPublicKey, Hash,
-    ProtocolVersion, StakeSnapshotHash, ValidatorId, VrfPublicKey,
+    derive_chain_randomness_v4, derive_chain_randomness_v5, Block, BlockId, BlockV2, ChainId,
+    ConsensusPublicKey, Hash, ProtocolVersion, StakeSnapshotHash, ValidatorId, VrfPublicKey,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -48,7 +48,9 @@ pub struct Proposal {
 impl Proposal {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        if self.protocol_version.0 >= 4 {
+        if self.protocol_version.0 >= 5 {
+            bytes.extend_from_slice(b"NORN_BFT_V5_PROPOSAL");
+        } else if self.protocol_version.0 >= 4 {
             bytes.extend_from_slice(b"NORN_BFT_V4_PROPOSAL");
         } else if self.protocol_version.0 >= 3 {
             bytes.extend_from_slice(b"NORN_BFT_V3_PROPOSAL");
@@ -95,11 +97,17 @@ impl SignedVote {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         match self.step {
+            VoteStep::Prevote if self.protocol_version.0 >= 5 => {
+                bytes.extend_from_slice(b"NORN_BFT_V5_PREVOTE")
+            }
             VoteStep::Prevote if self.protocol_version.0 >= 4 => {
                 bytes.extend_from_slice(b"NORN_BFT_V4_PREVOTE")
             }
             VoteStep::Prevote if self.protocol_version.0 >= 3 => {
                 bytes.extend_from_slice(b"NORN_BFT_V3_PREVOTE")
+            }
+            VoteStep::Precommit if self.protocol_version.0 >= 5 => {
+                bytes.extend_from_slice(b"NORN_BFT_V5_PRECOMMIT")
             }
             VoteStep::Precommit if self.protocol_version.0 >= 4 => {
                 bytes.extend_from_slice(b"NORN_BFT_V4_PRECOMMIT")
@@ -146,7 +154,9 @@ impl CommitCertificate {
     /// cannot produce a different state hash.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(128 + self.precommits.len() * 256);
-        if self.protocol_version.0 >= 4 {
+        if self.protocol_version.0 >= 5 {
+            bytes.extend_from_slice(b"NORN_COMMIT_CERTIFICATE_V5");
+        } else if self.protocol_version.0 >= 4 {
             bytes.extend_from_slice(b"NORN_COMMIT_CERTIFICATE_V4");
         } else if self.protocol_version.0 >= 3 {
             bytes.extend_from_slice(b"NORN_COMMIT_CERTIFICATE_V3");
@@ -677,7 +687,9 @@ fn validate_finalized_v2(
     }
     if consensus_state.height != certificate.height
         || consensus_state.finalized_block_id != certificate.block_id
-        || consensus_state.commit_certificate_hash != certificate.certificate_hash()
+        || consensus_state.state_root != block.header.state_root
+        || consensus_state.timestamp != block.header.timestamp
+        || consensus_state.epoch != block.header.epoch as u64
         || consensus_state.active_stake_snapshot_hash != block.header.stake_snapshot_hash
     {
         return Err(protocol_error(
@@ -1126,9 +1138,14 @@ mod wire_validation_tests {
 pub struct FinalizedConsensusState {
     pub height: u64,
     pub finalized_block_id: BlockId,
-    pub commit_certificate_hash: Hash,
+    /// Canonical execution commitment. Finality evidence is stored on
+    /// `FinalizedBlockV2`; this state must remain identical when an
+    /// equivalent QC for the same block is observed at another round.
+    pub state_root: Hash,
+    pub timestamp: i64,
     pub next_randomness: Hash,
     pub active_stake_snapshot_hash: StakeSnapshotHash,
+    pub epoch: u64,
     #[serde(default)]
     pub pending_validator_changes: PendingValidatorChanges,
 }
@@ -1145,6 +1162,7 @@ pub struct CanonicalFinalizedTip {
     pub block_id: BlockId,
     pub state_root: Hash,
     pub base_fee: u64,
+    pub timestamp: i64,
     pub next_randomness: Hash,
     pub active_snapshot_hash: StakeSnapshotHash,
     pub epoch: u64,
@@ -1166,6 +1184,7 @@ impl CanonicalFinalizedTip {
             block_id: BlockId(genesis.header.block_hash),
             state_root: genesis.header.state_root,
             base_fee: genesis.header.base_fee,
+            timestamp: genesis.header.timestamp,
             next_randomness,
             active_snapshot_hash,
             epoch: genesis.header.epoch as u64,
@@ -1177,6 +1196,9 @@ impl CanonicalFinalizedTip {
             || finalized.block.header.block_hash == Hash::default()
             || finalized.commit.block_id != BlockId(finalized.block.header.block_hash)
             || finalized.consensus_state.height != finalized.commit.height
+            || finalized.consensus_state.state_root != finalized.block.header.state_root
+            || finalized.consensus_state.timestamp != finalized.block.header.timestamp
+            || finalized.consensus_state.epoch != finalized.block.header.epoch as u64
         {
             return Err(NornError::ConsensusError(
                 "canonical finalized tip does not match finalized block".into(),
@@ -1187,6 +1209,7 @@ impl CanonicalFinalizedTip {
             block_id: finalized.commit.block_id,
             state_root: finalized.block.header.state_root,
             base_fee: finalized.block.header.base_fee,
+            timestamp: finalized.block.header.timestamp,
             next_randomness: finalized.consensus_state.next_randomness,
             active_snapshot_hash: finalized.consensus_state.active_stake_snapshot_hash,
             epoch: finalized.block.header.epoch as u64,
@@ -1264,7 +1287,19 @@ impl FinalizedConsensusState {
                 "Finalized consensus state does not match block/certificate".into(),
             ));
         }
-        let next_randomness = if block.header.protocol_version.0 >= 4 {
+        let next_randomness = if block.header.protocol_version.0 >= 5 {
+            derive_chain_randomness_v5(
+                block.header.parent_randomness,
+                builder_vrf_randomness,
+                block.header.chain_id,
+                block.header.protocol_version,
+                block.header.epoch,
+                commit.height,
+                block.consensus_data.builder_round,
+                block.header.block_builder,
+                block.header.stake_snapshot_hash,
+            )
+        } else if block.header.protocol_version.0 >= 4 {
             derive_chain_randomness_v4(
                 block.header.parent_randomness,
                 builder_vrf_randomness,
@@ -1276,16 +1311,18 @@ impl FinalizedConsensusState {
                 block.header.stake_snapshot_hash,
             )
         } else {
-            // V3 is retained only for explicit compatibility/unit fixtures;
-            // the active V4 Genesis path always uses the immutable formula.
+            // V3/V4 are retained only for explicit compatibility/unit fixtures;
+            // the active V5 Genesis path always uses the immutable formula.
             builder_vrf_randomness
         };
         Ok(Self {
             height: commit.height,
             finalized_block_id: commit.block_id,
-            commit_certificate_hash: commit.certificate_hash(),
+            state_root: block.header.state_root,
+            timestamp: block.header.timestamp,
             next_randomness,
             active_stake_snapshot_hash: block.header.stake_snapshot_hash,
+            epoch: block.header.epoch as u64,
             pending_validator_changes: PendingValidatorChanges::default(),
         })
     }
@@ -1859,7 +1896,7 @@ mod finalized_consensus_state_tests {
 
     #[test]
     fn finalized_state_accepts_valid_round_reproposal_certificate_round() {
-        let protocol_version = ProtocolVersion(4);
+        let protocol_version = ProtocolVersion(5);
         let chain_id = ChainId(Hash([1; 32]));
         let block_id = BlockId(Hash([9; 32]));
         let snapshot_hash = StakeSnapshotHash([8; 32]);
@@ -1925,7 +1962,6 @@ mod finalized_consensus_state_tests {
         let finalized =
             FinalizedConsensusState::from_v2(&proposal, &block, &commit, Hash([3; 32])).unwrap();
         assert_eq!(finalized.height, 1);
-        assert_eq!(finalized.commit_certificate_hash, commit.certificate_hash());
 
         let mut fresh_proposal = proposal.clone();
         fresh_proposal.round = 0;
@@ -1940,14 +1976,15 @@ mod finalized_consensus_state_tests {
         assert_eq!(fresh.next_randomness, finalized.next_randomness);
         assert_eq!(
             finalized.next_randomness,
-            derive_chain_randomness_v4(
+            crate::types::derive_chain_randomness_v5(
                 block.header.parent_randomness,
                 Hash([3; 32]),
-                block_id,
                 chain_id,
                 protocol_version,
                 block.header.epoch,
                 block.header.height as u64,
+                block.consensus_data.builder_round,
+                block.header.block_builder,
                 snapshot_hash,
             )
         );

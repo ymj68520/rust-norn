@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub const GENESIS_SCHEMA_VERSION: u16 = 4;
-pub const GENESIS_IDENTITY_KEY: &[u8] = b"genesis_identity_v4";
+pub const GENESIS_SCHEMA_VERSION: u16 = 5;
+pub const GENESIS_IDENTITY_KEY: &[u8] = b"genesis_identity_v5";
 
 fn default_epoch_delay() -> u64 {
     1
@@ -29,6 +29,30 @@ pub struct ProtocolResourceLimits {
     pub max_future_round: u32,
     pub max_verification_tasks: u32,
     pub max_verification_queue: u32,
+    #[serde(default = "default_max_consensus_round")]
+    pub max_consensus_round: u32,
+    #[serde(default = "default_max_durable_attempts_per_height")]
+    pub max_durable_attempts_per_height: u32,
+    #[serde(default = "default_max_durable_attempt_bytes_per_height")]
+    pub max_durable_attempt_bytes_per_height: u64,
+    #[serde(default = "default_max_block_timestamp_step")]
+    pub max_block_timestamp_step: u64,
+}
+
+fn default_max_consensus_round() -> u32 {
+    1_000_000
+}
+
+fn default_max_durable_attempts_per_height() -> u32 {
+    64
+}
+
+fn default_max_durable_attempt_bytes_per_height() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_max_block_timestamp_step() -> u64 {
+    365 * 24 * 60 * 60
 }
 
 impl Default for ProtocolResourceLimits {
@@ -45,6 +69,10 @@ impl Default for ProtocolResourceLimits {
             max_future_round: 2,
             max_verification_tasks: 64,
             max_verification_queue: 256,
+            max_consensus_round: default_max_consensus_round(),
+            max_durable_attempts_per_height: default_max_durable_attempts_per_height(),
+            max_durable_attempt_bytes_per_height: default_max_durable_attempt_bytes_per_height(),
+            max_block_timestamp_step: default_max_block_timestamp_step(),
         }
     }
 }
@@ -60,6 +88,10 @@ impl ProtocolResourceLimits {
             || self.max_certificate_members == 0
             || self.max_verification_tasks == 0
             || self.max_verification_queue == 0
+            || self.max_consensus_round == 0
+            || self.max_durable_attempts_per_height == 0
+            || self.max_durable_attempt_bytes_per_height == 0
+            || self.max_block_timestamp_step == 0
         {
             return Err(NornError::Config(
                 "Genesis resource limits must be non-zero".into(),
@@ -76,7 +108,7 @@ impl ProtocolResourceLimits {
             || self.max_transaction_bytes > usize::MAX as u64
         {
             return Err(NornError::Config(
-                "Genesis transaction limits cannot exceed block limits".into(),
+                "Genesis resource limits exceed protocol bounds".into(),
             ));
         }
         Ok(())
@@ -160,7 +192,7 @@ impl GenesisConfig {
         }
         if self.protocol_version != ChainContext::CURRENT_PROTOCOL_VERSION {
             return Err(NornError::Config(
-                "Genesis protocol version is not the active V4 protocol".into(),
+                "Genesis protocol version is not the active V5 protocol".into(),
             ));
         }
         if self.chain_id.0 == Hash::default() {
@@ -193,6 +225,11 @@ impl GenesisConfig {
         if header.height != 0 {
             return Err(NornError::Config(
                 "Genesis block height must be zero".into(),
+            ));
+        }
+        if header.timestamp < 0 {
+            return Err(NornError::Config(
+                "Genesis block timestamp must be non-negative".into(),
             ));
         }
         if header.prev_block_hash != Hash::default() {
@@ -296,7 +333,7 @@ impl GenesisConfig {
     /// Canonical, order-independent encoding used for Genesis identity.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(512 + self.validators.len() * 105);
-        bytes.extend_from_slice(b"NORN_GENESIS_V4");
+        bytes.extend_from_slice(b"NORN_GENESIS_V5");
         bytes.extend_from_slice(&self.schema_version.to_be_bytes());
         bytes.extend_from_slice(&self.protocol_version.0.to_be_bytes());
         bytes.extend_from_slice(&self.chain_id.0 .0);
@@ -323,6 +360,20 @@ impl GenesisConfig {
         bytes.extend_from_slice(&self.resource_limits.max_future_round.to_be_bytes());
         bytes.extend_from_slice(&self.resource_limits.max_verification_tasks.to_be_bytes());
         bytes.extend_from_slice(&self.resource_limits.max_verification_queue.to_be_bytes());
+        bytes.extend_from_slice(&self.resource_limits.max_consensus_round.to_be_bytes());
+        bytes.extend_from_slice(
+            &self
+                .resource_limits
+                .max_durable_attempts_per_height
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(
+            &self
+                .resource_limits
+                .max_durable_attempt_bytes_per_height
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(&self.resource_limits.max_block_timestamp_step.to_be_bytes());
         append_block_header(&mut bytes, &self.genesis_block.header);
 
         let mut validators = self.validators.clone();
@@ -400,7 +451,10 @@ pub const GENESIS_BLOCK_HASH: Hash = Hash([
 ]);
 
 /// 创世时间戳 (Unix timestamp)
-pub const GENESIS_TIMESTAMP: i64 = 1700000000; // 2023-11-14 00:53:20 UTC
+// V5 uses a fresh network identity. Keep the fixed Genesis timestamp close
+// enough to the current era for the parent-relative timestamp window while
+// remaining deterministic for every node.
+pub const GENESIS_TIMESTAMP: i64 = 1780000000; // 2026-05-28 20:26:40 UTC
 
 /// 创世块的Gas限制
 pub const GENESIS_GAS_LIMIT: i64 = 10_000_000;

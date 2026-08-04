@@ -53,7 +53,7 @@ The uncommitted follow-up addresses the latest review findings:
   remain processable while an idempotent broadcast is waiting for its bounded
   retry.
 
-### Current next-round worktree changes
+### Current V5 worktree changes
 
 - `BlockHeader.block_builder` is now the stable original block builder, while
   `Proposal.proposer` remains the current-round proposer. A valid-round
@@ -78,22 +78,35 @@ The uncommitted follow-up addresses the latest review findings:
 - Persistent SafetyStore sequence allocation is serialized across vote and
   companion-state WAL transactions; a concurrent regression test verifies
   monotonic recovery without sequence reuse.
-- Protocol activation is explicit: the active network uses Genesis schema 4,
-  protocol version 4, wire version 4, `NORN_BLOCK_HEADER_V4`,
-  `NORN_GENESIS_V4`, V4 transaction IDs, and V4 consensus signing domains.
-  Legacy V2/V3 Genesis/configuration is rejected; there is no mixed-height
+- Protocol activation is explicit: the active network uses Genesis schema 5,
+  protocol version 5, wire version 5, `NORN_BLOCK_HEADER_V5`,
+  `NORN_GENESIS_V5`, V5 transaction IDs, and V5 consensus signing domains.
+  Legacy V2/V3/V4 Genesis/configuration is rejected; there is no mixed-height
   deserialization fallback.
-- The V4 activation carries immutable `BlockConsensusData`
+- The V5 activation carries immutable `BlockConsensusData`
   with the original builder's VRF preout/proof and builder round. Its
   `consensus_data_hash` commits this material with the execution commitment,
-  and finality derives `next_randomness` with `NORN_CHAIN_RANDOMNESS_V4` from
-  immutable block data and chain context. Proposal/Commit rounds cannot alter
-  the next-height seed.
+  and finality derives `next_randomness` with `NORN_CHAIN_RANDOMNESS_V5` from
+  the parent seed, one builder VRF output, builder context, and snapshot. The
+  formula excludes `block_id`, so block-content grinding cannot search future
+  seeds. A single builder may still selectively abort after seeing an
+  unfavorable VRF; this is not claimed to be unbiased beacon randomness.
 - Historical proposal attempts may leave memory after their exact durable
   `(height, round, block_id)` record is retained. Exact Commit lookup reloads
   and revalidates the attempt; required locked/valid immutable block bodies
   remain available. Durable block-index read-modify-write is serialized with
-  finality cleanup.
+  finality cleanup. A separate durable per-height attempt index counts
+  competing block IDs as well as rounds, so attempts cannot bypass the limit
+  by changing block identity. Genesis now bounds attempts per height, durable
+  attempt bytes, and the maximum consensus round; exceeding a bound fails
+  closed.
+- Canonical finalized state contains block/state/timestamp/randomness/snapshot
+  fields but no certificate hash. Finality evidence remains in the durable
+  Proposal/Commit record, and an equivalent certificate at another round is
+  independently verified without rewriting canonical state.
+- V5 block timestamps are non-negative, strictly greater than the canonical
+  parent, and no more than the Genesis `max_block_timestamp_step`; local time
+  is used only when proposing.
 
 ## Verification
 
@@ -106,16 +119,12 @@ cargo test -p norn-core --test four_node_bft_test --locked
 cargo test --workspace --locked -j 1
 ```
 
-The current next-round changes additionally pass the focused wire-validation,
+The current V5 changes additionally pass the focused wire-validation,
 candidate-cache, exact-round finality, durable-candidate, Genesis activation,
-and concurrent SafetyStore regressions.
-The previously published workspace and four-process recovery gates remain the
-baseline for `1c35717`; the full workspace suite must be rerun after this
-worktree is reviewed.
-
-The prior workspace run passed. The current focused run includes 262
-`norn-core` unit tests and 42 `norn-common` tests; the full workspace gate
-must be rerun after the V4 worktree is reviewed.
+concurrent SafetyStore, V5 randomness, V5 timestamp, and durable-attempt-bound
+regressions. `cargo check --workspace --all-features --locked` and
+`cargo test --workspace --all-features --locked -j 1` also pass. The focused
+common/core run includes 265 `norn-core` unit tests and 43 `norn-common` tests.
 
 `cargo audit --no-fetch --no-yanked` remains a failing security gate: it reports two `hickory-proto 0.25.2` vulnerabilities and 13 allowed maintenance/unsoundness warnings. One Hickory advisory has no fixed upgrade; the other requires `hickory-proto >=0.26.1`. Clippy with `-D warnings` also remains open because of existing warnings outside this follow-up.
 
@@ -135,5 +144,5 @@ Until these items are independently reviewed and accepted, the status remains:
 Candidate prototype
 Not production-ready
 Published follow-up implementation commits: `fe692408fe29e84261bca5b1c2bb4a35a2de434a`, `1c35717`
-Current next-round hardening: uncommitted on `e75ad8f`
+Current V5 hardening: uncommitted on `6e6edc0`
 ```

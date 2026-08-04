@@ -492,10 +492,31 @@ impl PoVFEngine {
         local_validator_id: Option<ValidatorId>,
         resource_limits: ProtocolResourceLimits,
     ) -> Self {
-        let state_machine = TendermintStateMachine::new(
+        Self::new_with_parent_randomness_and_timestamp_and_limits(
             config,
             snapshot,
             parent_randomness,
+            0,
+            safety_store,
+            local_validator_id,
+            resource_limits,
+        )
+    }
+
+    pub fn new_with_parent_randomness_and_timestamp_and_limits(
+        config: ConsensusConfig,
+        snapshot: StakeSnapshot,
+        parent_randomness: Hash,
+        parent_timestamp: i64,
+        safety_store: Arc<dyn ConsensusSafetyStore>,
+        local_validator_id: Option<ValidatorId>,
+        resource_limits: ProtocolResourceLimits,
+    ) -> Self {
+        let state_machine = TendermintStateMachine::new_with_parent_timestamp(
+            config,
+            snapshot,
+            parent_randomness,
+            parent_timestamp,
             safety_store,
             local_validator_id,
         );
@@ -587,6 +608,11 @@ impl PoVFEngine {
             ));
         }
         block.validate_structure(context, limits)?;
+        self.state_machine
+            .read()
+            .await
+            .validate_block_timestamp(block.header.timestamp)
+            .map_err(|error| NornError::ConsensusError(error.to_string()))?;
         let evm_context = V2ExecutionContext {
             block_number: block.header.height.max(0) as u64,
             block_timestamp: block.header.timestamp.max(0) as u64,

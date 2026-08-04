@@ -454,7 +454,9 @@ impl TransactionV2 {
     /// intentionally excluded from this preimage.
     pub fn signing_bytes(&self) -> Result<Vec<u8>, TransactionV2Error> {
         let mut bytes = Vec::with_capacity(256);
-        if self.protocol_version.0 >= 4 {
+        if self.protocol_version.0 >= 5 {
+            bytes.extend_from_slice(b"NORN_TRANSACTION_V5");
+        } else if self.protocol_version.0 >= 4 {
             bytes.extend_from_slice(b"NORN_TRANSACTION_V4");
         } else if self.protocol_version.0 >= 3 {
             bytes.extend_from_slice(b"NORN_TRANSACTION_V3");
@@ -521,7 +523,9 @@ impl TransactionV2 {
     pub fn calculate_id(&self) -> Result<TransactionId, TransactionV2Error> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        if self.protocol_version.0 >= 4 {
+        if self.protocol_version.0 >= 5 {
+            hasher.update(b"NORN_TRANSACTION_ID_V5");
+        } else if self.protocol_version.0 >= 4 {
             hasher.update(b"NORN_TRANSACTION_ID_V4");
         } else if self.protocol_version.0 >= 3 {
             hasher.update(b"NORN_TRANSACTION_ID_V3");
@@ -856,7 +860,9 @@ impl BlockHeader {
     pub fn calculate_hash(&self) -> Result<Hash, crate::error::NornError> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        if self.protocol_version.0 >= 4 {
+        if self.protocol_version.0 >= 5 {
+            hasher.update(b"NORN_BLOCK_HEADER_V5");
+        } else if self.protocol_version.0 >= 4 {
             hasher.update(b"NORN_BLOCK_HEADER_V4");
         } else if self.protocol_version.0 >= 3 {
             hasher.update(b"NORN_BLOCK_HEADER_V3");
@@ -913,7 +919,9 @@ impl BlockConsensusData {
     pub fn calculate_hash(&self, protocol_version: ProtocolVersion) -> Hash {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        if protocol_version.0 >= 4 {
+        if protocol_version.0 >= 5 {
+            hasher.update(b"NORN_BLOCK_CONSENSUS_DATA_V5");
+        } else if protocol_version.0 >= 4 {
             hasher.update(b"NORN_BLOCK_CONSENSUS_DATA_V4");
         } else {
             hasher.update(b"NORN_BLOCK_CONSENSUS_DATA_V3");
@@ -949,6 +957,39 @@ pub fn derive_chain_randomness_v4(
     hasher.update(protocol_version.0.to_be_bytes());
     hasher.update(epoch.to_be_bytes());
     hasher.update(height.to_be_bytes());
+    hasher.update(stake_snapshot_hash.0);
+    Hash(hasher.finalize().into())
+}
+
+/// Derive the canonical V5 next-height randomness. The block ID is
+/// intentionally absent: a builder must not be able to search over legal
+/// transaction/timestamp encodings after seeing its one immutable VRF output
+/// and select a favorable future proposer seed. This prevents block-content
+/// grinding, while the single-builder selective-abort limitation remains a
+/// property of the protocol and is not claimed to be unbiased randomness.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_chain_randomness_v5(
+    parent_randomness: Hash,
+    builder_vrf_randomness: Hash,
+    chain_id: ChainId,
+    protocol_version: ProtocolVersion,
+    epoch: u64,
+    height: u64,
+    builder_round: u32,
+    block_builder: ValidatorId,
+    stake_snapshot_hash: StakeSnapshotHash,
+) -> Hash {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"NORN_CHAIN_RANDOMNESS_V5");
+    hasher.update(parent_randomness.0);
+    hasher.update(builder_vrf_randomness.0);
+    hasher.update(chain_id.0 .0);
+    hasher.update(protocol_version.0.to_be_bytes());
+    hasher.update(epoch.to_be_bytes());
+    hasher.update(height.to_be_bytes());
+    hasher.update(builder_round.to_be_bytes());
+    hasher.update(block_builder.0);
     hasher.update(stake_snapshot_hash.0);
     Hash(hasher.finalize().into())
 }
@@ -1043,6 +1084,11 @@ impl BlockV2 {
         if self.header.height <= 0 {
             return Err(crate::chain_context::protocol_error(
                 "V2 block height must be non-zero",
+            ));
+        }
+        if self.header.protocol_version.0 >= 5 && self.header.timestamp < 0 {
+            return Err(crate::chain_context::protocol_error(
+                "V2 block timestamp must be non-negative",
             ));
         }
         if self.transactions.len() > limits.max_transactions_per_block as usize {
@@ -1256,6 +1302,41 @@ mod block_v2_tests {
         assert!(block
             .validate_structure(&context(), &ProtocolResourceLimits::default())
             .is_err());
+    }
+
+    #[test]
+    fn v5_chain_randomness_is_independent_of_block_content_identity() {
+        let parent = Hash([1; 32]);
+        let builder_output = Hash([2; 32]);
+        let chain_id = ChainId(Hash([3; 32]));
+        let protocol = ProtocolVersion(5);
+        let snapshot = StakeSnapshotHash([4; 32]);
+        let first = derive_chain_randomness_v5(
+            parent,
+            builder_output,
+            chain_id,
+            protocol,
+            7,
+            42,
+            3,
+            ValidatorId([5; 32]),
+            snapshot,
+        );
+        // The V5 API has no block_id argument. Changing legal block content
+        // cannot create another future seed after the immutable VRF output is
+        // fixed.
+        let second = derive_chain_randomness_v5(
+            parent,
+            builder_output,
+            chain_id,
+            protocol,
+            7,
+            42,
+            3,
+            ValidatorId([5; 32]),
+            snapshot,
+        );
+        assert_eq!(first, second);
     }
 }
 

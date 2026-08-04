@@ -46,6 +46,8 @@ pub struct ConsensusConfig {
     pub max_certificate_members: u32,
     pub max_future_height: u64,
     pub max_future_round: u32,
+    pub max_consensus_round: u32,
+    pub max_block_timestamp_step: u64,
 }
 
 impl Default for ConsensusConfig {
@@ -67,6 +69,8 @@ impl Default for ConsensusConfig {
             max_certificate_members: 1024,
             max_future_height: 2,
             max_future_round: 2,
+            max_consensus_round: 1_000_000,
+            max_block_timestamp_step: 30,
         }
     }
 }

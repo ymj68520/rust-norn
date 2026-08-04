@@ -103,11 +103,12 @@ libFuzzer target against the same `decode_and_validate` entry point.
   when the live height/round has advanced;
 - four independent configurations derive the same snapshot hash and proposer
   sequence;
-- V4 `BlockConsensusData` commits the original builder VRF and execution
+- V5 `BlockConsensusData` commits the original builder VRF and execution
   commitment; finality derives one next randomness from immutable block data,
   regardless of the Commit/Proposal round;
 - durable block candidate index updates are serialized against concurrent
-  attempt writes and finality cleanup;
+  attempt writes and finality cleanup; the separate per-height attempt index
+  bounds competing block IDs as well as proposal rounds;
 - the full workspace test suite is green.
 
 These checks are completion gates, not evidence that an unreviewed deployment
@@ -115,7 +116,7 @@ is production-ready. Protocol upgrades continue to require a new versioned
 Genesis or an explicitly specified activation-height migration.
 
 Protocol upgrades use a new versioned Genesis/network identity. The active
-implementation is Genesis schema 4 / protocol 4 / wire 4; old V2/V3 Genesis
+implementation is Genesis schema 5 / protocol 5 / wire 5; old V2/V3/V4 Genesis
 records are rejected rather than guessed into the new format. The
 `BlockHeader` builder-identity field and hash layout therefore cannot be
 interpreted through a mixed-version deserialization path.

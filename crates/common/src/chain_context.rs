@@ -173,11 +173,12 @@ pub(crate) fn protocol_error(message: impl Into<String>) -> NornError {
 }
 
 impl ChainContext {
-    /// V4 is a new-network activation for immutable builder randomness. There
-    /// is no height-based mixed mode: a node either loads the V4 Genesis
-    /// identity or fails closed.
-    pub const CURRENT_WIRE_VERSION: u16 = 4;
-    pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(4);
+    /// V5 is a new-network activation for canonical builder-bound randomness,
+    /// bounded durable attempts, canonical finality state, and timestamp
+    /// validation. There is no mixed-height mode: a node either loads the V5
+    /// Genesis identity or fails closed.
+    pub const CURRENT_WIRE_VERSION: u16 = 5;
+    pub const CURRENT_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion(5);
 
     pub fn new(
         genesis_schema_version: u16,

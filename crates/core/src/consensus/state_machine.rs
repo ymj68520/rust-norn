@@ -37,6 +37,9 @@ pub struct TendermintStateMachine {
 
     pub snapshot: StakeSnapshot,
     pub parent_randomness: norn_common::types::Hash,
+    /// Consensus timestamp of the canonical parent block. It is supplied by
+    /// finalized durable state, never by the local wall clock.
+    pub parent_timestamp: i64,
     pub vote_pool: VotePool,
     pub safety_store: Arc<dyn ConsensusSafetyStore>,
     pub local_validator_id: Option<ValidatorId>,
@@ -103,9 +106,11 @@ mod tests {
         let finalized = FinalizedConsensusState {
             height: 1,
             finalized_block_id: BlockId(Hash([2; 32])),
-            commit_certificate_hash: Hash([3; 32]),
+            state_root: Hash([5; 32]),
+            timestamp: 1,
             next_randomness: Hash([4; 32]),
             active_stake_snapshot_hash: snapshot.snapshot_hash,
+            epoch: 1,
             pending_validator_changes: PendingValidatorChanges::default(),
         };
 
@@ -152,9 +157,11 @@ mod tests {
         let finalized = FinalizedConsensusState {
             height: 1,
             finalized_block_id: BlockId(Hash([2; 32])),
-            commit_certificate_hash: Hash([3; 32]),
+            state_root: Hash([5; 32]),
+            timestamp: 1,
             next_randomness: Hash([4; 32]),
             active_stake_snapshot_hash: snapshot.snapshot_hash,
+            epoch: 1,
             pending_validator_changes: source.pending_validator_changes.clone(),
         };
         let next_snapshot = finalized
@@ -243,6 +250,30 @@ mod tests {
         assert!(state_machine.on_timeout_propose(&FailingSigner).is_err());
         assert_eq!(state_machine.step, ConsensusStep::NewHeight);
         assert!(state_machine.locked_block.is_none());
+    }
+
+    #[test]
+    fn v5_block_timestamp_is_parent_relative_and_bounded() {
+        let snapshot = StakeSnapshot {
+            epoch: 1,
+            validators: BTreeMap::new(),
+            snapshot_hash: StakeSnapshotHash([8; 32]),
+        };
+        let mut config = ConsensusConfig::default();
+        config.protocol_version = norn_common::types::ProtocolVersion(5);
+        config.max_block_timestamp_step = 30;
+        let state_machine = TendermintStateMachine::new_with_parent_timestamp(
+            config,
+            snapshot,
+            Hash([1; 32]),
+            100,
+            Arc::new(MemorySafetyStore::new()),
+            None,
+        );
+        assert!(state_machine.validate_block_timestamp(101).is_ok());
+        assert!(state_machine.validate_block_timestamp(100).is_err());
+        assert!(state_machine.validate_block_timestamp(131).is_err());
+        assert!(state_machine.validate_block_timestamp(-1).is_err());
     }
 
     #[test]
@@ -433,6 +464,24 @@ impl TendermintStateMachine {
         safety_store: Arc<dyn ConsensusSafetyStore>,
         local_validator_id: Option<ValidatorId>,
     ) -> Self {
+        Self::new_with_parent_timestamp(
+            config,
+            snapshot,
+            parent_randomness,
+            0,
+            safety_store,
+            local_validator_id,
+        )
+    }
+
+    pub fn new_with_parent_timestamp(
+        config: ConsensusConfig,
+        snapshot: StakeSnapshot,
+        parent_randomness: norn_common::types::Hash,
+        parent_timestamp: i64,
+        safety_store: Arc<dyn ConsensusSafetyStore>,
+        local_validator_id: Option<ValidatorId>,
+    ) -> Self {
         Self {
             config,
             height: 1,
@@ -445,6 +494,7 @@ impl TendermintStateMachine {
             valid_round_certificate: None,
             snapshot,
             parent_randomness,
+            parent_timestamp,
             vote_pool: VotePool::new(),
             safety_store,
             local_validator_id,
@@ -607,6 +657,16 @@ impl TendermintStateMachine {
         snapshot: StakeSnapshot,
         parent_randomness: norn_common::types::Hash,
     ) {
+        self.start_new_height_with_timestamp(height, snapshot, parent_randomness, 0);
+    }
+
+    pub fn start_new_height_with_timestamp(
+        &mut self,
+        height: u64,
+        snapshot: StakeSnapshot,
+        parent_randomness: norn_common::types::Hash,
+        parent_timestamp: i64,
+    ) {
         self.height = height;
         self.round = 0;
         self.step = ConsensusStep::NewHeight;
@@ -620,8 +680,33 @@ impl TendermintStateMachine {
             .changes
             .retain(|change| change.effective_epoch > self.snapshot.epoch);
         self.parent_randomness = parent_randomness;
+        self.parent_timestamp = parent_timestamp;
         info!("Consensus starting new height {}", height);
         self.start_new_round(0);
+    }
+
+    pub(crate) fn validate_block_timestamp(&self, timestamp: i64) -> Result<()> {
+        if self.config.protocol_version.0 < 5 {
+            return Ok(());
+        }
+        if timestamp < 0 {
+            return Err(anyhow!("block timestamp must be non-negative"));
+        }
+        if timestamp <= self.parent_timestamp {
+            return Err(anyhow!(
+                "block timestamp must be greater than parent timestamp"
+            ));
+        }
+        let latest = self
+            .parent_timestamp
+            .checked_add(self.config.max_block_timestamp_step as i64)
+            .ok_or_else(|| anyhow!("block timestamp upper bound overflow"))?;
+        if timestamp > latest {
+            return Err(anyhow!(
+                "block timestamp exceeds the protocol parent-relative bound"
+            ));
+        }
+        Ok(())
     }
 
     /// Advance to next round
@@ -868,6 +953,7 @@ impl TendermintStateMachine {
         let expected_epoch = self.current_epoch()?;
         if proposal.height != self.height
             || proposal.round != self.round
+            || proposal.round > self.config.max_consensus_round
             || proposal.epoch != expected_epoch
             || proposal.protocol_version != self.config.protocol_version
             || proposal.chain_id != self.config.chain_id
@@ -881,6 +967,7 @@ impl TendermintStateMachine {
         {
             return Err(anyhow!("V2 proposal context mismatch"));
         }
+        self.validate_block_timestamp(block.header.timestamp)?;
         validate_v2_proposal_builder_relation(proposal, &block.header)?;
         if block.header.protocol_version.0 >= 4 {
             self.verify_block_builder_vrf(block)?;
@@ -931,6 +1018,7 @@ impl TendermintStateMachine {
     ) -> Result<VerifiedVrfOutput> {
         let expected_epoch = self.current_epoch()?;
         if proposal.height != self.height
+            || proposal.round > self.config.max_consensus_round
             || proposal.epoch != expected_epoch
             || proposal.protocol_version != self.config.protocol_version
             || proposal.chain_id != self.config.chain_id
@@ -947,6 +1035,7 @@ impl TendermintStateMachine {
         {
             return Err(anyhow!("durable V2 proposal context mismatch"));
         }
+        self.validate_block_timestamp(block.header.timestamp)?;
         validate_v2_proposal_builder_relation(proposal, &block.header)?;
         if block.header.protocol_version.0 >= 4 {
             self.verify_block_builder_vrf(block)?;
@@ -1099,7 +1188,10 @@ impl TendermintStateMachine {
         signer: &dyn ConsensusSigner,
     ) -> Result<(SignedVote, Option<VerifiedVrfOutput>)> {
         let expected_epoch = self.current_epoch()?;
-        if proposal.height != self.height || proposal.round != self.round {
+        if proposal.height != self.height
+            || proposal.round != self.round
+            || proposal.round > self.config.max_consensus_round
+        {
             return Err(anyhow!(
                 "Proposal height/round mismatch: expected ({},{}), got ({},{})",
                 self.height,
@@ -1137,6 +1229,7 @@ impl TendermintStateMachine {
                 "proposal block header does not match the active consensus context"
             ));
         }
+        self.validate_block_timestamp(block_header.timestamp)?;
 
         let calculated_block_id = BlockId(block_header.block_hash);
         if proposal.block_id != calculated_block_id {
@@ -1528,12 +1621,20 @@ impl TendermintStateMachine {
 
     /// Precommit timeout trigger -> advance to next round
     pub fn on_timeout_precommit(&mut self) -> Result<()> {
+        let next_round = self
+            .round
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("consensus round overflow"))?;
+        if next_round > self.config.max_consensus_round {
+            return Err(anyhow!(
+                "consensus round exceeds the protocol bound after precommit timeout"
+            ));
+        }
         info!(
             "Precommit timeout in round {}, advancing to round {}",
-            self.round,
-            self.round + 1
+            self.round, next_round
         );
-        self.start_new_round(self.round + 1);
+        self.start_new_round(next_round);
         self.persist_durable_safety_state()
     }
 
@@ -1572,7 +1673,12 @@ impl TendermintStateMachine {
             ));
         }
         let parent_randomness = finalized.parent_randomness_for_height(next_height)?;
-        self.start_new_height(next_height, snapshot, parent_randomness);
+        self.start_new_height_with_timestamp(
+            next_height,
+            snapshot,
+            parent_randomness,
+            finalized.timestamp,
+        );
         self.pending_validator_changes = finalized.pending_validator_changes.clone();
         self.pending_validator_changes
             .changes
@@ -1603,7 +1709,12 @@ impl TendermintStateMachine {
             ));
         }
         let parent_randomness = finalized.parent_randomness_for_height(next_height)?;
-        self.start_new_height(next_height, snapshot, parent_randomness);
+        self.start_new_height_with_timestamp(
+            next_height,
+            snapshot,
+            parent_randomness,
+            finalized.timestamp,
+        );
         self.pending_validator_changes = finalized.pending_validator_changes.clone();
         self.pending_validator_changes
             .changes
