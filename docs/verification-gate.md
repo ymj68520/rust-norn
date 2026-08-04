@@ -69,10 +69,10 @@ libFuzzer target against the same `decode_and_validate` entry point.
   while unknown errors and retry exhaustion fail-stop;
 - retry backoff is delivered as a delayed driver event and does not block the
   single-writer actor from processing high-priority consensus events;
-- V2 candidate proposal, block, and derived randomness are admitted as one
-  bounded cache entry; byte, per-height, per-proposer, future-height,
-  future-round, and TTL limits are enforced from protocol parameters or a
-  versioned protocol invariant;
+- immutable V2 block bodies and round-specific proposal attempts are admitted
+  separately; attempt identity is `(height, round, block_id)`, and byte,
+  per-height, per-proposer, future-height, future-round, and TTL limits are
+  enforced from protocol parameters or a versioned protocol invariant;
 - candidates referenced by `valid_block`, `locked_block`, or pending finality
   are pinned against TTL/capacity eviction; a missing required dependency
   fails closed, and a late prevote Polka never signs a second precommit after a
@@ -84,8 +84,13 @@ libFuzzer target against the same `decode_and_validate` entry point.
 - a valid-round re-proposal may change `Proposal.proposer` after proposer
   rotation, but its `BlockHeader.block_builder`, block body, commitments, and
   block ID remain unchanged; fresh proposals require builder/proposer equality;
+- finality retrieves the exact `(height, commit.round, block_id)` proposal
+  attempt; `commit.round` equals the proposal round, while the block header
+  round equals the valid round only for a valid-round re-proposal;
 - complete candidate material (Proposal, BlockV2, and derived randomness) is
   durably recoverable for every live `valid_block`/`locked_block` reference;
+  immutable block records and each round-specific attempt carry a format
+  version and checksum, and missing indexed attempts fail closed;
   restoring an ID without its body is a startup failure;
 - SafetyStore sequence allocation is serialized across vote and companion
   state WAL transactions, and concurrent recovery shows no sequence reuse;
@@ -103,10 +108,11 @@ These checks are completion gates, not evidence that an unreviewed deployment
 is production-ready. Protocol upgrades continue to require a new versioned
 Genesis or an explicitly specified activation-height migration.
 
-The `BlockHeader` V2 builder-identity field and hash layout are protocol
-incompatible with older serialized blocks. No node may infer compatibility by
-deserialization; it must select exactly one schema from the active protocol
-version/Genesis activation and reject unknown versions.
+Protocol upgrades use a new versioned Genesis/network identity. The active
+implementation is Genesis schema 3 / protocol 3 / wire 3; old V2 Genesis
+records are rejected rather than guessed into the new format. The
+`BlockHeader` builder-identity field and hash layout therefore cannot be
+interpreted through a mixed-version deserialization path.
 
 The validator-change queue and epoch snapshot transition are deterministic and
 durable, but they are not by themselves a governance transaction format. The

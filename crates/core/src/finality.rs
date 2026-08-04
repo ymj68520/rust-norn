@@ -7,6 +7,7 @@ use norn_common::consensus_types::{
 };
 use norn_common::traits::DBInterface;
 use norn_common::types::{Block, BlockId, BlockV2, Hash, StakeSnapshotHash, TransactionId};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -31,6 +32,9 @@ const STATE_TOMBSTONE: &[u8] = b"NORN_STATE_TOMBSTONE_V2";
 const SNAPSHOT_PREFIX: &[u8] = b"finality/v2/snapshot/";
 const PENDING_PROPOSAL_PREFIX: &[u8] = b"consensus/v2/pending-proposal/";
 const SAFETY_CANDIDATE_PREFIX: &[u8] = b"consensus/v2/safety-candidate/";
+const SAFETY_BLOCK_CANDIDATE_PREFIX: &[u8] = b"consensus/v2/safety-candidate-block/";
+const SAFETY_ATTEMPT_PREFIX: &[u8] = b"consensus/v2/safety-proposal-attempt/";
+const SAFETY_RECORD_FORMAT_VERSION: u16 = 1;
 
 /// Complete validated candidate material required to recover a durable
 /// Tendermint valid/locked reference after a process restart.  Persisting
@@ -41,6 +45,30 @@ pub struct DurableSafetyCandidate {
     pub proposal: Proposal,
     pub block: BlockV2,
     pub derived_randomness: Hash,
+}
+
+/// Durable immutable block material. Proposal attempts are intentionally
+/// stored separately because the same block body may be proposed in multiple
+/// rounds with different proposer/VRF metadata.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DurableBlockCandidate {
+    pub format_version: u16,
+    pub height: u64,
+    pub block_id: BlockId,
+    pub block: BlockV2,
+    pub attempt_rounds: Vec<u32>,
+    pub payload_hash: Hash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DurableProposalAttempt {
+    pub format_version: u16,
+    pub height: u64,
+    pub round: u32,
+    pub block_id: BlockId,
+    pub proposal: Proposal,
+    pub derived_randomness: Hash,
+    pub payload_hash: Hash,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +150,8 @@ impl FinalityStore {
         if proposal.height != block.header.height as u64
             || proposal.block_id != BlockId(block.header.block_hash)
             || block.header.block_builder.0 == [0u8; 32]
+            || (proposal.protocol_version.0 < 3
+                && (proposal.valid_round.is_some() || proposal.valid_round_certificate.is_some()))
             || match (
                 proposal.valid_round,
                 proposal.valid_round_certificate.as_ref(),
@@ -175,18 +205,77 @@ impl FinalityStore {
             || proposal.height != block.header.height as u64
             || proposal.block_id != BlockId(block.header.block_hash)
             || block.header.block_builder.0 == [0u8; 32]
+            || (proposal.protocol_version.0 < 3
+                && (proposal.valid_round.is_some() || proposal.valid_round_certificate.is_some()))
+            || match (
+                proposal.valid_round,
+                proposal.valid_round_certificate.as_ref(),
+            ) {
+                (None, None) => {
+                    proposal.proposer != block.header.block_builder
+                        || proposal.round != block.header.round
+                }
+                (Some(valid_round), Some(certificate)) => {
+                    valid_round >= proposal.round
+                        || certificate.round != valid_round
+                        || certificate.block_id != proposal.block_id
+                        || block.header.round != valid_round
+                }
+                _ => true,
+            }
         {
             bail!("safety candidate identity does not match its block");
         }
-        let candidate = DurableSafetyCandidate {
-            proposal: proposal.clone(),
-            block: block.clone(),
-            derived_randomness,
+        let block_id = proposal.block_id;
+        let block_key = safety_block_candidate_key(proposal.height, block_id);
+        let attempt_key = safety_proposal_attempt_key(proposal.height, proposal.round, block_id);
+        let mut block_record = if let Some(bytes) = self.db.get(&block_key).await? {
+            let record: DurableBlockCandidate = decode(&bytes, "durable safety block candidate")?;
+            validate_durable_block_candidate(&record)?;
+            if record.height != proposal.height
+                || record.block_id != block_id
+                || record.block != *block
+            {
+                bail!("durable safety block candidate conflicts with immutable block");
+            }
+            record
+        } else {
+            DurableBlockCandidate {
+                format_version: SAFETY_RECORD_FORMAT_VERSION,
+                height: proposal.height,
+                block_id,
+                block: block.clone(),
+                attempt_rounds: Vec::new(),
+                payload_hash: Hash::default(),
+            }
         };
+        let attempt = DurableProposalAttempt {
+            format_version: SAFETY_RECORD_FORMAT_VERSION,
+            height: proposal.height,
+            round: proposal.round,
+            block_id,
+            proposal: proposal.clone(),
+            derived_randomness,
+            payload_hash: Hash::default(),
+        };
+        if let Some(bytes) = self.db.get(&attempt_key).await? {
+            let existing: DurableProposalAttempt =
+                decode(&bytes, "durable safety proposal attempt")?;
+            validate_durable_proposal_attempt(&existing)?;
+            if existing != attempt_with_hash(&attempt)? {
+                bail!("durable safety proposal attempt conflicts with existing attempt");
+            }
+        }
+        if !block_record.attempt_rounds.contains(&proposal.round) {
+            block_record.attempt_rounds.push(proposal.round);
+            block_record.attempt_rounds.sort_unstable();
+        }
+        block_record.payload_hash = durable_block_payload_hash(&block_record)?;
+        let attempt = attempt_with_hash(&attempt)?;
         self.db
             .batch_insert(
-                &[safety_candidate_key(proposal.height, proposal.block_id)],
-                &[encode(&candidate)?],
+                &[block_key, attempt_key],
+                &[encode(&block_record)?, encode(&attempt)?],
             )
             .await
     }
@@ -196,19 +285,95 @@ impl FinalityStore {
         height: u64,
         block_id: BlockId,
     ) -> Result<Option<DurableSafetyCandidate>> {
-        self.db
-            .get(&safety_candidate_key(height, block_id))
+        Ok(self
+            .recover_safety_candidates(height, block_id)
             .await?
-            .map(|bytes| decode(&bytes, "durable safety candidate"))
-            .transpose()
+            .into_iter()
+            .max_by_key(|candidate| candidate.proposal.round))
+    }
+
+    pub async fn recover_safety_candidates(
+        &self,
+        height: u64,
+        block_id: BlockId,
+    ) -> Result<Vec<DurableSafetyCandidate>> {
+        let Some(block_record) = self.recover_safety_block(height, block_id).await? else {
+            return Ok(Vec::new());
+        };
+        let mut candidates = Vec::with_capacity(block_record.attempt_rounds.len());
+        for round in block_record.attempt_rounds {
+            let Some(attempt) = self
+                .recover_safety_candidate_attempt(height, round, block_id)
+                .await?
+            else {
+                bail!("durable safety block candidate references a missing proposal attempt");
+            };
+            candidates.push(DurableSafetyCandidate {
+                proposal: attempt.proposal,
+                block: block_record.block.clone(),
+                derived_randomness: attempt.derived_randomness,
+            });
+        }
+        Ok(candidates)
+    }
+
+    pub async fn recover_safety_candidate_attempt(
+        &self,
+        height: u64,
+        round: u32,
+        block_id: BlockId,
+    ) -> Result<Option<DurableProposalAttempt>> {
+        let Some(bytes) = self
+            .db
+            .get(&safety_proposal_attempt_key(height, round, block_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let attempt: DurableProposalAttempt = decode(&bytes, "durable safety proposal attempt")?;
+        validate_durable_proposal_attempt(&attempt)?;
+        if attempt.height != height || attempt.round != round || attempt.block_id != block_id {
+            bail!("durable safety proposal attempt key does not match payload");
+        }
+        Ok(Some(attempt))
+    }
+
+    pub async fn recover_safety_block(
+        &self,
+        height: u64,
+        block_id: BlockId,
+    ) -> Result<Option<DurableBlockCandidate>> {
+        let Some(bytes) = self
+            .db
+            .get(&safety_block_candidate_key(height, block_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+        let record: DurableBlockCandidate = decode(&bytes, "durable safety block candidate")?;
+        validate_durable_block_candidate(&record)?;
+        if record.height != height || record.block_id != block_id {
+            bail!("durable safety block candidate key does not match payload");
+        }
+        Ok(Some(record))
     }
 
     /// Candidate cleanup is intentionally only allowed after the finalized
     /// transaction has been durably committed.
     pub async fn clear_safety_candidate(&self, height: u64, block_id: BlockId) -> Result<()> {
-        self.db
-            .batch_delete(&[safety_candidate_key(height, block_id)])
-            .await
+        let mut keys = vec![
+            safety_block_candidate_key(height, block_id),
+            safety_candidate_key(height, block_id),
+        ];
+        if let Some(record) = self.recover_safety_block(height, block_id).await? {
+            keys.extend(
+                record
+                    .attempt_rounds
+                    .into_iter()
+                    .map(|round| safety_proposal_attempt_key(height, round, block_id)),
+            );
+        }
+        self.db.batch_delete(&keys).await
     }
 
     /// Commit a finalized block and all of its finality markers atomically.
@@ -458,7 +623,23 @@ impl FinalityStore {
         keys.push(TIP_KEY.to_vec());
         values.push(encode(&new_tip)?);
 
-        self.db.batch_insert(&keys, &values).await?;
+        // Candidate cleanup is part of the same mixed single-tree batch as
+        // finality. A crash therefore leaves either the old candidate plus no
+        // finalized marker, or the complete finalized transaction with all
+        // indexed attempts removed.
+        let mut safety_delete_keys = vec![safety_candidate_key(id.height, id.block_id)];
+        if let Some(record) = self.recover_safety_block(id.height, id.block_id).await? {
+            safety_delete_keys.push(safety_block_candidate_key(id.height, id.block_id));
+            safety_delete_keys.extend(
+                record
+                    .attempt_rounds
+                    .into_iter()
+                    .map(|round| safety_proposal_attempt_key(id.height, round, id.block_id)),
+            );
+        }
+        self.db
+            .batch_write(&keys, &values, &safety_delete_keys)
+            .await?;
         Ok(FinalityCommitResult::Applied)
     }
 
@@ -940,6 +1121,81 @@ fn safety_candidate_key(height: u64, block_id: BlockId) -> Vec<u8> {
     key
 }
 
+fn safety_block_candidate_key(height: u64, block_id: BlockId) -> Vec<u8> {
+    let mut key = SAFETY_BLOCK_CANDIDATE_PREFIX.to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key.extend_from_slice(&block_id.0 .0);
+    key
+}
+
+fn safety_proposal_attempt_key(height: u64, round: u32, block_id: BlockId) -> Vec<u8> {
+    let mut key = SAFETY_ATTEMPT_PREFIX.to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key.extend_from_slice(&round.to_be_bytes());
+    key.extend_from_slice(&block_id.0 .0);
+    key
+}
+
+fn durable_payload_hash<T: serde::Serialize>(payload: &T) -> Result<Hash> {
+    let bytes = encode(payload)?;
+    Ok(Hash(Sha256::digest(bytes).into()))
+}
+
+fn durable_block_payload_hash(record: &DurableBlockCandidate) -> Result<Hash> {
+    durable_payload_hash(&(
+        record.format_version,
+        record.height,
+        record.block_id,
+        &record.block,
+        &record.attempt_rounds,
+    ))
+}
+
+fn durable_attempt_payload_hash(record: &DurableProposalAttempt) -> Result<Hash> {
+    durable_payload_hash(&(
+        record.format_version,
+        record.height,
+        record.round,
+        record.block_id,
+        &record.proposal,
+        record.derived_randomness,
+    ))
+}
+
+fn validate_durable_block_candidate(record: &DurableBlockCandidate) -> Result<()> {
+    if record.format_version != SAFETY_RECORD_FORMAT_VERSION
+        || record.block_id != BlockId(record.block.header.block_hash)
+        || record.block.header.height < 0
+        || record.height != record.block.header.height as u64
+        || record
+            .attempt_rounds
+            .windows(2)
+            .any(|rounds| rounds[0] >= rounds[1])
+        || record.payload_hash != durable_block_payload_hash(record)?
+    {
+        bail!("invalid durable safety block candidate record");
+    }
+    Ok(())
+}
+
+fn validate_durable_proposal_attempt(record: &DurableProposalAttempt) -> Result<()> {
+    if record.format_version != SAFETY_RECORD_FORMAT_VERSION
+        || record.height != record.proposal.height
+        || record.round != record.proposal.round
+        || record.block_id != record.proposal.block_id
+        || record.payload_hash != durable_attempt_payload_hash(record)?
+    {
+        bail!("invalid durable safety proposal attempt record");
+    }
+    Ok(())
+}
+
+fn attempt_with_hash(record: &DurableProposalAttempt) -> Result<DurableProposalAttempt> {
+    let mut record = record.clone();
+    record.payload_hash = durable_attempt_payload_hash(&record)?;
+    Ok(record)
+}
+
 fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
     norn_common::utils::codec::serialize(value)
 }
@@ -955,7 +1211,7 @@ mod tests {
     use async_trait::async_trait;
     use norn_common::consensus_types::{
         CommitCertificate, FinalizedConsensusState, PendingValidatorChange,
-        PendingValidatorChanges, ValidatorChange, ValidatorRecord,
+        PendingValidatorChanges, PrevoteCertificate, ValidatorChange, ValidatorRecord,
     };
     use norn_common::types::{
         BlockHeader, ChainId, ConsensusPublicKey, Hash, ProtocolVersion, StakeSnapshotHash,
@@ -1027,7 +1283,7 @@ mod tests {
     }
 
     fn finalized() -> FinalizedBlockV2 {
-        let protocol_version = ProtocolVersion(2);
+        let protocol_version = ProtocolVersion(3);
         let chain_id = ChainId(Hash([1; 32]));
         let block_id = Hash([2; 32]);
         let snapshot_hash = StakeSnapshotHash([3; 32]);
@@ -1112,6 +1368,42 @@ mod tests {
         assert_eq!(recovered.proposal, finalized.proposal);
         assert_eq!(recovered.block, finalized.block);
         assert_eq!(recovered.derived_randomness, derived);
+
+        let protocol_version = finalized.proposal.protocol_version;
+        let chain_id = finalized.proposal.chain_id;
+        let snapshot_hash = finalized.proposal.stake_snapshot_hash;
+        let mut reproposal = finalized.proposal.clone();
+        reproposal.round = 1;
+        reproposal.valid_round = Some(0);
+        reproposal.valid_round_certificate = Some(PrevoteCertificate {
+            protocol_version,
+            chain_id,
+            epoch: 0,
+            height: 1,
+            round: 0,
+            block_id: finalized.commit.block_id,
+            stake_snapshot_hash: snapshot_hash,
+            prevotes: Vec::new(),
+        });
+        reproposal.proposer = ValidatorId([7; 32]);
+        store
+            .persist_safety_candidate(&reproposal, &finalized.block, Hash([43; 32]))
+            .await
+            .unwrap();
+        let original_attempt = store
+            .recover_safety_candidate_attempt(1, 0, finalized.commit.block_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let later_attempt = store
+            .recover_safety_candidate_attempt(1, 1, finalized.commit.block_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(original_attempt.proposal.round, 0);
+        assert_eq!(later_attempt.proposal.round, 1);
+        assert_eq!(original_attempt.derived_randomness, derived);
+        assert_eq!(later_attempt.derived_randomness, Hash([43; 32]));
 
         store
             .clear_safety_candidate(1, finalized.commit.block_id)

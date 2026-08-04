@@ -538,8 +538,7 @@ impl BlockProducer {
                 .candidate_cache_v2
                 .write()
                 .await
-                .get(height, valid_block_id)
-                .map(|candidate| candidate.block)
+                .get_block(height, valid_block_id)
                 .ok_or_else(|| {
                     anyhow!(
                         "valid-round block {:?} is not available for safe re-proposal",

@@ -262,6 +262,7 @@ pub enum ConsensusDriverAction {
     /// discarded as stale by the single-writer driver.
     UnpinPendingFinality {
         height: u64,
+        round: u32,
         block_id: norn_common::types::BlockId,
     },
 }
@@ -339,6 +340,7 @@ struct DriverState {
 struct PendingFinality {
     context: ConsensusContextToken,
     height: u64,
+    round: u32,
     block_id: norn_common::types::BlockId,
 }
 
@@ -596,7 +598,7 @@ fn replace_timeout(
     let stale_finality = state
         .pending_finality
         .values()
-        .map(|pending| (pending.height, pending.block_id))
+        .map(|pending| (pending.height, pending.round, pending.block_id))
         .collect::<Vec<_>>();
     state.pending_finality.clear();
     let token = TimeoutToken {
@@ -608,7 +610,13 @@ fn replace_timeout(
     };
     let mut actions = stale_finality
         .into_iter()
-        .map(|(height, block_id)| ConsensusDriverAction::UnpinPendingFinality { height, block_id })
+        .map(
+            |(height, round, block_id)| ConsensusDriverAction::UnpinPendingFinality {
+                height,
+                round,
+                block_id,
+            },
+        )
         .collect::<Vec<_>>();
     actions.reserve(2);
     if let Some(previous) = state.active_timeout.replace(token) {
@@ -677,6 +685,7 @@ fn invalidate_after_finality(
         .iter()
         .map(|(_, pending)| ConsensusDriverAction::UnpinPendingFinality {
             height: pending.height,
+            round: pending.round,
             block_id: pending.block_id,
         })
         .collect::<Vec<_>>();
@@ -838,6 +847,7 @@ async fn process_event(
                         PendingFinality {
                             context,
                             height: commit.height,
+                            round: commit.round,
                             block_id: commit.block_id,
                         },
                     );
@@ -870,12 +880,14 @@ async fn process_event(
                 // permanently consume candidate-cache capacity.
                 return Ok(vec![ConsensusDriverAction::UnpinPendingFinality {
                     height: pending.height,
+                    round: pending.round,
                     block_id: pending.block_id,
                 }]);
             }
             if !context_is_current(state, &context) {
                 return Ok(vec![ConsensusDriverAction::UnpinPendingFinality {
                     height: pending.height,
+                    round: pending.round,
                     block_id: pending.block_id,
                 }]);
             }
@@ -895,6 +907,7 @@ async fn process_event(
                 FinalityPreparationResult::Rejected(_) => {
                     vec![ConsensusDriverAction::UnpinPendingFinality {
                         height: pending.height,
+                        round: pending.round,
                         block_id: pending.block_id,
                     }]
                 }
@@ -1315,7 +1328,11 @@ mod tests {
         .unwrap();
         assert!(rejected_actions.iter().any(|action| matches!(
             action,
-            ConsensusDriverAction::UnpinPendingFinality { height: 1, block_id }
+            ConsensusDriverAction::UnpinPendingFinality {
+                height: 1,
+                block_id,
+                ..
+            }
                 if *block_id == BlockId(Hash([7; 32]))
         )));
 

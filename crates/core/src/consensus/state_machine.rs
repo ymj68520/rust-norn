@@ -916,6 +916,78 @@ impl TendermintStateMachine {
         self.verify_proposal_vrf(proposal, &block.header)
     }
 
+    /// Validate a durable proposal attempt during restart recovery. Unlike
+    /// the live admission path this deliberately does not require the
+    /// proposal to be for the current round or current deterministic proposer;
+    /// older attempts may be needed to finalize an older-round certificate.
+    /// All cryptographic context remains bound to the active height snapshot.
+    pub fn validate_v2_proposal_for_recovery(
+        &self,
+        proposal: &Proposal,
+        block: &BlockV2,
+    ) -> Result<VerifiedVrfOutput> {
+        let expected_epoch = self.current_epoch()?;
+        if proposal.height != self.height
+            || proposal.epoch != expected_epoch
+            || proposal.protocol_version != self.config.protocol_version
+            || proposal.chain_id != self.config.chain_id
+            || proposal.stake_snapshot_hash != self.snapshot.snapshot_hash
+            || block.header.height < 0
+            || proposal.height != block.header.height as u64
+            || proposal.parent_block_hash != block.header.prev_block_hash
+            || block.header.epoch != expected_epoch
+            || block.header.protocol_version != self.config.protocol_version
+            || block.header.chain_id != self.config.chain_id
+            || block.header.stake_snapshot_hash != self.snapshot.snapshot_hash
+            || block.header.parent_randomness != self.parent_randomness
+            || proposal.block_id != BlockId(block.header.block_hash)
+        {
+            return Err(anyhow!("durable V2 proposal context mismatch"));
+        }
+        validate_v2_proposal_builder_relation(proposal, &block.header)?;
+        let record = self
+            .snapshot
+            .validators
+            .get(&proposal.proposer)
+            .ok_or_else(|| anyhow!("durable V2 proposer is not in the active snapshot"))?;
+        if !record.is_active_at(self.snapshot.epoch) {
+            return Err(anyhow!(
+                "durable V2 proposer is jailed or slashed in the active snapshot"
+            ));
+        }
+        if record.consensus_public_key.0 == [0u8; 33] || proposal.signature == [0u8; 64] {
+            return Err(anyhow!("durable V2 proposal has a zero key or signature"));
+        }
+        let verifying_key = VerifyingKey::from_sec1_bytes(&record.consensus_public_key.0)
+            .map_err(|_| anyhow!("malformed durable V2 proposer public key"))?;
+        let signature = Signature::from_slice(&proposal.signature)
+            .map_err(|_| anyhow!("malformed durable V2 proposer signature"))?;
+        if signature.normalize_s().is_some() {
+            return Err(anyhow!("durable V2 proposer signature is not canonical"));
+        }
+        verifying_key
+            .verify(&proposal.canonical_bytes(), &signature)
+            .map_err(|_| anyhow!("durable V2 proposer signature verification failed"))?;
+
+        let context = VrfContext {
+            protocol_version: proposal.protocol_version,
+            chain_id: proposal.chain_id,
+            epoch: proposal.epoch,
+            height: proposal.height,
+            round: proposal.round,
+            parent_block_hash: proposal.parent_block_hash,
+            stake_snapshot_hash: proposal.stake_snapshot_hash,
+            validator_id: proposal.proposer,
+        };
+        norn_crypto::vrf::verify_and_derive(
+            &record.vrf_public_key.0,
+            &context,
+            &VRFPreOutBytes(proposal.vrf_preout),
+            &VRFProofBytes(proposal.vrf_proof),
+        )
+        .map_err(|e| anyhow!("durable V2 proposal VRF verification failed: {e}"))
+    }
+
     /// Verify the proposer VRF against the complete active-height context.
     /// The returned randomness is derived only after proof verification and is
     /// therefore safe to persist as the next-height consensus seed.
@@ -1489,6 +1561,13 @@ fn validate_v2_proposal_builder_relation(
 ) -> Result<()> {
     if block_header.block_builder.0 == [0u8; 32] {
         return Err(anyhow!("V2 proposal block builder must be non-zero"));
+    }
+    if proposal.protocol_version.0 < 3
+        && (proposal.valid_round.is_some() || proposal.valid_round_certificate.is_some())
+    {
+        return Err(anyhow!(
+            "valid-round re-proposals require the active V3 protocol"
+        ));
     }
     match (
         proposal.valid_round,

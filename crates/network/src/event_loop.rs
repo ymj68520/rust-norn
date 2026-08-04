@@ -973,6 +973,7 @@ mod tests {
     fn full_node_can_only_originate_v2_sync_requests() {
         let block_request = ConsensusMessage::BlockRequest {
             height: 1,
+            round: 0,
             block_id: BlockId(Hash([1; 32])),
         };
         let finality_request = ConsensusMessage::FinalityRequest { height: 1 };

@@ -110,6 +110,37 @@ impl DBInterface for SledDB {
         })
         .await?
     }
+
+    async fn batch_write(
+        &self,
+        insert_keys: &[Vec<u8>],
+        insert_values: &[Vec<u8>],
+        delete_keys: &[Vec<u8>],
+    ) -> Result<()> {
+        if insert_keys.len() != insert_values.len() {
+            anyhow::bail!("Batch write failed: Key/Value length mismatch");
+        }
+        let db = self.db.clone();
+        let insert_keys = insert_keys.to_vec();
+        let insert_values = insert_values.to_vec();
+        let delete_keys = delete_keys.to_vec();
+
+        tokio::task::spawn_blocking(move || {
+            let mut batch = sled::Batch::default();
+            for (key, value) in insert_keys.iter().zip(insert_values.iter()) {
+                batch.insert(key.as_slice(), value.as_slice());
+            }
+            for key in &delete_keys {
+                batch.remove(key.as_slice());
+            }
+            db.apply_batch(batch)
+                .map_err(|e| anyhow::anyhow!("Failed to apply mixed SledDB batch: {}", e))?;
+            db.flush()
+                .map_err(|e| anyhow::anyhow!("Failed to flush mixed SledDB batch: {}", e))?;
+            Ok(())
+        })
+        .await?
+    }
 }
 
 // Additional utility methods specific to Sled

@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-pub const GENESIS_SCHEMA_VERSION: u16 = 2;
-pub const GENESIS_IDENTITY_KEY: &[u8] = b"genesis_identity_v2";
+pub const GENESIS_SCHEMA_VERSION: u16 = 3;
+pub const GENESIS_IDENTITY_KEY: &[u8] = b"genesis_identity_v3";
 
 fn default_epoch_delay() -> u64 {
     1
@@ -158,9 +158,9 @@ impl GenesisConfig {
                 self.schema_version
             )));
         }
-        if self.protocol_version.0 == 0 {
+        if self.protocol_version != ChainContext::CURRENT_PROTOCOL_VERSION {
             return Err(NornError::Config(
-                "Genesis protocol version must be non-zero".into(),
+                "Genesis protocol version is not the active V3 protocol".into(),
             ));
         }
         if self.chain_id.0 == Hash::default() {
@@ -296,7 +296,7 @@ impl GenesisConfig {
     /// Canonical, order-independent encoding used for Genesis identity.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(512 + self.validators.len() * 105);
-        bytes.extend_from_slice(b"NORN_GENESIS_V2");
+        bytes.extend_from_slice(b"NORN_GENESIS_V3");
         bytes.extend_from_slice(&self.schema_version.to_be_bytes());
         bytes.extend_from_slice(&self.protocol_version.0.to_be_bytes());
         bytes.extend_from_slice(&self.chain_id.0 .0);
@@ -368,7 +368,7 @@ fn append_validator(bytes: &mut Vec<u8>, record: &ValidatorRecord) {
 /// 确保所有节点使用相同的创世块，这对于网络同步至关重要
 pub fn get_genesis_block() -> Block {
     let header = BlockHeader {
-        protocol_version: crate::types::ProtocolVersion(2),
+        protocol_version: ChainContext::CURRENT_PROTOCOL_VERSION,
         chain_id: crate::types::ChainId(Hash([1u8; 32])),
         height: 0,
         epoch: 1,
@@ -505,6 +505,15 @@ mod tests {
             .transactions
             .push(crate::types::Transaction::default());
         assert!(!is_valid_genesis_block(&invalid_genesis));
+    }
+
+    #[test]
+    fn legacy_v2_genesis_is_rejected_without_migration_guessing() {
+        let mut legacy = GenesisConfig::from_fixed_genesis();
+        legacy.schema_version = 2;
+        legacy.protocol_version = ProtocolVersion(2);
+        legacy.genesis_block.header.protocol_version = ProtocolVersion(2);
+        assert!(legacy.validate_allow_empty_validators().is_err());
     }
 
     #[test]

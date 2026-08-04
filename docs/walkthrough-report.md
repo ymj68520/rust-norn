@@ -64,16 +64,25 @@ The uncommitted follow-up addresses the latest review findings:
   matching certificate round/block ID, and header round equal to `valid_round`.
   Equal, greater, missing, and mismatched valid-round inputs fail closed.
 - Complete validated candidates (Proposal, BlockV2, and derived randomness) are
-  persisted in FinalityStore, recovered before a validator resumes production,
-  and cleared only after durable finality. A missing body for a durable lock or
-  valid reference is a startup/reconciliation failure.
+  persisted in FinalityStore. Immutable block records and round-specific
+  proposal attempts are separate, keyed respectively by `(height, block_id)`
+  and `(height, round, block_id)`. Finalization retrieves the exact certificate
+  round instead of using the latest cached Proposal. Recovery restores every
+  indexed attempt before production resumes; record versions and checksums
+  reject torn or unknown durable material.
+- `FinalizedConsensusState::from_v2` now accepts the Proposal explicitly:
+  fresh finality requires equal Proposal/header rounds, while valid-round
+  re-proposal finality requires `commit.round == proposal.round` and
+  `block.header.round == proposal.valid_round`. The old invalid requirement
+  `commit.round == block.header.round` is gone.
 - Persistent SafetyStore sequence allocation is serialized across vote and
   companion-state WAL transactions; a concurrent regression test verifies
   monotonic recovery without sequence reuse.
-- The header field and hash layout change is a protocol-incompatible V2 schema
-  change. It requires a new versioned Genesis/network activation or an explicit
-  activation-height migration; old serialized blocks must not be guessed into
-  the new layout.
+- Protocol activation is explicit: the active network uses Genesis schema 3,
+  protocol version 3, wire version 3, `NORN_BLOCK_HEADER_V3`,
+  `NORN_GENESIS_V3`, V3 transaction IDs, and V3 consensus signing domains.
+  Legacy V2 Genesis/configuration is rejected; there is no mixed-height
+  deserialization fallback.
 
 ## Verification
 
@@ -87,7 +96,8 @@ cargo test --workspace --locked -j 1
 ```
 
 The current next-round changes additionally pass the focused wire-validation,
-candidate-cache, durable-candidate, and concurrent SafetyStore regressions.
+candidate-cache, exact-round finality, durable-candidate, Genesis activation,
+and concurrent SafetyStore regressions.
 The previously published workspace and four-process recovery gates remain the
 baseline for `1c35717`; the full workspace suite must be rerun after this
 worktree is reviewed.
@@ -112,5 +122,5 @@ Until these items are independently reviewed and accepted, the status remains:
 Candidate prototype
 Not production-ready
 Published follow-up implementation commits: `fe692408fe29e84261bca5b1c2bb4a35a2de434a`, `1c35717`
-Current next-round hardening: uncommitted on `1c35717`
+Current next-round hardening: uncommitted on `65a9f3d`
 ```

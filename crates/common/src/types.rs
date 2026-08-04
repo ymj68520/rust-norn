@@ -454,7 +454,11 @@ impl TransactionV2 {
     /// intentionally excluded from this preimage.
     pub fn signing_bytes(&self) -> Result<Vec<u8>, TransactionV2Error> {
         let mut bytes = Vec::with_capacity(256);
-        bytes.extend_from_slice(Self::DOMAIN);
+        if self.protocol_version.0 >= 3 {
+            bytes.extend_from_slice(b"NORN_TRANSACTION_V3");
+        } else {
+            bytes.extend_from_slice(Self::DOMAIN);
+        }
         bytes.extend_from_slice(&self.protocol_version.0.to_be_bytes());
         bytes.extend_from_slice(&self.chain_id.0 .0);
         bytes.extend_from_slice(&self.nonce.to_be_bytes());
@@ -515,7 +519,11 @@ impl TransactionV2 {
     pub fn calculate_id(&self) -> Result<TransactionId, TransactionV2Error> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(b"NORN_TRANSACTION_ID_V2");
+        if self.protocol_version.0 >= 3 {
+            hasher.update(b"NORN_TRANSACTION_ID_V3");
+        } else {
+            hasher.update(b"NORN_TRANSACTION_ID_V2");
+        }
         hasher.update(self.signing_bytes()?);
         hasher.update(self.signature);
         Ok(TransactionId(Hash(hasher.finalize().into())))
@@ -844,7 +852,11 @@ impl BlockHeader {
     pub fn calculate_hash(&self) -> Result<Hash, crate::error::NornError> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(b"NORN_BLOCK_HEADER_V2");
+        if self.protocol_version.0 >= 3 {
+            hasher.update(b"NORN_BLOCK_HEADER_V3");
+        } else {
+            hasher.update(b"NORN_BLOCK_HEADER_V2");
+        }
         hasher.update(&self.protocol_version.0.to_be_bytes());
         hasher.update(&self.chain_id.0 .0);
         hasher.update(&self.height.to_be_bytes());

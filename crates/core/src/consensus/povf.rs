@@ -72,7 +72,6 @@ pub enum CandidateRetention {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct V2CandidateEntry {
     proposal: Proposal,
-    block: BlockV2,
     derived_randomness: Hash,
     inserted_at: Instant,
     encoded_bytes: usize,
@@ -85,11 +84,16 @@ struct V2CandidateEntry {
 #[derive(Debug)]
 pub struct V2CandidateCache {
     limits: V2CandidateCacheLimits,
-    entries: HashMap<(u64, BlockId), V2CandidateEntry>,
+    /// Proposal attempts are keyed by the consensus round.  A block may be
+    /// re-proposed in a later round, but an attempt must never overwrite the
+    /// proposal/VRF material used by an earlier-round certificate.
+    entries: HashMap<(u64, u32, BlockId), V2CandidateEntry>,
+    /// Immutable block bodies are shared by all round-specific attempts.
+    blocks: HashMap<(u64, BlockId), BlockV2>,
     /// Number of in-flight finality preparations holding each candidate pin.
     /// Duplicate certificates may start duplicate workers; one worker must
     /// not release another worker's retention dependency.
-    pending_finality: HashMap<(u64, BlockId), usize>,
+    pending_finality: HashMap<(u64, u32, BlockId), usize>,
     total_bytes: usize,
 }
 
@@ -98,6 +102,7 @@ impl V2CandidateCache {
         Self {
             limits,
             entries: HashMap::new(),
+            blocks: HashMap::new(),
             pending_finality: HashMap::new(),
             total_bytes: 0,
         }
@@ -112,10 +117,18 @@ impl V2CandidateCache {
             .and_then(|size| usize::try_from(size).ok())
     }
 
-    fn remove_key(&mut self, key: &(u64, BlockId)) -> bool {
+    fn remove_key(&mut self, key: &(u64, u32, BlockId)) -> bool {
         if let Some(entry) = self.entries.remove(key) {
             self.pending_finality.remove(key);
             self.total_bytes = self.total_bytes.saturating_sub(entry.encoded_bytes);
+            let block_key = (key.0, key.2);
+            if !self
+                .entries
+                .keys()
+                .any(|candidate_key| (candidate_key.0, candidate_key.2) == block_key)
+            {
+                self.blocks.remove(&block_key);
+            }
             true
         } else {
             false
@@ -140,8 +153,8 @@ impl V2CandidateCache {
 
     fn oldest_key(
         &self,
-        predicate: impl Fn(&(u64, BlockId), &V2CandidateEntry) -> bool,
-    ) -> Option<(u64, BlockId)> {
+        predicate: impl Fn(&(u64, u32, BlockId), &V2CandidateEntry) -> bool,
+    ) -> Option<(u64, u32, BlockId)> {
         self.entries
             .iter()
             .filter(|(key, entry)| {
@@ -151,7 +164,8 @@ impl V2CandidateCache {
                 left.inserted_at
                     .cmp(&right.inserted_at)
                     .then_with(|| left_key.0.cmp(&right_key.0))
-                    .then_with(|| left_key.1 .0 .0.cmp(&right_key.1 .0 .0))
+                    .then_with(|| left_key.1.cmp(&right_key.1))
+                    .then_with(|| left_key.2 .0 .0.cmp(&right_key.2 .0 .0))
             })
             .map(|(key, _)| *key)
     }
@@ -159,7 +173,7 @@ impl V2CandidateCache {
     fn count_at_height(&self, height: u64) -> usize {
         self.entries
             .keys()
-            .filter(|(entry_height, _)| *entry_height == height)
+            .filter(|(entry_height, _, _)| *entry_height == height)
             .count()
     }
 
@@ -170,27 +184,11 @@ impl V2CandidateCache {
             .count()
     }
 
-    fn count_for_proposer_except(
-        &self,
-        height: u64,
-        proposer: ValidatorId,
-        except: (u64, BlockId),
-    ) -> usize {
-        self.entries
-            .iter()
-            .filter(|(key, entry)| {
-                **key != except
-                    && entry.proposal.height == height
-                    && entry.proposal.proposer == proposer
-            })
-            .count()
-    }
-
-    /// Admit a candidate after enforcing future windows, TTL, per-height,
-    /// per-proposer and total-byte limits. A valid-round re-proposal may carry
-    /// a new Proposal (and derived VRF randomness) for the same exact block;
-    /// the candidate body and block ID remain immutable while the proposal
-    /// metadata is refreshed. Conflicting content for one block ID is rejected.
+    /// Admit one immutable block body and one round-specific proposal attempt.
+    /// Replaying the exact attempt is idempotent; a conflicting attempt under
+    /// the same `(height, round, block_id)` key fails closed. A later-round
+    /// re-proposal creates a distinct entry and cannot replace earlier VRF
+    /// material needed by an older commit.
     pub fn insert(
         &mut self,
         proposal: Proposal,
@@ -201,45 +199,23 @@ impl V2CandidateCache {
     ) -> bool {
         let now = Instant::now();
         self.prune_expired(now);
-        let key = (proposal.height, proposal.block_id);
+        let key = (proposal.height, proposal.round, proposal.block_id);
+        let block_key = (proposal.height, proposal.block_id);
+        if self
+            .blocks
+            .get(&block_key)
+            .is_some_and(|existing_block| existing_block != &block)
+        {
+            return false;
+        }
         if let Some(existing) = self.entries.get(&key).cloned() {
-            if existing.block != block {
-                return false;
-            }
-            if proposal.height > current_height.saturating_add(self.limits.max_future_height)
-                || proposal.round > current_round.saturating_add(self.limits.max_future_round)
+            if self.blocks.get(&block_key) != Some(&block)
+                || existing.proposal != proposal
+                || existing.derived_randomness != derived_randomness
             {
                 return false;
             }
-            let Some(encoded_bytes) = Self::encoded_size(&proposal, &block) else {
-                return false;
-            };
-            if encoded_bytes > self.limits.max_total_bytes {
-                return false;
-            }
-            if proposal.proposer != existing.proposal.proposer
-                && self.count_for_proposer_except(proposal.height, proposal.proposer, key)
-                    >= self.limits.max_items_per_proposer
-            {
-                return false;
-            }
-            let new_total = self
-                .total_bytes
-                .saturating_sub(existing.encoded_bytes)
-                .saturating_add(encoded_bytes);
-            if new_total > self.limits.max_total_bytes {
-                return false;
-            }
-            self.total_bytes = new_total;
-            if let Some(entry) = self.entries.get_mut(&key) {
-                entry.proposal = proposal;
-                entry.block = block;
-                entry.derived_randomness = derived_randomness;
-                entry.inserted_at = now;
-                entry.encoded_bytes = encoded_bytes;
-                // Keep consensus-driven retention and pending-finality pins.
-                entry.retention = existing.retention;
-            }
+            // Exact replay must not refresh insertion time or alter retention.
             return true;
         }
         if proposal.height > current_height.saturating_add(self.limits.max_future_height)
@@ -255,7 +231,8 @@ impl V2CandidateCache {
         }
 
         while self.count_at_height(proposal.height) >= self.limits.max_items_per_height {
-            let Some(oldest) = self.oldest_key(|(height, _), _| *height == proposal.height) else {
+            let Some(oldest) = self.oldest_key(|(height, _, _), _| *height == proposal.height)
+            else {
                 break;
             };
             self.remove_key(&oldest);
@@ -263,7 +240,7 @@ impl V2CandidateCache {
         while self.count_for_proposer(proposal.height, proposal.proposer)
             >= self.limits.max_items_per_proposer
         {
-            let Some(oldest) = self.oldest_key(|(height, _), entry| {
+            let Some(oldest) = self.oldest_key(|(height, _, _), entry| {
                 *height == proposal.height && entry.proposal.proposer == proposal.proposer
             }) else {
                 break;
@@ -286,11 +263,13 @@ impl V2CandidateCache {
             return false;
         }
         self.total_bytes = self.total_bytes.saturating_add(encoded_bytes);
+        if !self.blocks.contains_key(&block_key) {
+            self.blocks.insert(block_key, block);
+        }
         self.entries.insert(
             key,
             V2CandidateEntry {
                 proposal,
-                block,
                 derived_randomness,
                 inserted_at: now,
                 encoded_bytes,
@@ -303,8 +282,8 @@ impl V2CandidateCache {
     /// Pin a candidate needed by a finalized commit.  A missing candidate is
     /// a safety/liveness fault and must be handled by the caller rather than
     /// silently replacing it with a new block.
-    pub fn pin_pending_finality(&mut self, height: u64, block_id: BlockId) -> bool {
-        let key = (height, block_id);
+    pub fn pin_pending_finality(&mut self, height: u64, round: u32, block_id: BlockId) -> bool {
+        let key = (height, round, block_id);
         if let Some(entry) = self.entries.get_mut(&key) {
             let pin_count = self.pending_finality.entry(key).or_insert(0);
             *pin_count = pin_count.saturating_add(1);
@@ -315,8 +294,8 @@ impl V2CandidateCache {
         }
     }
 
-    pub fn unpin_pending_finality(&mut self, height: u64, block_id: BlockId) {
-        let key = (height, block_id);
+    pub fn unpin_pending_finality(&mut self, height: u64, round: u32, block_id: BlockId) {
+        let key = (height, round, block_id);
         let still_pinned = match self.pending_finality.get_mut(&key) {
             Some(pin_count) if *pin_count > 1 => {
                 *pin_count -= 1;
@@ -348,43 +327,67 @@ impl V2CandidateCache {
         let required = [valid_block, locked_block]
             .into_iter()
             .flatten()
-            .all(|block_id| self.entries.contains_key(&(height, block_id)));
-        for ((entry_height, block_id), entry) in &mut self.entries {
+            .all(|block_id| self.blocks.contains_key(&(height, block_id)));
+        for ((entry_height, _round, block_id), entry) in &mut self.entries {
             if *entry_height != height {
                 continue;
             }
-            entry.retention = if self
-                .pending_finality
-                .contains_key(&(*entry_height, *block_id))
-            {
-                CandidateRetention::PendingFinalityPinned
-            } else if locked_block == Some(*block_id) {
-                CandidateRetention::LockedPinned
-            } else if valid_block == Some(*block_id) {
-                CandidateRetention::ValidRoundPinned
-            } else {
-                CandidateRetention::Normal
-            };
+            entry.retention =
+                if self
+                    .pending_finality
+                    .contains_key(&(*entry_height, *_round, *block_id))
+                {
+                    CandidateRetention::PendingFinalityPinned
+                } else if locked_block == Some(*block_id) {
+                    CandidateRetention::LockedPinned
+                } else if valid_block == Some(*block_id) {
+                    CandidateRetention::ValidRoundPinned
+                } else {
+                    CandidateRetention::Normal
+                };
         }
         required
     }
 
     pub fn get(&mut self, height: u64, block_id: BlockId) -> Option<ValidatedCandidate> {
         self.prune_expired(Instant::now());
+        let key = self
+            .entries
+            .keys()
+            .filter(|(entry_height, _, entry_block_id)| {
+                *entry_height == height && *entry_block_id == block_id
+            })
+            .max_by_key(|(_, round, _)| *round)
+            .copied()?;
+        self.get_attempt(height, key.1, block_id)
+    }
+
+    pub fn get_attempt(
+        &mut self,
+        height: u64,
+        round: u32,
+        block_id: BlockId,
+    ) -> Option<ValidatedCandidate> {
+        self.prune_expired(Instant::now());
+        let block = self.blocks.get(&(height, block_id))?.clone();
         self.entries
-            .get(&(height, block_id))
+            .get(&(height, round, block_id))
             .map(|entry| ValidatedCandidate {
                 proposal: entry.proposal.clone(),
-                block: entry.block.clone(),
+                block,
                 derived_randomness: entry.derived_randomness,
             })
+    }
+
+    pub fn get_block(&self, height: u64, block_id: BlockId) -> Option<BlockV2> {
+        self.blocks.get(&(height, block_id)).cloned()
     }
 
     pub fn remove_through_height(&mut self, finalized_height: u64) {
         let keys = self
             .entries
             .keys()
-            .filter(|(height, _)| *height <= finalized_height)
+            .filter(|(height, _, _)| *height <= finalized_height)
             .copied()
             .collect::<Vec<_>>();
         for key in keys {
@@ -400,9 +403,14 @@ impl V2CandidateCache {
         self.total_bytes
     }
 
-    pub fn retention(&self, height: u64, block_id: BlockId) -> Option<CandidateRetention> {
+    pub fn retention(
+        &self,
+        height: u64,
+        round: u32,
+        block_id: BlockId,
+    ) -> Option<CandidateRetention> {
         self.entries
-            .get(&(height, block_id))
+            .get(&(height, round, block_id))
             .map(|entry| entry.retention)
     }
 }
@@ -414,6 +422,7 @@ pub struct PoVFEngine {
     pub finalized_blocks: Arc<RwLock<HashMap<Hash, FinalizedBlock>>>,
     pub finalized_blocks_v2: Arc<RwLock<HashMap<Hash, FinalizedBlockV2>>>,
     pub current_height: Arc<RwLock<u64>>,
+    resource_limits: ProtocolResourceLimits,
     finality_store: StdRwLock<Option<Arc<FinalityStore>>>,
 }
 
@@ -481,6 +490,7 @@ impl PoVFEngine {
             finalized_blocks: Arc::new(RwLock::new(HashMap::new())),
             finalized_blocks_v2: Arc::new(RwLock::new(HashMap::new())),
             current_height: Arc::new(RwLock::new(1)),
+            resource_limits,
             finality_store: StdRwLock::new(None),
         }
     }
@@ -818,21 +828,47 @@ impl PoVFEngine {
             let Some(store) = self.attached_finality_store() else {
                 return false;
             };
-            let Ok(Some(candidate)) = store.recover_safety_candidate(height, block_id).await else {
+            let Ok(candidates) = store.recover_safety_candidates(height, block_id).await else {
                 return false;
             };
+            if candidates.is_empty() {
+                return false;
+            }
             let (current_height, current_round) = {
                 let sm = self.state_machine.read().await;
                 (sm.height, sm.round)
             };
-            if !self.candidate_cache_v2.write().await.insert(
-                candidate.proposal,
-                candidate.block,
-                candidate.derived_randomness,
-                current_height,
-                current_round,
-            ) {
-                return false;
+            for candidate in candidates {
+                let (context, verified_randomness) = {
+                    let sm = self.state_machine.read().await;
+                    let context = ChainContext::new(
+                        3,
+                        sm.config.protocol_version,
+                        sm.config.chain_id,
+                        Hash::default(),
+                    );
+                    let verified = sm
+                        .validate_v2_proposal_for_recovery(&candidate.proposal, &candidate.block)
+                        .ok();
+                    (context, verified.map(|output| Hash(output.randomness)))
+                };
+                if candidate
+                    .block
+                    .validate_structure(&context, &self.resource_limits)
+                    .is_err()
+                    || verified_randomness != Some(candidate.derived_randomness)
+                {
+                    return false;
+                }
+                if !self.candidate_cache_v2.write().await.insert(
+                    candidate.proposal,
+                    candidate.block,
+                    candidate.derived_randomness,
+                    current_height,
+                    current_round,
+                ) {
+                    return false;
+                }
             }
         }
         self.candidate_cache_v2
@@ -841,8 +877,17 @@ impl PoVFEngine {
             .reconcile_state(height, valid_block, locked_block)
     }
 
-    pub async fn pin_v2_candidate_for_finality(&self, height: u64, block_id: BlockId) -> bool {
-        let candidate = self.candidate_cache_v2.write().await.get(height, block_id);
+    pub async fn pin_v2_candidate_for_finality(
+        &self,
+        height: u64,
+        round: u32,
+        block_id: BlockId,
+    ) -> bool {
+        let candidate = self
+            .candidate_cache_v2
+            .write()
+            .await
+            .get_attempt(height, round, block_id);
         let Some(candidate) = candidate else {
             return false;
         };
@@ -860,14 +905,19 @@ impl PoVFEngine {
         self.candidate_cache_v2
             .write()
             .await
-            .pin_pending_finality(height, block_id)
+            .pin_pending_finality(height, round, block_id)
     }
 
-    pub async fn unpin_v2_candidate_for_finality(&self, height: u64, block_id: BlockId) -> bool {
+    pub async fn unpin_v2_candidate_for_finality(
+        &self,
+        height: u64,
+        round: u32,
+        block_id: BlockId,
+    ) -> bool {
         self.candidate_cache_v2
             .write()
             .await
-            .unpin_pending_finality(height, block_id);
+            .unpin_pending_finality(height, round, block_id);
         self.reconcile_v2_candidate_retention().await
     }
 
@@ -891,6 +941,19 @@ impl PoVFEngine {
             .write()
             .await
             .get(height, block_id)
+            .map(|candidate| (candidate.proposal, candidate.block))
+    }
+
+    pub async fn get_validated_candidate_for_commit(
+        &self,
+        height: u64,
+        round: u32,
+        block_id: BlockId,
+    ) -> Option<(Proposal, BlockV2)> {
+        self.candidate_cache_v2
+            .write()
+            .await
+            .get_attempt(height, round, block_id)
             .map(|candidate| (candidate.proposal, candidate.block))
     }
 
@@ -1204,7 +1267,7 @@ impl PoVFEngine {
             .candidate_cache_v2
             .write()
             .await
-            .get(commit.height, commit.block_id)
+            .get_attempt(commit.height, commit.round, commit.block_id)
             .ok_or_else(|| {
                 NornError::ConsensusError(format!(
                     "V2 candidate missing for height {} block {:?}",
@@ -1235,7 +1298,7 @@ impl PoVFEngine {
         self.verify_commit_certificate_v2(&block, &commit, &snapshot)?;
 
         let mut consensus_state =
-            FinalizedConsensusState::from_v2(&block, &commit, next_randomness)?;
+            FinalizedConsensusState::from_v2(&proposal, &block, &commit, next_randomness)?;
         consensus_state.pending_validator_changes = pending_validator_changes;
 
         let finalized = FinalizedBlockV2 {
@@ -1379,7 +1442,7 @@ mod tests {
     fn valid_round_reproposal_updates_metadata_without_changing_candidate_body() {
         let mut cache = V2CandidateCache::new(V2CandidateCacheLimits {
             max_total_bytes: 1_000_000,
-            max_items_per_height: 1,
+            max_items_per_height: 2,
             max_items_per_proposer: 1,
             max_future_height: 0,
             max_future_round: 1,
@@ -1393,11 +1456,17 @@ mod tests {
         reproposal.proposer = ValidatorId([2; 32]);
         reproposal.round = 1;
         assert!(cache.insert(reproposal.clone(), block.clone(), Hash([2; 32]), 1, 1));
-        let recovered = cache.get(1, first.block_id).expect("candidate retained");
+        let recovered = cache
+            .get_attempt(1, 1, first.block_id)
+            .expect("round-specific candidate retained");
         assert_eq!(recovered.block, block);
         assert_eq!(recovered.proposal.proposer, ValidatorId([2; 32]));
         assert_eq!(recovered.derived_randomness, Hash([2; 32]));
-        assert_eq!(cache.len(), 1);
+        let original = cache
+            .get_attempt(1, 0, first.block_id)
+            .expect("original round candidate retained");
+        assert_eq!(original.derived_randomness, Hash([1; 32]));
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]
@@ -1441,10 +1510,10 @@ mod tests {
         });
         let pinned = cache_proposal(1, 0, 1, 1);
         assert!(cache.insert(pinned.clone(), BlockV2::default(), Hash([4; 32]), 1, 0));
-        assert!(cache.pin_pending_finality(1, pinned.block_id));
-        assert!(cache.pin_pending_finality(1, pinned.block_id));
+        assert!(cache.pin_pending_finality(1, 0, pinned.block_id));
+        assert!(cache.pin_pending_finality(1, 0, pinned.block_id));
         assert_eq!(
-            cache.retention(1, pinned.block_id),
+            cache.retention(1, 0, pinned.block_id),
             Some(CandidateRetention::PendingFinalityPinned)
         );
         assert!(cache.get(1, pinned.block_id).is_some());
@@ -1458,12 +1527,12 @@ mod tests {
         ));
         assert!(cache.get(1, pinned.block_id).is_some());
 
-        cache.unpin_pending_finality(1, pinned.block_id);
+        cache.unpin_pending_finality(1, 0, pinned.block_id);
         assert_eq!(
-            cache.retention(1, pinned.block_id),
+            cache.retention(1, 0, pinned.block_id),
             Some(CandidateRetention::PendingFinalityPinned)
         );
-        cache.unpin_pending_finality(1, pinned.block_id);
+        cache.unpin_pending_finality(1, 0, pinned.block_id);
         assert!(cache.get(1, pinned.block_id).is_none());
     }
 

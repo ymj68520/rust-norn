@@ -48,7 +48,11 @@ pub struct Proposal {
 impl Proposal {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(b"NORN_BFT_V2_PROPOSAL");
+        if self.protocol_version.0 >= 3 {
+            bytes.extend_from_slice(b"NORN_BFT_V3_PROPOSAL");
+        } else {
+            bytes.extend_from_slice(b"NORN_BFT_V2_PROPOSAL");
+        }
         bytes.extend_from_slice(&self.protocol_version.0.to_be_bytes());
         bytes.extend_from_slice(&self.chain_id.0 .0);
         bytes.extend_from_slice(&self.epoch.to_be_bytes());
@@ -89,6 +93,12 @@ impl SignedVote {
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         match self.step {
+            VoteStep::Prevote if self.protocol_version.0 >= 3 => {
+                bytes.extend_from_slice(b"NORN_BFT_V3_PREVOTE")
+            }
+            VoteStep::Precommit if self.protocol_version.0 >= 3 => {
+                bytes.extend_from_slice(b"NORN_BFT_V3_PRECOMMIT")
+            }
             VoteStep::Prevote => bytes.extend_from_slice(b"NORN_BFT_V2_PREVOTE"),
             VoteStep::Precommit => bytes.extend_from_slice(b"NORN_BFT_V2_PRECOMMIT"),
         }
@@ -128,7 +138,11 @@ impl CommitCertificate {
     /// cannot produce a different state hash.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(128 + self.precommits.len() * 256);
-        bytes.extend_from_slice(b"NORN_COMMIT_CERTIFICATE_V2");
+        if self.protocol_version.0 >= 3 {
+            bytes.extend_from_slice(b"NORN_COMMIT_CERTIFICATE_V3");
+        } else {
+            bytes.extend_from_slice(b"NORN_COMMIT_CERTIFICATE_V2");
+        }
         bytes.extend_from_slice(&self.protocol_version.0.to_be_bytes());
         bytes.extend_from_slice(&self.chain_id.0 .0);
         bytes.extend_from_slice(&self.epoch.to_be_bytes());
@@ -169,6 +183,7 @@ pub enum ConsensusMessage {
     /// after a restart or while the original proposal was not observed.
     BlockRequest {
         height: u64,
+        round: u32,
         block_id: BlockId,
     },
     /// Response to BlockRequest. The proposal is carried as well as the block
@@ -364,7 +379,11 @@ impl ConsensusEnvelope {
                     validate_prevote_certificate(certificate, proposal, limits)?;
                 }
             }
-            ConsensusMessage::BlockRequest { height, block_id } => {
+            ConsensusMessage::BlockRequest {
+                height,
+                round: _,
+                block_id,
+            } => {
                 if *height == 0 || *block_id == BlockId(Hash::default()) {
                     return Err(protocol_error(
                         "V2 block request has an invalid height or block ID",
@@ -747,6 +766,13 @@ fn validate_proposal_block_round(
     if block_builder.0 == [0u8; 32] {
         return Err(protocol_error("proposal block builder must be non-zero"));
     }
+    if proposal.protocol_version.0 < 3
+        && (proposal.valid_round.is_some() || proposal.valid_round_certificate.is_some())
+    {
+        return Err(protocol_error(
+            "valid-round re-proposals require the active V3 protocol",
+        ));
+    }
     match (
         proposal.valid_round,
         proposal.valid_round_certificate.as_ref(),
@@ -783,8 +809,8 @@ mod wire_validation_tests {
 
     fn context() -> ChainContext {
         ChainContext::new(
-            2,
-            ProtocolVersion(2),
+            3,
+            ProtocolVersion(3),
             ChainId(Hash([3u8; 32])),
             Hash([4u8; 32]),
         )
@@ -1183,19 +1209,46 @@ impl CanonicalFinalizedTip {
 
 impl FinalizedConsensusState {
     pub fn from_v2(
+        proposal: &Proposal,
         block: &BlockV2,
         commit: &CommitCertificate,
         next_randomness: Hash,
     ) -> Result<Self> {
         if block.header.height < 0
             || block.header.block_hash == Hash::default()
+            || proposal.height != block.header.height as u64
+            || proposal.block_id != BlockId(block.header.block_hash)
             || commit.block_id != BlockId(block.header.block_hash)
+            || commit.height != proposal.height
             || commit.height != block.header.height as u64
+            || commit.round != proposal.round
             || commit.protocol_version != block.header.protocol_version
+            || proposal.protocol_version != block.header.protocol_version
             || commit.chain_id != block.header.chain_id
+            || proposal.chain_id != block.header.chain_id
             || commit.epoch != block.header.epoch
-            || commit.round != block.header.round
+            || proposal.epoch != block.header.epoch
             || commit.stake_snapshot_hash != block.header.stake_snapshot_hash
+            || proposal.stake_snapshot_hash != block.header.stake_snapshot_hash
+            || proposal.parent_block_hash != block.header.prev_block_hash
+            || (proposal.protocol_version.0 < 3
+                && (proposal.valid_round.is_some() || proposal.valid_round_certificate.is_some()))
+            || match (
+                proposal.valid_round,
+                proposal.valid_round_certificate.as_ref(),
+            ) {
+                (None, None) => {
+                    proposal.proposer != block.header.block_builder
+                        || proposal.round != block.header.round
+                }
+                (Some(valid_round), Some(certificate)) => {
+                    valid_round >= proposal.round
+                        || certificate.round != valid_round
+                        || certificate.block_id != proposal.block_id
+                        || block.header.round != valid_round
+                }
+                _ => true,
+            }
         {
             return Err(NornError::ConsensusError(
                 "Finalized consensus state does not match block/certificate".into(),
@@ -1776,5 +1829,75 @@ mod finalized_consensus_state_tests {
         let first_hash = first.certificate_hash();
         first.precommits.reverse();
         assert_eq!(first_hash, first.certificate_hash());
+    }
+
+    #[test]
+    fn finalized_state_accepts_valid_round_reproposal_certificate_round() {
+        let protocol_version = ProtocolVersion(3);
+        let chain_id = ChainId(Hash([1; 32]));
+        let block_id = BlockId(Hash([9; 32]));
+        let snapshot_hash = StakeSnapshotHash([8; 32]);
+        let block = BlockV2 {
+            header: crate::types::BlockHeader {
+                protocol_version,
+                chain_id,
+                height: 1,
+                epoch: 1,
+                round: 0,
+                timestamp: 1,
+                prev_block_hash: Hash([7; 32]),
+                block_hash: block_id.0,
+                merkle_root: Hash::default(),
+                state_root: Hash([6; 32]),
+                block_builder: ValidatorId([1; 32]),
+                stake_snapshot_hash: snapshot_hash,
+                parent_randomness: Hash([5; 32]),
+                gas_limit: 1,
+                base_fee: 1,
+                consensus_data_hash: Hash([4; 32]),
+            },
+            transactions: Vec::new(),
+        };
+        let valid_round_certificate = PrevoteCertificate {
+            protocol_version,
+            chain_id,
+            epoch: 1,
+            height: 1,
+            round: 0,
+            block_id,
+            stake_snapshot_hash: snapshot_hash,
+            prevotes: Vec::new(),
+        };
+        let proposal = Proposal {
+            protocol_version,
+            chain_id,
+            epoch: 1,
+            height: 1,
+            round: 1,
+            valid_round: Some(0),
+            valid_round_certificate: Some(valid_round_certificate),
+            block_id,
+            parent_block_hash: Hash([7; 32]),
+            stake_snapshot_hash: snapshot_hash,
+            proposer: ValidatorId([2; 32]),
+            vrf_preout: [1; 32],
+            vrf_proof: [2; 64],
+            signature: [3; 64],
+        };
+        let commit = CommitCertificate {
+            protocol_version,
+            chain_id,
+            epoch: 1,
+            height: 1,
+            round: 1,
+            block_id,
+            stake_snapshot_hash: snapshot_hash,
+            precommits: Vec::new(),
+        };
+
+        let finalized =
+            FinalizedConsensusState::from_v2(&proposal, &block, &commit, Hash([3; 32])).unwrap();
+        assert_eq!(finalized.height, 1);
+        assert_eq!(finalized.commit_certificate_hash, commit.certificate_hash());
     }
 }

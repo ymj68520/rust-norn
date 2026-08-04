@@ -179,7 +179,7 @@ impl FinalityContext {
             } else {
                 if !self
                     .consensus
-                    .pin_v2_candidate_for_finality(commit.height, commit.block_id)
+                    .pin_v2_candidate_for_finality(commit.height, commit.round, commit.block_id)
                     .await
                 {
                     return Err(anyhow!(
@@ -447,8 +447,9 @@ pub struct NornNode {
     consensus: Arc<PoVFEngine>,
     consensus_driver: ConsensusDriver,
     finality_store: Arc<FinalityStore>,
-    pending_commits:
-        Arc<tokio::sync::Mutex<HashMap<(u64, norn_common::types::BlockId), CommitCertificate>>>,
+    pending_commits: Arc<
+        tokio::sync::Mutex<HashMap<(u64, u32, norn_common::types::BlockId), CommitCertificate>>,
+    >,
 
     /// Block producer
     block_producer: Option<Arc<BlockProducer>>,
@@ -486,8 +487,9 @@ struct NodeConsensusActionExecutor {
     code_storage: Arc<CodeStorage>,
     finality_context: Arc<FinalityContext>,
     network: Arc<NetworkService>,
-    pending_commits:
-        Arc<tokio::sync::Mutex<HashMap<(u64, norn_common::types::BlockId), CommitCertificate>>>,
+    pending_commits: Arc<
+        tokio::sync::Mutex<HashMap<(u64, u32, norn_common::types::BlockId), CommitCertificate>>,
+    >,
     verification_slots: Arc<tokio::sync::Semaphore>,
 }
 
@@ -685,7 +687,11 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                 tokio::spawn(async move {
                     let _permit = permit;
                     let result = if let Some((_, block)) = consensus
-                        .get_validated_candidate(commit.height, commit.block_id)
+                        .get_validated_candidate_for_commit(
+                            commit.height,
+                            commit.round,
+                            commit.block_id,
+                        )
                         .await
                     {
                         let snapshot = consensus.state_machine.read().await.snapshot.clone();
@@ -719,7 +725,11 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                 });
             }
             ConsensusDriverAction::ApplyValidatedProposal { candidate, .. } => {
-                let candidate_key = (candidate.proposal.height, candidate.proposal.block_id);
+                let candidate_key = (
+                    candidate.proposal.height,
+                    candidate.proposal.round,
+                    candidate.proposal.block_id,
+                );
                 let proposal = candidate.proposal.clone();
                 let block = candidate.block.clone();
                 let proposal_height = proposal.height;
@@ -1065,10 +1075,14 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                     })?;
             }
             ConsensusDriverAction::CancelTimeout(_) => {}
-            ConsensusDriverAction::UnpinPendingFinality { height, block_id } => {
+            ConsensusDriverAction::UnpinPendingFinality {
+                height,
+                round,
+                block_id,
+            } => {
                 if !self
                     .consensus
-                    .unpin_v2_candidate_for_finality(height, block_id)
+                    .unpin_v2_candidate_for_finality(height, round, block_id)
                     .await
                 {
                     warn!(
@@ -1689,13 +1703,22 @@ impl NornNode {
         Ok(())
     }
 
-    async fn request_v2_block(&self, height: u64, block_id: norn_common::types::BlockId) {
+    async fn request_v2_block(
+        &self,
+        height: u64,
+        round: u32,
+        block_id: norn_common::types::BlockId,
+    ) {
         let envelope = ConsensusEnvelope {
             wire_version: self.chain_context.wire_version,
             protocol_version: self.chain_context.protocol_version,
             chain_id: self.chain_context.chain_id,
             genesis_hash: self.chain_context.genesis_hash,
-            payload: ConsensusMessage::BlockRequest { height, block_id },
+            payload: ConsensusMessage::BlockRequest {
+                height,
+                round,
+                block_id,
+            },
         };
         match bincode::serialize(&envelope) {
             Ok(bytes) => {
@@ -1797,11 +1820,12 @@ impl NornNode {
     async fn respond_to_v2_block_request(
         &self,
         height: u64,
+        round: u32,
         block_id: norn_common::types::BlockId,
     ) {
         if let Some((proposal, block)) = self
             .consensus
-            .get_validated_candidate(height, block_id)
+            .get_validated_candidate_for_commit(height, round, block_id)
             .await
         {
             info!(
@@ -1816,7 +1840,9 @@ impl NornNode {
         // The finality record remains an authoritative source for a missed
         // proposal, including its VRF proof and proposal context.
         match self.finality_store.recover_finalized_v2(height).await {
-            Ok(Some(finalized)) if finalized.commit.block_id == block_id => {
+            Ok(Some(finalized))
+                if finalized.commit.block_id == block_id && finalized.commit.round == round =>
+            {
                 info!(
                     "Responding to V2 block request at height {} from durable finality",
                     height
@@ -1936,9 +1962,9 @@ impl NornNode {
                                                     break;
                                                 }
                                 }
-                                             ConsensusMessage::BlockRequest { height, block_id } => {
-                                                 info!("Received V2 block request at height {}", height);
-                                                 self.respond_to_v2_block_request(height, block_id).await;
+                                             ConsensusMessage::BlockRequest { height, round, block_id } => {
+                                                 info!("Received V2 block request at height {} round {}", height, round);
+                                                 self.respond_to_v2_block_request(height, round, block_id).await;
                                              }
                                              ConsensusMessage::BlockResponse { proposal, block } => {
                                                   info!("Received V2 block response at height {}", proposal.height);
@@ -1964,7 +1990,7 @@ impl NornNode {
                                                       .lock()
                                                       .await
                                                       .insert(
-                                                          (height, finalized.commit.block_id),
+                                                        (height, finalized.commit.round, finalized.commit.block_id),
                                                           finalized.commit,
                                                       );
                                                   if let Err(error) = self
@@ -1997,8 +2023,9 @@ impl NornNode {
                                               ConsensusMessage::Commit(commit_cert) => {
                                                   let candidate_available = self
                                                       .consensus
-                                                      .get_validated_candidate(
+                                                      .get_validated_candidate_for_commit(
                                                          commit_cert.height,
+                                                         commit_cert.round,
                                                          commit_cert.block_id,
                                                      )
                                                      .await
@@ -2012,12 +2039,13 @@ impl NornNode {
                                                      .is_some();
                                                   if !candidate_available && !already_durable {
                                                       self.pending_commits.lock().await.insert(
-                                                          (commit_cert.height, commit_cert.block_id),
+                                                          (commit_cert.height, commit_cert.round, commit_cert.block_id),
                                                           commit_cert.clone(),
                                                       );
-                                                      self.request_v2_block(
-                                                          commit_cert.height,
-                                                          commit_cert.block_id,
+                                                     self.request_v2_block(
+                                                         commit_cert.height,
+                                                         commit_cert.round,
+                                                         commit_cert.block_id,
                                                      )
                                                      .await;
                                                      info!(
