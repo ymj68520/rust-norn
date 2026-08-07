@@ -54,6 +54,12 @@ pub struct NodeConfig {
     #[serde(default)]
     pub genesis_path: Option<String>,
 
+    /// Dev/test-only grace period before the first consensus round. This lets
+    /// a fresh validator set form its authenticated mesh (and test fixtures
+    /// finish deterministic pre-funding) before it can sign a vote.
+    #[serde(default)]
+    pub consensus_start_delay_ms: u64,
+
     // Enhanced features configuration
     #[serde(default)]
     pub txpool: TxPoolConfig,
@@ -184,6 +190,29 @@ mod tests {
     }
 
     #[test]
+    fn txpool_default_matches_deserialization_defaults() {
+        let config = TxPoolConfig::default();
+
+        assert!(config.enabled);
+        assert!(config.enhanced);
+        assert_eq!(config.max_size, 50_000);
+        assert_eq!(config.v2_max_txs_per_block, 8192);
+        assert_eq!(config.expiration_seconds, 3_600);
+    }
+
+    #[test]
+    fn logging_default_keeps_stdout_enabled() {
+        let config = LoggingConfig::default();
+
+        assert_eq!(config.level, "info");
+        assert_eq!(config.format, "json");
+        assert_eq!(config.outputs, vec!["stdout"]);
+        assert_eq!(config.max_file_size, 100);
+        assert_eq!(config.max_files, 10);
+        assert!(config.compress);
+    }
+
+    #[test]
     fn validator_keys_must_match_genesis_record() {
         let consensus_key = SigningKey::from_slice(&[7u8; 32]).unwrap();
         let vrf_key = VRFKeyPair::from_seed(b"stage-one-validator");
@@ -292,6 +321,7 @@ mod tests {
                 network_mode: NetworkMode::Devnet,
                 node_role: NodeRole::FullNode,
                 genesis_path: None,
+                consensus_start_delay_ms: 0,
                 txpool: TxPoolConfig::default(),
                 sync: SyncConfig::default(),
                 monitoring: MonitoringConfig::default(),
@@ -302,7 +332,7 @@ mod tests {
 }
 
 /// Transaction pool configuration
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct TxPoolConfig {
     /// Enable enhanced transaction pool
     #[serde(default = "default_txpool_enabled")]
@@ -316,9 +346,28 @@ pub struct TxPoolConfig {
     #[serde(default = "default_txpool_max_size")]
     pub max_size: usize,
 
+    /// Local V2 proposal execution cap. This is intentionally separate from
+    /// the protocol maximum and from the verification work queue so ARM
+    /// validators can apply bounded backpressure without rejecting a short
+    /// burst at the RPC boundary.
+    #[serde(default = "default_txpool_v2_max_txs_per_block")]
+    pub v2_max_txs_per_block: usize,
+
     /// Transaction expiration time in seconds
     #[serde(default = "default_txpool_expiration")]
     pub expiration_seconds: i64,
+}
+
+impl Default for TxPoolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_txpool_enabled(),
+            enhanced: default_txpool_enhanced(),
+            max_size: default_txpool_max_size(),
+            v2_max_txs_per_block: default_txpool_v2_max_txs_per_block(),
+            expiration_seconds: default_txpool_expiration(),
+        }
+    }
 }
 
 /// Sync configuration
@@ -362,7 +411,7 @@ pub struct MonitoringConfig {
 }
 
 /// Logging configuration (simplified for TOML deserialization)
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct LoggingConfig {
     /// Log level: trace, debug, info, warn, error
     #[serde(default = "default_logging_level")]
@@ -373,7 +422,7 @@ pub struct LoggingConfig {
     pub format: String,
 
     /// Log outputs: "stdout", "file", or both
-    #[serde(default)]
+    #[serde(default = "default_logging_outputs")]
     pub outputs: Vec<String>,
 
     /// Log file path (if file output is enabled)
@@ -391,6 +440,20 @@ pub struct LoggingConfig {
     /// Compress old log files
     #[serde(default = "default_logging_compress")]
     pub compress: bool,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_logging_level(),
+            format: default_logging_format(),
+            outputs: default_logging_outputs(),
+            file_path: None,
+            max_file_size: default_logging_max_file_size(),
+            max_files: default_logging_max_files(),
+            compress: default_logging_compress(),
+        }
+    }
 }
 
 // Convert from config::LoggingConfig to logging::LoggingConfig
@@ -433,7 +496,12 @@ fn default_txpool_enhanced() -> bool {
     true
 }
 fn default_txpool_max_size() -> usize {
-    10000
+    50000
+}
+fn default_txpool_v2_max_txs_per_block() -> usize {
+    // Keep the local cap aligned with the default Genesis transaction limit.
+    // Byte and gas ceilings still bound the actual proposal size.
+    8192
 }
 fn default_txpool_expiration() -> i64 {
     3600
@@ -470,6 +538,9 @@ fn default_logging_level() -> String {
 }
 fn default_logging_format() -> String {
     "json".to_string()
+}
+fn default_logging_outputs() -> Vec<String> {
+    vec!["stdout".to_string()]
 }
 fn default_logging_max_file_size() -> u64 {
     100

@@ -13,10 +13,13 @@ use crate::server::BlockchainRpcImpl;
 use jsonrpsee::server::Server as JsonRpcServer;
 use norn_core::blockchain::Blockchain;
 use norn_core::evm::{EVMConfig, EVMExecutor};
+use norn_core::finality::FinalityStore;
 use norn_core::state::AccountStateManager;
 use norn_core::txpool::TxPool;
+use norn_network::NetworkCommand;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tonic::transport::Server;
 use tracing::info;
 
@@ -24,8 +27,21 @@ pub async fn start_rpc_server(
     addr: SocketAddr,
     chain: Arc<Blockchain>,
     tx_pool: Arc<TxPool>,
+    tx_pool_v2: Option<Arc<norn_core::txpool_v2::TransactionV2Pool>>,
+    finality_store: Arc<FinalityStore>,
+    transaction_broadcast: Option<mpsc::Sender<NetworkCommand>>,
 ) -> Result<(), tonic::transport::Error> {
-    let service = BlockchainRpcImpl::new(chain, tx_pool);
+    let service = if let Some(v2) = tx_pool_v2 {
+        BlockchainRpcImpl::new_with_v2_and_finality(
+            chain,
+            tx_pool,
+            v2,
+            finality_store,
+            transaction_broadcast,
+        )
+    } else {
+        BlockchainRpcImpl::new_with_finality(chain, tx_pool, finality_store)
+    };
 
     Server::builder()
         .add_service(BlockchainServiceServer::new(service))

@@ -1,8 +1,9 @@
 use crate::chain_context::{protocol_error, ChainContext};
 use crate::error::{NornError, Result};
 use crate::types::{
-    derive_chain_randomness_v4, derive_chain_randomness_v5, Block, BlockId, BlockV2, ChainId,
-    ConsensusPublicKey, Hash, ProtocolVersion, StakeSnapshotHash, ValidatorId, VrfPublicKey,
+    derive_chain_randomness_v4, derive_chain_randomness_v5, Block, BlockConsensusData, BlockHeader,
+    BlockId, BlockV2, ChainId, ConsensusPublicKey, Hash, ProtocolVersion, StakeSnapshotHash,
+    ValidatorId, VrfPublicKey,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -199,6 +200,25 @@ pub enum ConsensusMessage {
         proposal: Proposal,
         block: BlockV2,
     },
+    /// Bandwidth-efficient proposal for validators that already received the
+    /// transaction gossip. Ordered 64-bit IDs locate bodies; the header's
+    /// full Merkle root authenticates the exact reconstruction. A missing or
+    /// ambiguous body uses the existing BlockRequest fallback.
+    CompactProposalV2 {
+        proposal: Proposal,
+        header: BlockHeader,
+        consensus_data: BlockConsensusData,
+        transaction_short_ids: Vec<u64>,
+    },
+    /// Ask the proposal owner for only the bodies absent from the local
+    /// transaction relay cache. This avoids transferring and validating a
+    /// multi-megabyte full block when gossip lost only a few batches.
+    CompactTransactionRequestV2 {
+        height: u64,
+        round: u32,
+        block_id: BlockId,
+        transaction_short_ids: Vec<u64>,
+    },
     /// Request a V2 block/proposal pair needed to verify a Commit received
     /// after a restart or while the original proposal was not observed.
     BlockRequest {
@@ -239,8 +259,13 @@ pub struct ConsensusEnvelope {
 
 /// Hard wire ceilings prevent an attacker from forcing unbounded allocation
 /// before protocol-level Genesis limits are applied by later validation.
-pub const MAX_CONSENSUS_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
+/// A proposal may contain one maximum-sized block. Reserve additional space
+/// for the proposal metadata and for a worst-case finality certificate carried
+/// by sync responses, while retaining a strict pre-decode transport ceiling.
+pub const MAX_CONSENSUS_ENVELOPE_BYTES: usize =
+    crate::chain_context::MAX_BLOCK_MESSAGE_BYTES + 512 * 1024;
 pub const MAX_CONSENSUS_CERTIFICATE_VOTES: usize = 1024;
+pub const MAX_COMPACT_REPAIR_TRANSACTIONS: usize = 8192;
 
 impl ConsensusEnvelope {
     /// Validate an already decoded envelope against the local chain identity.
@@ -397,6 +422,95 @@ impl ConsensusEnvelope {
                 }
                 if let Some(certificate) = &proposal.valid_round_certificate {
                     validate_prevote_certificate(certificate, proposal, limits)?;
+                }
+            }
+            ConsensusMessage::CompactProposalV2 {
+                proposal,
+                header,
+                consensus_data,
+                transaction_short_ids,
+            } => {
+                validate_shared_context(
+                    proposal.protocol_version,
+                    proposal.chain_id,
+                    proposal.epoch,
+                    proposal.height,
+                    proposal.round,
+                    proposal.stake_snapshot_hash,
+                    self,
+                )?;
+                if proposal.block_id != BlockId(header.block_hash)
+                    || proposal.parent_block_hash != header.prev_block_hash
+                    || proposal.protocol_version != header.protocol_version
+                    || proposal.chain_id != header.chain_id
+                    || proposal.epoch != header.epoch
+                    || proposal.stake_snapshot_hash != header.stake_snapshot_hash
+                    || (proposal.valid_round.is_none() && proposal.proposer != header.block_builder)
+                    || header.height < 0
+                    || proposal.height != header.height as u64
+                {
+                    return Err(protocol_error(
+                        "compact V2 proposal and block contexts do not match",
+                    ));
+                }
+                validate_proposal_block_round(proposal, header.round, header.block_builder)?;
+                BlockV2::validate_short_compact_structure(
+                    header,
+                    consensus_data,
+                    transaction_short_ids,
+                    &ChainContext {
+                        wire_version: self.wire_version,
+                        genesis_schema_version: 0,
+                        protocol_version: self.protocol_version,
+                        chain_id: self.chain_id,
+                        genesis_hash: self.genesis_hash,
+                    },
+                    limits,
+                )?;
+                if proposal.proposer.0 == [0u8; 32]
+                    || proposal.stake_snapshot_hash.0 == [0u8; 32]
+                    || proposal.vrf_preout == [0u8; 32]
+                    || proposal.vrf_proof == [0u8; 64]
+                    || proposal.signature == [0u8; 64]
+                {
+                    return Err(protocol_error(
+                        "compact V2 proposal contains a zero identity or proof field",
+                    ));
+                }
+                if proposal.valid_round.is_some() && proposal.valid_round_certificate.is_none() {
+                    return Err(protocol_error(
+                        "compact V2 proposal valid round is missing its certificate",
+                    ));
+                }
+                if let Some(certificate) = &proposal.valid_round_certificate {
+                    validate_prevote_certificate(certificate, proposal, limits)?;
+                }
+            }
+            ConsensusMessage::CompactTransactionRequestV2 {
+                height,
+                round: _,
+                block_id,
+                transaction_short_ids,
+            } => {
+                if *height == 0
+                    || *block_id == BlockId(Hash::default())
+                    || transaction_short_ids.is_empty()
+                    || transaction_short_ids.len()
+                        > MAX_COMPACT_REPAIR_TRANSACTIONS
+                            .min(limits.max_transactions_per_block as usize)
+                {
+                    return Err(protocol_error(
+                        "compact transaction request is outside protocol bounds",
+                    ));
+                }
+                let mut unique = HashSet::with_capacity(transaction_short_ids.len());
+                if transaction_short_ids
+                    .iter()
+                    .any(|short_id| !unique.insert(*short_id))
+                {
+                    return Err(protocol_error(
+                        "compact transaction request contains duplicate short IDs",
+                    ));
                 }
             }
             ConsensusMessage::BlockRequest {
@@ -814,7 +928,9 @@ fn validate_proposal_block_round(
             if valid_round < proposal.round
                 && certificate.round == valid_round
                 && certificate.block_id == proposal.block_id
-                && block_round == valid_round => {}
+                // The block body is immutable: a later Polka can advance the
+                // valid round while the block header keeps its original round.
+                && block_round <= valid_round => {}
         _ => {
             return Err(protocol_error(
                 "proposal valid-round and block round relation is invalid",
@@ -944,6 +1060,39 @@ mod wire_validation_tests {
         };
         envelope.validate_for_context(&context).unwrap();
 
+        let compact_envelope = match &envelope.payload {
+            ConsensusMessage::ProposalV2 { proposal, block } => ConsensusEnvelope {
+                wire_version: envelope.wire_version,
+                protocol_version: envelope.protocol_version,
+                chain_id: envelope.chain_id,
+                genesis_hash: envelope.genesis_hash,
+                payload: ConsensusMessage::CompactProposalV2 {
+                    proposal: proposal.clone(),
+                    header: block.header.clone(),
+                    consensus_data: block.consensus_data.clone(),
+                    transaction_short_ids: block
+                        .transactions
+                        .iter()
+                        .map(|transaction| transaction.transaction_id.relay_short_id())
+                        .collect(),
+                },
+            },
+            _ => unreachable!(),
+        };
+        compact_envelope.validate_for_context(&context).unwrap();
+
+        let mut tampered_compact = compact_envelope;
+        if let ConsensusMessage::CompactProposalV2 {
+            transaction_short_ids,
+            ..
+        } = &mut tampered_compact.payload
+        {
+            let duplicate = transaction_short_ids.first().copied().unwrap_or(12);
+            transaction_short_ids.push(duplicate);
+            transaction_short_ids.push(duplicate);
+        }
+        assert!(tampered_compact.validate_for_context(&context).is_err());
+
         let mut valid_round_reproposal = envelope.clone();
         if let ConsensusMessage::ProposalV2 { proposal, .. } = &mut valid_round_reproposal.payload {
             proposal.proposer = ValidatorId([9u8; 32]);
@@ -972,6 +1121,21 @@ mod wire_validation_tests {
             });
         }
         assert!(valid_round_reproposal
+            .validate_for_context(&context)
+            .is_ok());
+
+        // A later Polka retains the immutable block and its original header
+        // round, while moving the certificate and re-proposal rounds forward.
+        let mut later_valid_round_reproposal = valid_round_reproposal.clone();
+        if let ConsensusMessage::ProposalV2 { proposal, .. } =
+            &mut later_valid_round_reproposal.payload
+        {
+            proposal.round = 2;
+            proposal.valid_round = Some(1);
+            proposal.valid_round_certificate.as_mut().unwrap().round = 1;
+            proposal.valid_round_certificate.as_mut().unwrap().prevotes[0].round = 1;
+        }
+        assert!(later_valid_round_reproposal
             .validate_for_context(&context)
             .is_ok());
 
@@ -1278,7 +1442,7 @@ impl FinalizedConsensusState {
                     valid_round >= proposal.round
                         || certificate.round != valid_round
                         || certificate.block_id != proposal.block_id
-                        || block.header.round != valid_round
+                        || block.header.round > valid_round
                 }
                 _ => true,
             }
@@ -1962,6 +2126,24 @@ mod finalized_consensus_state_tests {
         let finalized =
             FinalizedConsensusState::from_v2(&proposal, &block, &commit, Hash([3; 32])).unwrap();
         assert_eq!(finalized.height, 1);
+
+        let mut later_proposal = proposal.clone();
+        later_proposal.round = 2;
+        later_proposal.valid_round = Some(1);
+        later_proposal
+            .valid_round_certificate
+            .as_mut()
+            .unwrap()
+            .round = 1;
+        let mut later_commit = commit.clone();
+        later_commit.round = 2;
+        assert!(FinalizedConsensusState::from_v2(
+            &later_proposal,
+            &block,
+            &later_commit,
+            Hash([3; 32]),
+        )
+        .is_ok());
 
         let mut fresh_proposal = proposal.clone();
         fresh_proposal.round = 0;

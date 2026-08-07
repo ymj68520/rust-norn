@@ -7,8 +7,15 @@ use libp2p::{
     kad::{store::MemoryStore, Behaviour as KadBehaviour, Config as KadConfig},
     PeerId, StreamProtocol,
 };
+use norn_common::consensus_types::MAX_CONSENSUS_ENVELOPE_BYTES;
 use std::hash::Hash;
 use std::time::Duration;
+
+// libp2p-gossipsub defaults to a 64 KiB transmit ceiling, while Norn's
+// consensus envelope deliberately permits multi-transaction V2 proposals.
+// Leave room for the gossip framing and protobuf overhead while keeping the
+// transport limit aligned with the protocol's pre-decode envelope ceiling.
+const MAX_CONSENSUS_GOSSIP_BYTES: usize = MAX_CONSENSUS_ENVELOPE_BYTES + 64 * 1024;
 
 pub fn build_behaviour(
     keypair: &Keypair,
@@ -27,7 +34,9 @@ pub fn build_behaviour(
     };
 
     let gossipsub_config = gossipsub::ConfigBuilder::default()
+        .protocol_id_prefix("/norn/data")
         .heartbeat_interval(Duration::from_secs(1))
+        .max_transmit_size(MAX_CONSENSUS_GOSSIP_BYTES)
         .validation_mode(gossipsub::ValidationMode::Strict)
         .message_id_fn(message_id_fn)
         .build()
@@ -38,6 +47,20 @@ pub fn build_behaviour(
         gossipsub_config,
     )
     .expect("Correct configuration");
+
+    let control_gossipsub_config = gossipsub::ConfigBuilder::default()
+        .protocol_id_prefix("/norn/control")
+        .heartbeat_interval(Duration::from_millis(250))
+        .max_transmit_size(MAX_CONSENSUS_GOSSIP_BYTES)
+        .validation_mode(gossipsub::ValidationMode::Strict)
+        .message_id_fn(message_id_fn)
+        .build()
+        .expect("Valid control-plane config");
+    let control_gossipsub = gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(keypair.clone()),
+        control_gossipsub_config,
+    )
+    .expect("Correct control-plane configuration");
 
     // Kademlia configuration
     let store = MemoryStore::new(peer_id.clone());
@@ -71,6 +94,7 @@ pub fn build_behaviour(
     // V2 uses explicit bootstrap peers only. This keeps peer discovery
     // deterministic and avoids an unauthenticated local-discovery ingress.
     Ok(NornBehaviour {
+        control_gossipsub,
         gossipsub,
         kademlia,
         identify,

@@ -2,7 +2,8 @@ use anyhow::{anyhow, Result};
 use k256::ecdsa::signature::Signer;
 use k256::ecdsa::SigningKey;
 use norn_common::chain_context::{
-    ChainContext, PeerRole, MAX_BLOCK_MESSAGE_BYTES, MAX_TRANSACTION_MESSAGE_BYTES,
+    ChainContext, PeerRole, MAX_BLOCK_MESSAGE_BYTES, MAX_TRANSACTION_BATCH_MESSAGE_BYTES,
+    MAX_TRANSACTION_MESSAGE_BYTES,
 };
 use norn_common::consensus_types::{
     CanonicalFinalizedTip, CommitCertificate, ConsensusEnvelope, ConsensusMessage,
@@ -37,7 +38,7 @@ use crate::tx_handler::TxHandler;
 use async_trait::async_trait;
 use libp2p::identity::Keypair;
 use norn_rpc::{create_ethereum_rpc, start_ethereum_rpc_server, start_rpc_server};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::signal;
@@ -95,6 +96,7 @@ struct FinalityContext {
     consensus: Arc<PoVFEngine>,
     finality_store: Arc<FinalityStore>,
     state_manager: Arc<AccountStateManager>,
+    tx_pool_v2: Arc<TransactionV2Pool>,
     resource_limits: ProtocolResourceLimits,
     evm_executor: Arc<EVMExecutor>,
     activation_lock: Arc<tokio::sync::Mutex<()>>,
@@ -224,6 +226,8 @@ impl FinalityContext {
         // cannot observe the old height after the first activation has already
         // advanced the state machine.
         let _activation_guard = self.activation_lock.lock().await;
+        let persistence_started = std::time::Instant::now();
+        let persistence_transactions = prepared.finalized.block.transactions.len();
         let commit_status = match self
             .finality_store
             .commit_finalized_transaction_with_state_and_checkpoint_and_snapshot(
@@ -275,9 +279,11 @@ impl FinalityContext {
         }
 
         info!(
-            "Finalized V2 block {:?} at height {}; durable finality status {:?}",
+            "Finalized V2 block {:?} at height {}; transactions={}; persistence_elapsed_ms={}; durable finality status {:?}",
             prepared.finalized.block.header.block_hash,
             prepared.finalized.block.header.height,
+            persistence_transactions,
+            persistence_started.elapsed().as_millis(),
             commit_status
         );
         // A validator can miss the Commit gossip while it is reconnecting or
@@ -316,7 +322,7 @@ impl FinalityContext {
         };
         if let Err(error) = self
             .network
-            .command_tx
+            .control_tx
             .send(NetworkCommand::BroadcastConsensus(bytes))
             .await
         {
@@ -360,20 +366,13 @@ impl FinalityContext {
                 current_height
             ));
         }
-        let checkpoint = &prepared.checkpoint;
-        self.state_manager
-            .restore_canonical_state(
-                &checkpoint.accounts,
-                &checkpoint.storage,
-                checkpoint.state_root,
-            )
-            .await
-            .map_err(|error| anyhow!("failed to apply finalized canonical state: {error}"))?;
-        self.evm_executor
-            .code_storage()
-            .restore_checkpoint(&checkpoint.code)
-            .await
-            .map_err(|error| anyhow!("failed to apply finalized canonical code: {error}"))?;
+        norn_core::execution::overlay::ExecutionOverlay::apply_persisted_writes(
+            &prepared.state_write_values,
+            &self.state_manager,
+            self.evm_executor.code_storage(),
+        )
+        .await
+        .map_err(|error| anyhow!("failed to apply finalized canonical writes: {error}"))?;
         let recomputed_root = StateRootCalculator::new(false)
             .calculate_from_manager(&self.state_manager)
             .await?;
@@ -382,6 +381,16 @@ impl FinalityContext {
                 "finalized canonical state root does not match block state_root"
             ));
         }
+        self.state_manager
+            .set_verified_state_root(recomputed_root)
+            .await;
+        // Prune the complete finalized nonce frontier before advancing the
+        // consensus height. Otherwise the next proposer can race activation,
+        // package stale nonces, and spend the round producing an invalid
+        // block. The pool implementation performs one bounded scan rather
+        // than one full scan per committed transaction.
+        self.tx_pool_v2
+            .remove_committed_batch(&finalized.block.transactions);
         self.consensus
             .record_finalized_v2_after_durable(&finalized)
             .await?;
@@ -589,6 +598,9 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                 let code_storage = self.code_storage.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    let validation_height = proposal.height;
+                    let validation_transactions = block.transactions.len();
+                    let validation_started = std::time::Instant::now();
                     let result = consensus
                         .verify_proposal_v2(
                             proposal,
@@ -599,6 +611,13 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                             &code_storage,
                         )
                         .await;
+                    info!(
+                        height = validation_height,
+                        transactions = validation_transactions,
+                        elapsed_ms = validation_started.elapsed().as_millis(),
+                        accepted = result.is_ok(),
+                        "Completed V2 proposal validation"
+                    );
                     let result = match result {
                         Ok(candidate) => ProposalValidationResult::Accepted(candidate),
                         Err(error) => ProposalValidationResult::Rejected(error.to_string()),
@@ -729,29 +748,13 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                     candidate.proposal.round,
                     candidate.proposal.block_id,
                 );
-                let proposal = candidate.proposal.clone();
-                let block = candidate.block.clone();
-                let proposal_height = proposal.height;
-                let proposal_round = proposal.round;
+                let proposal_height = candidate.proposal.height;
+                let proposal_round = candidate.proposal.round;
                 if let Some(signer) = self.signer.as_ref() {
                     let vote = self
                         .consensus
                         .apply_validated_proposal_v2(candidate, signer.as_ref())
                         .await?;
-                    let envelope = ConsensusEnvelope {
-                        wire_version: self.chain_context.wire_version,
-                        protocol_version: proposal.protocol_version,
-                        chain_id: proposal.chain_id,
-                        genesis_hash: self.chain_context.genesis_hash,
-                        payload: ConsensusMessage::ProposalV2 { proposal, block },
-                    };
-                    let bytes = bincode::serialize(&envelope)
-                        .map_err(|error| anyhow!("failed to encode local V2 proposal: {error}"))?;
-                    self.network
-                        .command_tx
-                        .send(NetworkCommand::BroadcastConsensus(bytes))
-                        .await
-                        .map_err(|error| anyhow!("failed to enqueue local V2 proposal: {error}"))?;
                     if let Some(vote) = vote {
                         let (follow_up, certificate) = self
                             .consensus
@@ -1029,7 +1032,7 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                     .map_err(|error| anyhow!("failed to encode Vote: {error}"))?;
                 match self
                     .network
-                    .command_tx
+                    .control_tx
                     .try_send(NetworkCommand::BroadcastConsensus(bytes))
                 {
                     Ok(()) => {}
@@ -1064,7 +1067,7 @@ impl ConsensusActionExecutor for NodeConsensusActionExecutor {
                 let bytes = bincode::serialize(&envelope)
                     .map_err(|error| anyhow!("failed to encode Commit: {error}"))?;
                 self.network
-                    .command_tx
+                    .control_tx
                     .send(NetworkCommand::BroadcastConsensus(bytes))
                     .await
                     .map_err(|error| {
@@ -1149,9 +1152,22 @@ impl NornNode {
         .await?;
 
         let tx_pool = Arc::new(TxPool::new());
-        let tx_pool_v2 = Arc::new(TransactionV2Pool::new_with_capacity(
-            genesis_config.resource_limits.max_verification_queue as usize,
-        ));
+        let v2_pool_capacity = config.txpool.max_size.max(1);
+        let max_v2_txs_per_block = config
+            .txpool
+            .v2_max_txs_per_block
+            .max(1)
+            .min(genesis_config.resource_limits.max_transactions_per_block as usize);
+        if config.txpool.max_size == 0 || config.txpool.v2_max_txs_per_block == 0 {
+            warn!("Invalid zero V2 txpool setting; clamping pool capacity and block cap to one");
+        }
+        info!(
+            v2_pool_capacity,
+            max_v2_txs_per_block,
+            verification_queue = genesis_config.resource_limits.max_verification_queue,
+            "Configured V2 transaction admission and proposal limits independently"
+        );
+        let tx_pool_v2 = Arc::new(TransactionV2Pool::new_with_capacity(v2_pool_capacity));
 
         let (local_validator_id, signer, vrf_key_pair) = if config.node_role == NodeRole::Validator
         {
@@ -1384,6 +1400,7 @@ impl NornNode {
                     block_interval: 1,
                     max_txs_per_block: genesis_config.resource_limits.max_transactions_per_block
                         as usize,
+                    max_v2_txs_per_block,
                     max_gas_per_block: genesis_config.resource_limits.max_block_gas as i64,
                     max_block_bytes: genesis_config.resource_limits.max_block_bytes as usize,
                     max_transaction_bytes: genesis_config.resource_limits.max_transaction_bytes
@@ -1462,6 +1479,7 @@ impl NornNode {
             tx_pool_v2.clone(),
             chain_context,
             genesis_config.resource_limits.max_transaction_bytes as usize,
+            genesis_config.resource_limits.max_block_bytes as usize,
             genesis_config.resource_limits.max_verification_tasks as usize,
         ));
 
@@ -1470,6 +1488,7 @@ impl NornNode {
             consensus: consensus.clone(),
             finality_store: finality_store.clone(),
             state_manager: state_manager.clone(),
+            tx_pool_v2: tx_pool_v2.clone(),
             resource_limits: genesis_config.resource_limits.clone(),
             evm_executor: evm_executor.clone(),
             activation_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1524,26 +1543,6 @@ impl NornNode {
     pub async fn start(mut self) -> Result<()> {
         info!("Starting Norn Node...");
 
-        // All nodes start the same protocol round through the driver. This
-        // gives the proposer wait phase a real deadline even when no local
-        // proposal is produced and keeps timer ownership out of the producer.
-        let (height, round, timeout_ms) = {
-            let state = self.consensus.state_machine.read().await;
-            (
-                state.height,
-                state.round,
-                state.config.timeout_propose_ms.max(1),
-            )
-        };
-        self.consensus_driver
-            .dispatch(ConsensusDriverEvent::RoundStarted {
-                height,
-                round,
-                deadline: tokio::time::Instant::now()
-                    + std::time::Duration::from_millis(timeout_ms),
-            })
-            .await?;
-
         let rpc_addr = self.config.rpc_address;
         let eth_rpc_addr = {
             let port = rpc_addr.port() + 1000;
@@ -1552,10 +1551,22 @@ impl NornNode {
 
         let chain_ref = self.blockchain.clone();
         let tx_pool_ref = self.tx_pool.clone();
+        let tx_pool_v2_ref = self.tx_pool_v2.clone();
+        let finality_store_ref = self.finality_store.clone();
+        let transaction_broadcast = self.network.command_tx.clone();
         let rpc_addr_clone = rpc_addr;
         tokio::spawn(async move {
             info!("gRPC Server listening on {}", rpc_addr_clone);
-            if let Err(e) = start_rpc_server(rpc_addr_clone, chain_ref, tx_pool_ref).await {
+            if let Err(e) = start_rpc_server(
+                rpc_addr_clone,
+                chain_ref,
+                tx_pool_ref,
+                Some(tx_pool_v2_ref),
+                finality_store_ref,
+                Some(transaction_broadcast),
+            )
+            .await
+            {
                 error!("gRPC Server failed: {:?}", e);
             }
         });
@@ -1576,6 +1587,37 @@ impl NornNode {
         });
         info!("Ethereum JSON-RPC server started on {}", eth_rpc_addr);
 
+        if self.config.consensus_start_delay_ms > 0 {
+            info!(
+                delay_ms = self.config.consensus_start_delay_ms,
+                "Delaying first consensus round while the fresh validator mesh initializes"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(
+                self.config.consensus_start_delay_ms,
+            ))
+            .await;
+        }
+
+        // All nodes start the same protocol round through the driver. This
+        // gives the proposer wait phase a real deadline even when no local
+        // proposal is produced and keeps timer ownership out of the producer.
+        let (height, round, timeout_ms) = {
+            let state = self.consensus.state_machine.read().await;
+            (
+                state.height,
+                state.round,
+                state.config.timeout_propose_ms.max(1),
+            )
+        };
+        self.consensus_driver
+            .dispatch(ConsensusDriverEvent::RoundStarted {
+                height,
+                round,
+                deadline: tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(timeout_ms),
+            })
+            .await?;
+
         let syncer = self.syncer.clone();
         tokio::spawn(async move {
             syncer.start().await;
@@ -1587,68 +1629,137 @@ impl NornNode {
             let consensus = self.consensus.clone();
             let consensus_driver = self.consensus_driver.clone();
             let finality_store = self.finality_store.clone();
+            let network_tx = self.network.control_tx.clone();
             tokio::spawn(async move {
-                let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+                // Keep proposer hand-off latency well below a block interval.  A one-second
+                // poll was visible directly in the inter-block time on small validators,
+                // especially when leadership rotated immediately after finality.
+                let mut timer = tokio::time::interval(std::time::Duration::from_millis(100));
                 let mut produced_slot: Option<(u64, u32)> = None;
                 loop {
                     timer.tick().await;
-                    let slot = {
-                        let state_machine = consensus.state_machine.read().await;
-                        (state_machine.height, state_machine.round)
+                    let Some(slot) = producer.proposal_slot().await else {
+                        continue;
                     };
                     if produced_slot == Some(slot) {
                         continue;
                     }
-                    if producer.should_produce().await {
-                        let (proposal, block) = match finality_store
-                            .recover_pending_proposal(slot.0, slot.1)
-                            .await
-                        {
-                            Ok(Some((proposal, block))) => {
-                                info!(
-                                    "Recovering pending V2 proposal at height {} round {}",
-                                    proposal.height, proposal.round
-                                );
-                                (proposal, block)
-                            }
-                            Ok(None) => {
-                                let produced = match producer
-                                    .produce_v2_proposal(&chain_context, &resource_limits)
-                                    .await
-                                {
-                                    Ok(produced) => produced,
-                                    Err(error) => {
-                                        warn!("V2 proposal production failed: {}", error);
-                                        continue;
-                                    }
-                                };
-                                if let Err(error) = finality_store
-                                    .persist_pending_proposal(&produced.0, &produced.1)
-                                    .await
-                                {
-                                    warn!(
-                                        "V2 proposal was not durably recorded before voting: {}",
-                                        error
-                                    );
+                    let (proposal, block) = match finality_store
+                        .recover_pending_proposal(slot.0, slot.1)
+                        .await
+                    {
+                        Ok(Some((proposal, block))) => {
+                            info!(
+                                "Recovering pending V2 proposal at height {} round {}",
+                                proposal.height, proposal.round
+                            );
+                            (proposal, block)
+                        }
+                        Ok(None) => {
+                            let produced = match producer
+                                .produce_v2_proposal_for_slot(
+                                    &chain_context,
+                                    &resource_limits,
+                                    Some(slot),
+                                )
+                                .await
+                            {
+                                Ok(produced) => produced,
+                                Err(error) => {
+                                    warn!("V2 proposal production failed: {}", error);
                                     continue;
                                 }
-                                (produced.0, produced.1)
-                            }
-                            Err(error) => {
-                                warn!("Failed to recover pending V2 proposal: {}", error);
+                            };
+                            if let Err(error) = finality_store
+                                .persist_pending_proposal(&produced.0, &produced.1)
+                                .await
+                            {
+                                warn!(
+                                    "V2 proposal was not durably recorded before voting: {}",
+                                    error
+                                );
                                 continue;
                             }
-                        };
-                        produced_slot = Some(slot);
-                        if let Err(error) = consensus_driver
-                            .dispatch(ConsensusDriverEvent::LocalProposalBuilt { proposal, block })
-                            .await
-                        {
-                            warn!(
-                                "Failed to submit local V2 proposal to consensus driver: {}",
-                                error
-                            );
+                            (produced.0, produced.1)
                         }
+                        Err(error) => {
+                            warn!("Failed to recover pending V2 proposal: {}", error);
+                            continue;
+                        }
+                    };
+                    let current_slot = {
+                        let state_machine = consensus.state_machine.read().await;
+                        (state_machine.height, state_machine.round)
+                    };
+                    if current_slot != slot {
+                        info!(
+                            built_height = proposal.height,
+                            built_round = proposal.round,
+                            current_height = current_slot.0,
+                            current_round = current_slot.1,
+                            "Discarding stale local V2 proposal before persistence"
+                        );
+                        continue;
+                    }
+                    // The locally built proposal is already durably recorded
+                    // and structurally validated. Broadcast it in parallel
+                    // with this validator's pure execution check; every peer
+                    // still performs full validation before voting.
+                    let transaction_short_ids = block
+                        .transactions
+                        .iter()
+                        .map(|transaction| transaction.transaction_id.relay_short_id())
+                        .collect::<Vec<_>>();
+                    let unique_short_ids = transaction_short_ids
+                        .iter()
+                        .copied()
+                        .collect::<HashSet<_>>();
+                    let payload = if unique_short_ids.len() == transaction_short_ids.len() {
+                        ConsensusMessage::CompactProposalV2 {
+                            proposal: proposal.clone(),
+                            header: block.header.clone(),
+                            consensus_data: block.consensus_data.clone(),
+                            transaction_short_ids,
+                        }
+                    } else {
+                        warn!(
+                            "Short transaction ID collision in local proposal; broadcasting full block"
+                        );
+                        ConsensusMessage::ProposalV2 {
+                            proposal: proposal.clone(),
+                            block: block.clone(),
+                        }
+                    };
+                    let envelope = ConsensusEnvelope {
+                        wire_version: chain_context.wire_version,
+                        protocol_version: proposal.protocol_version,
+                        chain_id: proposal.chain_id,
+                        genesis_hash: chain_context.genesis_hash,
+                        payload,
+                    };
+                    let bytes = match bincode::serialize(&envelope) {
+                        Ok(bytes) => bytes,
+                        Err(error) => {
+                            warn!("Failed to encode local V2 proposal: {}", error);
+                            continue;
+                        }
+                    };
+                    if let Err(error) = network_tx
+                        .send(NetworkCommand::BroadcastConsensus(bytes))
+                        .await
+                    {
+                        warn!("Failed to enqueue local V2 proposal: {}", error);
+                        continue;
+                    }
+                    produced_slot = Some(slot);
+                    if let Err(error) = consensus_driver
+                        .dispatch(ConsensusDriverEvent::LocalProposalBuilt { proposal, block })
+                        .await
+                    {
+                        warn!(
+                            "Failed to submit local V2 proposal to consensus driver: {}",
+                            error
+                        );
                     }
                 }
             });
@@ -1732,7 +1843,7 @@ impl NornNode {
             Ok(bytes) => {
                 if let Err(error) = self
                     .network
-                    .command_tx
+                    .control_tx
                     .send(NetworkCommand::BroadcastConsensus(bytes))
                     .await
                 {
@@ -1741,6 +1852,215 @@ impl NornNode {
             }
             Err(error) => warn!("Failed to encode V2 block request: {}", error),
         }
+    }
+
+    fn dispatch_compact_v2_proposal(
+        &self,
+        proposal: norn_common::consensus_types::Proposal,
+        header: norn_common::types::BlockHeader,
+        consensus_data: norn_common::types::BlockConsensusData,
+        transaction_short_ids: Vec<u64>,
+    ) {
+        let verified_pool = self.tx_pool_v2.clone();
+        let relay_cache = self.tx_handler.relay_cache();
+        let driver = self.consensus_driver.clone();
+        let network_tx = self.network.control_tx.clone();
+        let chain_context = self.chain_context;
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let wanted = transaction_short_ids
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>();
+            let mut missing = 0usize;
+            for attempt in 0..=20u32 {
+                let verified = verified_pool.get_by_relay_short_ids(&wanted);
+                let relayed = relay_cache.get_by_relay_short_ids(&wanted);
+                let mut transactions = Vec::with_capacity(transaction_short_ids.len());
+                let mut missing_short_ids = Vec::new();
+                missing = 0;
+                for short_id in &transaction_short_ids {
+                    if let Some(transaction) =
+                        verified.get(short_id).or_else(|| relayed.get(short_id))
+                    {
+                        transactions.push(transaction.clone());
+                    } else {
+                        missing += 1;
+                        missing_short_ids.push(*short_id);
+                    }
+                }
+                if missing == 0 {
+                    let block = norn_common::types::BlockV2 {
+                        header,
+                        transactions,
+                        consensus_data,
+                    };
+                    info!(
+                        "Reconstructed compact V2 proposal height={} transactions={} elapsed_ms={}",
+                        proposal.height,
+                        block.transactions.len(),
+                        started.elapsed().as_millis()
+                    );
+                    if let Err(error) = driver
+                        .dispatch(ConsensusDriverEvent::NetworkProposal { proposal, block })
+                        .await
+                    {
+                        warn!("Failed to submit compact V2 proposal: {}", error);
+                    }
+                    return;
+                }
+                if attempt == 0
+                    && missing_short_ids.len()
+                        <= norn_common::consensus_types::MAX_COMPACT_REPAIR_TRANSACTIONS
+                {
+                    let request = ConsensusEnvelope {
+                        wire_version: chain_context.wire_version,
+                        protocol_version: chain_context.protocol_version,
+                        chain_id: chain_context.chain_id,
+                        genesis_hash: chain_context.genesis_hash,
+                        payload: ConsensusMessage::CompactTransactionRequestV2 {
+                            height: proposal.height,
+                            round: proposal.round,
+                            block_id: proposal.block_id,
+                            transaction_short_ids: missing_short_ids,
+                        },
+                    };
+                    match bincode::serialize(&request) {
+                        Ok(bytes) => {
+                            if let Err(error) = network_tx
+                                .send(NetworkCommand::BroadcastConsensus(bytes))
+                                .await
+                            {
+                                warn!("Failed to request compact transaction repair: {}", error);
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                "Failed to encode compact transaction repair request: {}",
+                                error
+                            )
+                        }
+                    }
+                }
+                if missing > norn_common::consensus_types::MAX_COMPACT_REPAIR_TRANSACTIONS {
+                    break;
+                }
+                if attempt < 20 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+
+            // Do not request a multi-megabyte full block while the active
+            // round is still exchanging votes. That fallback caused every
+            // validator holding the candidate to broadcast a full response,
+            // delaying a correct prevote by more than six seconds. A later
+            // Commit for a genuinely missing candidate still uses the normal
+            // BlockRequest recovery path.
+            warn!(
+                "Compact V2 proposal height={} still misses {} transaction bodies after repair window",
+                proposal.height, missing
+            );
+        });
+    }
+
+    async fn respond_to_compact_transaction_request(
+        &self,
+        height: u64,
+        round: u32,
+        block_id: norn_common::types::BlockId,
+        transaction_short_ids: Vec<u64>,
+    ) {
+        let candidate = if let Some(candidate) = self
+            .consensus
+            .get_validated_candidate_for_commit(height, round, block_id)
+            .await
+        {
+            Some(candidate)
+        } else {
+            match self
+                .finality_store
+                .recover_pending_proposal(height, round)
+                .await
+            {
+                Ok(Some((proposal, block))) if proposal.block_id == block_id => {
+                    Some((proposal, block))
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(
+                        "Failed to recover pending proposal for compact body repair: {}",
+                        error
+                    );
+                    None
+                }
+            }
+        };
+        let Some((proposal, block)) = candidate else {
+            return;
+        };
+        let local_validator_id = self.consensus.state_machine.read().await.local_validator_id;
+        if Some(proposal.proposer) != local_validator_id {
+            // The request is broadcast, but exactly one validator owns the
+            // proposal. Other validators stay silent to avoid N-fold response
+            // amplification on the latency-sensitive control plane.
+            return;
+        }
+
+        let wanted = transaction_short_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut found = HashMap::with_capacity(wanted.len());
+        let mut ambiguous = HashSet::new();
+        for transaction in block.transactions {
+            let short_id = transaction.transaction_id.relay_short_id();
+            if !wanted.contains(&short_id) || ambiguous.contains(&short_id) {
+                continue;
+            }
+            if found.insert(short_id, transaction).is_some() {
+                found.remove(&short_id);
+                ambiguous.insert(short_id);
+            }
+        }
+        let transactions = transaction_short_ids
+            .into_iter()
+            .filter_map(|short_id| found.remove(&short_id))
+            .collect::<Vec<_>>();
+        if transactions.is_empty() {
+            return;
+        }
+        let count = transactions.len();
+        // Keep each data-plane frame small enough for control-gossip votes to
+        // interleave on low-bandwidth Raspberry Pi Wi-Fi links.
+        const REPAIR_BATCH_TRANSACTIONS: usize = 256;
+        for chunk in transactions.chunks(REPAIR_BATCH_TRANSACTIONS) {
+            let gossip = match norn_common::types::TransactionV2Batch::encode(chunk.to_vec()) {
+                Ok(gossip) => gossip,
+                Err(error) => {
+                    warn!(
+                        "Failed to encode compact transaction repair batch: {}",
+                        error
+                    );
+                    return;
+                }
+            };
+            if let Err(error) = self
+                .network
+                .control_tx
+                .send(NetworkCommand::BroadcastTransaction(gossip))
+                .await
+            {
+                warn!(
+                    "Failed to enqueue compact transaction repair batch: {}",
+                    error
+                );
+                return;
+            }
+        }
+        info!(
+            "Responded to compact transaction repair height={} transactions={}",
+            height, count
+        );
     }
 
     async fn request_v2_finality(&self, height: u64) {
@@ -1758,7 +2078,7 @@ impl NornNode {
             Ok(bytes) => {
                 if let Err(error) = self
                     .network
-                    .command_tx
+                    .control_tx
                     .send(NetworkCommand::BroadcastConsensus(bytes))
                     .await
                 {
@@ -1788,7 +2108,7 @@ impl NornNode {
             Ok(bytes) => {
                 if let Err(error) = self
                     .network
-                    .command_tx
+                    .control_tx
                     .send(NetworkCommand::BroadcastConsensus(bytes))
                     .await
                 {
@@ -1814,7 +2134,7 @@ impl NornNode {
             Ok(bytes) => {
                 if let Err(error) = self
                     .network
-                    .command_tx
+                    .control_tx
                     .send(NetworkCommand::BroadcastConsensus(bytes))
                     .await
                 {
@@ -1925,11 +2245,23 @@ impl NornNode {
                                     self.peer_manager.handle_network_event(norn_network::service::NetworkEvent::BlockReceived(data)).await;
                                 }
                                 norn_network::service::NetworkEvent::TransactionReceived(data) => {
-                                    if data.len() > MAX_TRANSACTION_MESSAGE_BYTES {
+                                    let byte_limit = if data.starts_with(norn_common::types::TransactionV2Batch::MAGIC) {
+                                        MAX_TRANSACTION_BATCH_MESSAGE_BYTES
+                                    } else {
+                                        MAX_TRANSACTION_MESSAGE_BYTES
+                                    };
+                                    if data.len() > byte_limit {
                                         warn!("Rejected oversized transaction network message");
                                         continue;
                                     }
-                                    self.tx_handler.handle_tx_data(data).await;
+                                    // Do not await CPU-bound signature verification here. The
+                                    // handler owns a bounded worker queue; when it is full, drop
+                                    // this gossip copy rather than starving Proposal/Prevote/
+                                    // Precommit delivery. The proposer still retains accepted
+                                    // transactions and includes them in the consensus proposal.
+                                    if !self.tx_handler.try_enqueue(data) {
+                                        debug!("Dropped transaction gossip because verification queue is saturated");
+                                    }
                                 }
                                 norn_network::service::NetworkEvent::ConsensusMessageReceived(data) => {
                                     debug!(
@@ -1970,6 +2302,33 @@ impl NornNode {
                                                     break;
                                                 }
                                 }
+                                             ConsensusMessage::CompactProposalV2 {
+                                                 proposal,
+                                                 header,
+                                                 consensus_data,
+                                                 transaction_short_ids,
+                                             } => {
+                                                 self.dispatch_compact_v2_proposal(
+                                                     proposal,
+                                                     header,
+                                                     consensus_data,
+                                                     transaction_short_ids,
+                                                 );
+                                             }
+                                             ConsensusMessage::CompactTransactionRequestV2 {
+                                                 height,
+                                                 round,
+                                                 block_id,
+                                                 transaction_short_ids,
+                                             } => {
+                                                 self.respond_to_compact_transaction_request(
+                                                     height,
+                                                     round,
+                                                     block_id,
+                                                     transaction_short_ids,
+                                                 )
+                                                 .await;
+                                             }
                                              ConsensusMessage::BlockRequest { height, round, block_id } => {
                                                  info!("Received V2 block request at height {} round {}", height, round);
                                                  self.respond_to_v2_block_request(height, round, block_id).await;

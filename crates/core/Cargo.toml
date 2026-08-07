@@ -25,6 +25,7 @@ chrono = { workspace = true }
 once_cell = "1.19"
 bincode = { workspace = true }
 futures = { workspace = true }
+zstd = "0.13"
 
 # EVM Support
 revm = { workspace = true }

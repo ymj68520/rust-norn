@@ -53,6 +53,10 @@ pub struct NetworkAuthConfig {
 }
 
 pub struct NetworkService {
+    /// Priority control path for consensus messages. It is intentionally
+    /// separate from transaction gossip so RPC bursts cannot queue proposals
+    /// and votes behind hundreds of bulk broadcasts.
+    pub control_tx: mpsc::Sender<NetworkCommand>,
     pub command_tx: mpsc::Sender<NetworkCommand>,
     pub event_rx: mpsc::Receiver<NetworkEvent>,
     pub local_peer_id: PeerId,
@@ -137,11 +141,20 @@ impl NetworkService {
 
         swarm.listen_on(config.listen_address.parse()?)?;
 
+        let (control_tx, control_rx) = mpsc::channel(256);
         let (command_tx, command_rx) = mpsc::channel(100);
-        let (event_tx, event_rx) = mpsc::channel(100);
+        // Transaction gossip is delivered in bounded batches and uses
+        // `try_send` so an abusive peer can never block the swarm.  A depth
+        // of 100, however, dropped legitimate bursts before the node's cheap
+        // relay-cache handoff could drain them, leaving compact proposals
+        // short of hundreds of bodies.  Keep a finite queue, but size it for
+        // one maximum benchmark/pool burst. Consensus transport remains on
+        // its separate priority behaviour and command channel.
+        let (event_tx, event_rx) = mpsc::channel(4096);
 
         let event_loop = EventLoop::new_with_context_and_auth(
             swarm,
+            control_rx,
             command_rx,
             event_tx,
             context,
@@ -154,6 +167,7 @@ impl NetworkService {
         tokio::spawn(event_loop.run());
 
         Ok(Self {
+            control_tx,
             command_tx,
             event_rx,
             local_peer_id,

@@ -1,7 +1,7 @@
-use norn_storage::SledDB;
 use norn_common::traits::DBInterface;
-use norn_crypto::transaction::TransactionSigner;
 use norn_common::types::{Address, Transaction};
+use norn_crypto::transaction::TransactionSigner;
+use norn_storage::SledDB;
 use std::time::Instant;
 use tokio;
 
@@ -57,12 +57,19 @@ async fn test_transaction_simulation() -> Result<(), Box<dyn std::error::Error>>
         )?;
 
         let tx_hash = tx.body.hash;
-        tx_hashes.push((tx_hash, format!("test_key_{}", i).into_bytes(), format!("test_value_{}", i).into_bytes()));
+        tx_hashes.push((
+            tx_hash,
+            format!("test_key_{}", i).into_bytes(),
+            format!("test_value_{}", i).into_bytes(),
+        ));
         transactions.push(tx);
     }
 
     let generation_time = start.elapsed();
-    println!("   ✅ Transaction generation: {} tx in {:?}", num_transactions, generation_time);
+    println!(
+        "   ✅ Transaction generation: {} tx in {:?}",
+        num_transactions, generation_time
+    );
 
     // Store transactions in database
     println!("   Storing transactions in database...");
@@ -79,8 +86,14 @@ async fn test_transaction_simulation() -> Result<(), Box<dyn std::error::Error>>
     }
 
     let storage_time = start.elapsed();
-    println!("   ✅ Transaction storage: {} tx in {:?}", num_transactions, storage_time);
-    println!("   ✅ Storage throughput: {:.0} tx/sec", num_transactions as f64 / storage_time.as_secs_f64());
+    println!(
+        "   ✅ Transaction storage: {} tx in {:?}",
+        num_transactions, storage_time
+    );
+    println!(
+        "   ✅ Storage throughput: {:.0} tx/sec",
+        num_transactions as f64 / storage_time.as_secs_f64()
+    );
 
     // Verify some transactions
     println!("   Verifying stored transactions...");
@@ -99,7 +112,10 @@ async fn test_transaction_simulation() -> Result<(), Box<dyn std::error::Error>>
     }
 
     let verify_time = start.elapsed();
-    println!("   ✅ Transaction verification: {} tx in {:?}", verify_count, verify_time);
+    println!(
+        "   ✅ Transaction verification: {} tx in {:?}",
+        verify_count, verify_time
+    );
 
     Ok(())
 }
@@ -125,8 +141,14 @@ async fn test_database_growth() -> Result<(), Box<dyn std::error::Error>> {
         let insert_time = start.elapsed();
         let total_bytes = (size * records_per_size) as f64 / 1024.0 / 1024.0; // MB
 
-        println!("     ✅ {} records ({:.1} MB) in {:?}", records_per_size, total_bytes, insert_time);
-        println!("     ✅ Write throughput: {:.1} MB/sec", total_bytes / insert_time.as_secs_f64());
+        println!(
+            "     ✅ {} records ({:.1} MB) in {:?}",
+            records_per_size, total_bytes, insert_time
+        );
+        println!(
+            "     ✅ Write throughput: {:.1} MB/sec",
+            total_bytes / insert_time.as_secs_f64()
+        );
 
         // Read back some records
         let start = Instant::now();
@@ -150,7 +172,10 @@ async fn test_concurrent_access() -> Result<(), Box<dyn std::error::Error>> {
     let operations_per_task = 1000;
     let mut handles = Vec::new();
 
-    println!("   Starting {} concurrent tasks with {} operations each...", num_tasks, operations_per_task);
+    println!(
+        "   Starting {} concurrent tasks with {} operations each...",
+        num_tasks, operations_per_task
+    );
     let start = Instant::now();
 
     for task_id in 0..num_tasks {
@@ -161,7 +186,10 @@ async fn test_concurrent_access() -> Result<(), Box<dyn std::error::Error>> {
                 let value = format!("task_{}_value_{}", task_id, i);
 
                 // Insert
-                db_clone.insert(key.as_bytes(), value.as_bytes()).await.unwrap();
+                db_clone
+                    .insert(key.as_bytes(), value.as_bytes())
+                    .await
+                    .unwrap();
 
                 // Read back
                 let stored_value = db_clone.get(key.as_bytes()).await.unwrap();
@@ -178,8 +206,14 @@ async fn test_concurrent_access() -> Result<(), Box<dyn std::error::Error>> {
 
     let total_time = start.elapsed();
     let total_operations = (num_tasks * operations_per_task) as f64;
-    println!("   ✅ Concurrent operations: {} operations in {:?}", total_operations as u64, total_time);
-    println!("   ✅ Concurrent throughput: {:.0} ops/sec", total_operations / total_time.as_secs_f64());
+    println!(
+        "   ✅ Concurrent operations: {} operations in {:?}",
+        total_operations as u64, total_time
+    );
+    println!(
+        "   ✅ Concurrent throughput: {:.0} ops/sec",
+        total_operations / total_time.as_secs_f64()
+    );
 
     Ok(())
 }
@@ -212,10 +246,18 @@ async fn test_data_persistence() -> Result<(), Box<dyn std::error::Error>> {
 
     for (key, expected_value) in &test_data {
         let stored_value = db.get(key.as_bytes()).await?;
-        assert_eq!(stored_value, Some(expected_value.as_bytes().to_vec()), "Key {} should persist", key);
+        assert_eq!(
+            stored_value,
+            Some(expected_value.as_bytes().to_vec()),
+            "Key {} should persist",
+            key
+        );
     }
 
-    println!("   ✅ All {} records successfully persisted and retrieved", test_data.len());
+    println!(
+        "   ✅ All {} records successfully persisted and retrieved",
+        test_data.len()
+    );
 
     // Phase 3: Update and verify persistence
     println!("   Phase 3: Testing update persistence...");
@@ -231,7 +273,12 @@ async fn test_data_persistence() -> Result<(), Box<dyn std::error::Error>> {
     for (key, _) in &test_data {
         let stored_value = db.get(key.as_bytes()).await?;
         let expected_value = format!("{}_updated", key);
-        assert_eq!(stored_value, Some(expected_value.as_bytes().to_vec()), "Updated key {} should persist", key);
+        assert_eq!(
+            stored_value,
+            Some(expected_value.as_bytes().to_vec()),
+            "Updated key {} should persist",
+            key
+        );
     }
 
     println!("   ✅ All updates successfully persisted and retrieved");

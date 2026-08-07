@@ -79,6 +79,10 @@ pub const MAX_HANDSHAKE_BYTES: usize = 1024;
 /// these bounds.
 pub const MAX_BLOCK_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_TRANSACTION_MESSAGE_BYTES: usize = 256 * 1024;
+/// A transaction batch is a block-sized replication optimization. Each
+/// transaction remains subject to `MAX_TRANSACTION_MESSAGE_BYTES`, while the
+/// aggregate is bounded like a block before any batch decoding occurs.
+pub const MAX_TRANSACTION_BATCH_MESSAGE_BYTES: usize = MAX_BLOCK_MESSAGE_BYTES;
 
 impl NetworkHandshake {
     pub fn new(context: ChainContext, peer_role: PeerRole) -> Self {

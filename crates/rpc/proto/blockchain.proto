@@ -88,6 +88,22 @@ message SendTransactionWithDataResp {
   string tx_hash = 1;
 }
 
+message SendTransactionV2Req {
+  bytes transaction = 1;
+}
+
+message SendTransactionV2Resp {
+  string tx_hash = 1;
+}
+
+message SendTransactionsV2Req {
+  repeated bytes transactions = 1;
+}
+
+message SendTransactionsV2Resp {
+  repeated string tx_hashes = 1;
+}
+
 service BlockchainService {
   rpc GetBlockNumber(Empty) returns (BlockNumberResp);
   rpc GetBlockByHash(GetBlockReq) returns (GetBlockResp);
@@ -98,4 +114,6 @@ service BlockchainService {
   rpc ReadContractAddress(ReadContractAddressReq) returns (ReadContractAddressResp);
   rpc SendTransaction(SendTransactionReq) returns (SendTransactionResp);
   rpc SendTransactionWithData(SendTransactionWithDataReq) returns (SendTransactionWithDataResp);
+  rpc SendTransactionV2(SendTransactionV2Req) returns (SendTransactionV2Resp);
+  rpc SendTransactionsV2(SendTransactionsV2Req) returns (SendTransactionsV2Resp);
 }

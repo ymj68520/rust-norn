@@ -1,5 +1,5 @@
-use norn_storage::SledDB;
 use norn_common::traits::DBInterface;
+use norn_storage::SledDB;
 use std::time::Instant;
 use tokio;
 
@@ -107,7 +107,10 @@ async fn test_batch_operations() -> Result<(), Box<dyn std::error::Error>> {
     println!("✅ Batch operations completed in {:?}", elapsed);
     println!("   - Batch insert: {} records", batch_size);
     println!("   - Batch delete: {} records", batch_size);
-    println!("   - Throughput: {:.0} ops/sec", (batch_size * 2) as f64 / elapsed.as_secs_f64());
+    println!(
+        "   - Throughput: {:.0} ops/sec",
+        (batch_size * 2) as f64 / elapsed.as_secs_f64()
+    );
 
     Ok(())
 }
@@ -138,10 +141,18 @@ async fn test_performance() -> Result<(), Box<dyn std::error::Error>> {
     let read_time = start.elapsed();
 
     println!("✅ Performance test completed:");
-    println!("   - Sequential write: {} records in {:?} ({:.0} writes/sec)",
-             test_size, write_time, test_size as f64 / write_time.as_secs_f64());
-    println!("   - Sequential read: {} records in {:?} ({:.0} reads/sec)",
-             test_size, read_time, test_size as f64 / read_time.as_secs_f64());
+    println!(
+        "   - Sequential write: {} records in {:?} ({:.0} writes/sec)",
+        test_size,
+        write_time,
+        test_size as f64 / write_time.as_secs_f64()
+    );
+    println!(
+        "   - Sequential read: {} records in {:?} ({:.0} reads/sec)",
+        test_size,
+        read_time,
+        test_size as f64 / read_time.as_secs_f64()
+    );
 
     Ok(())
 }
@@ -178,11 +189,15 @@ async fn test_large_data() -> Result<(), Box<dyn std::error::Error>> {
     let read_time = start.elapsed();
 
     println!("✅ Large data test completed:");
-    println!("   - Large value insert: {} records (10KB each) in {:?}",
-             num_large_records, insert_time);
+    println!(
+        "   - Large value insert: {} records (10KB each) in {:?}",
+        num_large_records, insert_time
+    );
     println!("   - Large value read: 10 records in {:?}", read_time);
-    println!("   - Total data stored: {:.1} MB",
-             (num_large_records * 10 * 1024) as f64 / (1024.0 * 1024.0));
+    println!(
+        "   - Total data stored: {:.1} MB",
+        (num_large_records * 10 * 1024) as f64 / (1024.0 * 1024.0)
+    );
 
     Ok(())
 }

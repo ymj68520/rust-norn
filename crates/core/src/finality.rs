@@ -7,24 +7,26 @@ use norn_common::consensus_types::{
 };
 use norn_common::genesis::ProtocolResourceLimits;
 use norn_common::traits::DBInterface;
-use norn_common::types::{Block, BlockId, BlockV2, Hash, StakeSnapshotHash, TransactionId};
+use norn_common::types::{
+    Block, BlockConsensusData, BlockHeader, BlockId, BlockV2, Hash, StakeSnapshotHash,
+    TransactionId,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::Arc;
 
 const HEIGHT_PREFIX: &[u8] = b"finality/v2/by-height/";
 const RECORD_PREFIX: &[u8] = b"finality/v2/record/";
-const BLOCK_PREFIX: &[u8] = b"finality/v2/block/";
 const CERTIFICATE_PREFIX: &[u8] = b"finality/v2/certificate/";
 const STATE_WRITE_COUNT_PREFIX: &[u8] = b"state/v2/write-count/";
 const STATE_WRITE_PREFIX: &[u8] = b"state/v2/write/";
-const TRANSACTION_PREFIX: &[u8] = b"finality/v2/transaction/";
 const TIP_KEY: &[u8] = b"finality/v2/tip";
 const LEGACY_TIP_KEY: &[u8] = b"consensus/v2/finalized-tip";
 const STATE_ROOT_KEY: &[u8] = b"state/v2/root";
 const STATE_ROOT_PREFIX: &[u8] = b"state/v2/root/";
 const STATE_CHECKPOINT_KEY: &[u8] = b"state/v2/checkpoint";
 const STATE_CHECKPOINT_PREFIX: &[u8] = b"state/v2/checkpoint/";
+const STATE_CHECKPOINT_CONTENT_PREFIX: &[u8] = b"state/v2/checkpoint-content/";
 const CONSENSUS_STATE_KEY: &[u8] = b"finality/v2/consensus-state";
 const STATE_ACCOUNT_PREFIX: &[u8] = b"state/v2/account/";
 const STATE_STORAGE_PREFIX: &[u8] = b"state/v2/storage/";
@@ -37,6 +39,13 @@ const SAFETY_BLOCK_CANDIDATE_PREFIX: &[u8] = b"consensus/v2/safety-candidate-blo
 const SAFETY_ATTEMPT_PREFIX: &[u8] = b"consensus/v2/safety-proposal-attempt/";
 const SAFETY_HEIGHT_INDEX_PREFIX: &[u8] = b"consensus/v2/safety-proposal-height-index/";
 const SAFETY_RECORD_FORMAT_VERSION: u16 = 1;
+const COMPRESSED_FINALITY_MAGIC: &[u8] = b"NORN_FINALITY_ZSTD_V1";
+const COMPRESSED_FINALITY_LENGTH_BYTES: usize = std::mem::size_of::<u64>();
+// This is a corruption/allocation guard for durable data, not a consensus
+// limit. Genesis currently caps the encoded block itself at 8 MiB, while the
+// serde representation of a complete finality record can be larger because
+// byte fields use a human-readable-compatible encoding.
+const MAX_DURABLE_FINALITY_RECORD_BYTES: usize = 64 * 1024 * 1024;
 
 /// Complete validated candidate material required to recover a durable
 /// Tendermint valid/locked reference after a process restart.  Persisting
@@ -52,7 +61,7 @@ pub struct DurableSafetyCandidate {
 /// Durable immutable block material. Proposal attempts are intentionally
 /// stored separately because the same block body may be proposed in multiple
 /// rounds with different proposer/VRF metadata.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableBlockCandidate {
     pub format_version: u16,
     pub height: u64,
@@ -60,6 +69,42 @@ pub struct DurableBlockCandidate {
     pub block: BlockV2,
     pub attempt_rounds: Vec<u32>,
     pub payload_hash: Hash,
+}
+
+/// Crash-safety only needs the immutable block commitment, not thousands of
+/// transaction bodies or IDs that are already committed by the header's
+/// Merkle root and block hash.  Keeping the durable record constant-sized is
+/// essential on SD cards: a pre-vote fsync must not grow with block traffic.
+/// The full body remains available in the bounded live candidate cache for
+/// normal finality and re-proposal and can be rehydrated by block ID after a
+/// restart.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct DurableCompactBlock {
+    header: BlockHeader,
+    consensus_data: BlockConsensusData,
+}
+
+impl DurableCompactBlock {
+    fn from_block(block: &BlockV2) -> Self {
+        Self {
+            header: block.header.clone(),
+            consensus_data: block.consensus_data.clone(),
+        }
+    }
+
+    fn matches(&self, block: &BlockV2) -> bool {
+        self.header == block.header && self.consensus_data == block.consensus_data
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct DurableBlockCandidateRecord {
+    format_version: u16,
+    height: u64,
+    block_id: BlockId,
+    block: DurableCompactBlock,
+    attempt_rounds: Vec<u32>,
+    payload_hash: Hash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -114,6 +159,7 @@ pub struct FinalityStore {
     /// Serializes durable block-record read-modify-write and finality cleanup
     /// so `attempt_rounds` cannot lose a concurrent writer's index update.
     candidate_write_lock: Arc<tokio::sync::Mutex<()>>,
+    candidate_bodies: std::sync::Mutex<std::collections::HashMap<(u64, BlockId), BlockV2>>,
 }
 
 impl FinalityStore {
@@ -129,6 +175,7 @@ impl FinalityStore {
             db,
             resource_limits,
             candidate_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            candidate_bodies: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -172,6 +219,45 @@ impl FinalityStore {
             .transpose()
     }
 
+    fn remember_candidate_body(
+        &self,
+        height: u64,
+        block_id: BlockId,
+        block: &BlockV2,
+    ) -> Result<()> {
+        let mut bodies = self
+            .candidate_bodies
+            .lock()
+            .map_err(|_| anyhow!("candidate body cache lock is poisoned"))?;
+        if let Some(existing) = bodies.get(&(height, block_id)) {
+            if existing != block {
+                bail!("candidate body conflicts with the immutable block ID");
+            }
+        } else {
+            bodies.insert((height, block_id), block.clone());
+        }
+        Ok(())
+    }
+
+    fn candidate_body(
+        &self,
+        height: u64,
+        block_id: BlockId,
+        compact: &DurableCompactBlock,
+    ) -> Result<Option<BlockV2>> {
+        let bodies = self
+            .candidate_bodies
+            .lock()
+            .map_err(|_| anyhow!("candidate body cache lock is poisoned"))?;
+        let Some(block) = bodies.get(&(height, block_id)) else {
+            return Ok(None);
+        };
+        if !compact.matches(block) {
+            bail!("candidate body does not match its durable compact commitment");
+        }
+        Ok(Some(block.clone()))
+    }
+
     /// Persist the exact V2 proposal/block pair before its local vote is
     /// signed. This lets a restarted validator recover the proposal that its
     /// safety WAL already authorized instead of constructing a different block
@@ -198,16 +284,20 @@ impl FinalityStore {
                     valid_round >= proposal.round
                         || certificate.round != valid_round
                         || certificate.block_id != proposal.block_id
-                        || block.header.round != valid_round
+                        || block.header.round > valid_round
                 }
                 _ => true,
             }
         {
             bail!("pending V2 proposal does not match its block identity");
         }
+        self.remember_candidate_body(proposal.height, proposal.block_id, block)?;
         let key = pending_proposal_key(proposal.height, proposal.round);
         self.db
-            .batch_insert(&[key], &[encode(&(proposal, block))?])
+            .batch_insert(
+                &[key],
+                &[encode(&(proposal, DurableCompactBlock::from_block(block)))?],
+            )
             .await
     }
 
@@ -216,11 +306,15 @@ impl FinalityStore {
         height: u64,
         round: u32,
     ) -> Result<Option<(Proposal, BlockV2)>> {
-        self.db
-            .get(&pending_proposal_key(height, round))
-            .await?
-            .map(|bytes| decode(&bytes, "pending V2 proposal"))
-            .transpose()
+        let Some(bytes) = self.db.get(&pending_proposal_key(height, round)).await? else {
+            return Ok(None);
+        };
+        let (proposal, compact): (Proposal, DurableCompactBlock) =
+            decode(&bytes, "pending V2 proposal")?;
+        let block = self
+            .candidate_body(height, proposal.block_id, &compact)?
+            .ok_or_else(|| anyhow!("pending proposal body must be rehydrated from a peer"))?;
+        Ok(Some((proposal, block)))
     }
 
     pub async fn clear_pending_proposal(&self, height: u64, round: u32) -> Result<()> {
@@ -254,13 +348,14 @@ impl FinalityStore {
                     valid_round >= proposal.round
                         || certificate.round != valid_round
                         || certificate.block_id != proposal.block_id
-                        || block.header.round != valid_round
+                        || block.header.round > valid_round
                 }
                 _ => true,
             }
         {
             bail!("safety candidate identity does not match its block");
         }
+        self.remember_candidate_body(proposal.height, proposal.block_id, block)?;
         let block_id = proposal.block_id;
         if proposal.round > self.resource_limits.max_consensus_round {
             bail!("proposal round exceeds the protocol consensus round bound");
@@ -276,21 +371,22 @@ impl FinalityStore {
         let existing_block_bytes = self.db.get(&block_key).await?;
         let existing_block_present = existing_block_bytes.is_some();
         let mut block_record = if let Some(bytes) = existing_block_bytes.as_ref() {
-            let record: DurableBlockCandidate = decode(&bytes, "durable safety block candidate")?;
+            let record: DurableBlockCandidateRecord =
+                decode(&bytes, "durable safety block candidate")?;
             validate_durable_block_candidate(&record)?;
             if record.height != proposal.height
                 || record.block_id != block_id
-                || record.block != *block
+                || !record.block.matches(block)
             {
                 bail!("durable safety block candidate conflicts with immutable block");
             }
             record
         } else {
-            DurableBlockCandidate {
+            DurableBlockCandidateRecord {
                 format_version: SAFETY_RECORD_FORMAT_VERSION,
                 height: proposal.height,
                 block_id,
-                block: block.clone(),
+                block: DurableCompactBlock::from_block(block),
                 attempt_rounds: Vec::new(),
                 payload_hash: Hash::default(),
             }
@@ -383,7 +479,7 @@ impl FinalityStore {
                     ))
                     .await?
                     .ok_or_else(|| anyhow!("durable attempt index references a missing block"))?;
-                let existing_block: DurableBlockCandidate =
+                let existing_block: DurableBlockCandidateRecord =
                     decode(&existing_block, "durable safety block candidate")?;
                 validate_durable_block_candidate(&existing_block)?;
                 durable_bytes = durable_bytes
@@ -532,6 +628,27 @@ impl FinalityStore {
         height: u64,
         block_id: BlockId,
     ) -> Result<Option<DurableBlockCandidate>> {
+        let Some(record) = self.recover_safety_block_record(height, block_id).await? else {
+            return Ok(None);
+        };
+        let block = self
+            .candidate_body(height, block_id, &record.block)?
+            .ok_or_else(|| anyhow!("durable candidate body must be rehydrated from a peer"))?;
+        Ok(Some(DurableBlockCandidate {
+            format_version: record.format_version,
+            height: record.height,
+            block_id: record.block_id,
+            block,
+            attempt_rounds: record.attempt_rounds,
+            payload_hash: record.payload_hash,
+        }))
+    }
+
+    async fn recover_safety_block_record(
+        &self,
+        height: u64,
+        block_id: BlockId,
+    ) -> Result<Option<DurableBlockCandidateRecord>> {
         let Some(bytes) = self
             .db
             .get(&safety_block_candidate_key(height, block_id))
@@ -539,7 +656,7 @@ impl FinalityStore {
         else {
             return Ok(None);
         };
-        let record: DurableBlockCandidate = decode(&bytes, "durable safety block candidate")?;
+        let record: DurableBlockCandidateRecord = decode(&bytes, "durable safety block candidate")?;
         validate_durable_block_candidate(&record)?;
         if record.height != height || record.block_id != block_id {
             bail!("durable safety block candidate key does not match payload");
@@ -555,7 +672,7 @@ impl FinalityStore {
             safety_block_candidate_key(height, block_id),
             safety_candidate_key(height, block_id),
         ];
-        if let Some(record) = self.recover_safety_block(height, block_id).await? {
+        if let Some(record) = self.recover_safety_block_record(height, block_id).await? {
             keys.extend(
                 record
                     .attempt_rounds
@@ -593,7 +710,12 @@ impl FinalityStore {
         }
         self.db
             .batch_write(&insert_keys, &insert_values, &keys)
-            .await
+            .await?;
+        self.candidate_bodies
+            .lock()
+            .map_err(|_| anyhow!("candidate body cache lock is poisoned"))?
+            .remove(&(height, block_id));
+        Ok(())
     }
 
     /// Commit a finalized block and all of its finality markers atomically.
@@ -731,7 +853,7 @@ impl FinalityStore {
             if actual_tip != expected_tip {
                 bail!("canonical finalized tip conflicts with durable finality record");
             }
-            let persisted: FinalizedBlockV2 = decode(
+            let persisted = decode_finalized_record(
                 &self
                     .db
                     .get(&record_key(finalized.block.header.block_hash))
@@ -786,29 +908,19 @@ impl FinalityStore {
             bail!("finalized block epoch regresses canonical tip epoch");
         }
 
-        for transaction_id in &transaction_ids {
-            let key = transaction_key(transaction_id);
-            if let Some(existing_bytes) = self.db.get(&key).await? {
-                let existing: FinalizeTransactionId =
-                    decode(&existing_bytes, "transaction marker")?;
-                if existing != id {
-                    bail!(
-                        "transaction {:?} is already finalized under a different transaction",
-                        transaction_id
-                    );
-                }
-                bail!("transaction marker exists without its finalized height marker");
-            }
-        }
-
         let encoded_id = encode(&id)?;
-        let encoded_finalized = encode(finalized)?;
-        let encoded_block = encode(&finalized.block)?;
+        // Transaction signatures, IDs and chain fields dominate a full block
+        // record and are highly redundant in their serde/bincode form. Sled
+        // stores values of this size as external blobs; writing the raw value
+        // caused roughly 6 MiB per 8192-transfer block and periodic multi-
+        // second blob compaction on SD cards. Level-1 zstd keeps the durable
+        // atomic record intact while materially reducing write amplification.
+        let encoded_finalized = encode_finalized_record(finalized)?;
         let encoded_certificate = encode(&finalized.commit)?;
         let encoded_consensus_state = encode(&finalized.consensus_state)?;
         let encoded_state_write_count = encode(&state_write_values.len())?;
-        let canonical_entries = if let Some(checkpoint) = checkpoint {
-            canonical_state_entries(checkpoint, state_write_values)?
+        let canonical_entries = if checkpoint.is_some() {
+            canonical_state_entries(state_write_values)?
         } else {
             Vec::new()
         };
@@ -816,7 +928,6 @@ impl FinalityStore {
         let mut keys = vec![
             height_key,
             record_key(finalized.block.header.block_hash),
-            block_key(finalized.block.header.block_hash),
             certificate_key(id.height),
             CONSENSUS_STATE_KEY.to_vec(),
             state_write_count_key(id.height),
@@ -824,7 +935,6 @@ impl FinalityStore {
         let mut values = vec![
             encoded_id.clone(),
             encoded_finalized,
-            encoded_block,
             encoded_certificate,
             encoded_consensus_state,
             encoded_state_write_count,
@@ -833,23 +943,31 @@ impl FinalityStore {
             keys.push(state_write_key(id.height, index));
             values.push(value.clone());
         }
-        for transaction_id in &transaction_ids {
-            keys.push(transaction_key(transaction_id));
-            values.push(encoded_id.clone());
-        }
         for (key, value) in canonical_entries {
             keys.push(key);
             values.push(value);
         }
         if let Some(checkpoint) = checkpoint {
+            let encoded_checkpoint = encode(checkpoint)?;
+            let checkpoint_content_key = checkpoint_content_key(&checkpoint.state_root);
+            match self.db.get(&checkpoint_content_key).await? {
+                Some(existing) if existing != encoded_checkpoint => {
+                    bail!("canonical checkpoint content conflicts with its state root")
+                }
+                Some(_) => {}
+                None => {
+                    keys.push(checkpoint_content_key);
+                    values.push(encoded_checkpoint);
+                }
+            }
             keys.push(STATE_ROOT_KEY.to_vec());
             values.push(encode(&checkpoint.state_root)?);
             keys.push(state_root_key(id.height));
             values.push(encode(&checkpoint.state_root)?);
             keys.push(STATE_CHECKPOINT_KEY.to_vec());
-            values.push(encode(checkpoint)?);
+            values.push(encode(&checkpoint.state_root)?);
             keys.push(checkpoint_key(id.height));
-            values.push(encode(checkpoint)?);
+            values.push(encode(&checkpoint.state_root)?);
         }
         if let Some(snapshot) = next_snapshot {
             keys.push(snapshot_key(snapshot.epoch));
@@ -885,7 +1003,7 @@ impl FinalityStore {
             }
             for indexed_block_id in indexed_block_ids {
                 let record = self
-                    .recover_safety_block(id.height, indexed_block_id)
+                    .recover_safety_block_record(id.height, indexed_block_id)
                     .await?
                     .ok_or_else(|| anyhow!("durable attempt index references a missing block"))?;
                 let mut indexed_rounds = index
@@ -915,6 +1033,10 @@ impl FinalityStore {
         self.db
             .batch_write(&keys, &values, &safety_delete_keys)
             .await?;
+        self.candidate_bodies
+            .lock()
+            .map_err(|_| anyhow!("candidate body cache lock is poisoned"))?
+            .retain(|(height, _), _| *height != id.height);
         Ok(FinalityCommitResult::Applied)
     }
 
@@ -1020,7 +1142,7 @@ impl FinalityStore {
         let Some(record_bytes) = self.db.get(&record_key(id.block_id.0)).await? else {
             return Ok(DurableCommitOutcome::Indeterminate);
         };
-        let persisted: FinalizedBlockV2 = match decode(&record_bytes, "finalized record") {
+        let persisted = match decode_finalized_record(&record_bytes, "finalized record") {
             Ok(record) => record,
             Err(_) => return Ok(DurableCommitOutcome::Indeterminate),
         };
@@ -1070,7 +1192,7 @@ impl FinalityStore {
         let Some(record_bytes) = self.db.get(&record_key(id.block_id.0)).await? else {
             bail!("finalized height marker has no finalized record");
         };
-        let finalized: FinalizedBlockV2 = decode(&record_bytes, "finalized record")?;
+        let finalized = decode_finalized_record(&record_bytes, "finalized record")?;
         if FinalizeTransactionId::from_v2(&finalized) != id {
             bail!("finalized record does not match its durable identity");
         }
@@ -1088,12 +1210,23 @@ impl FinalityStore {
                 .ok_or_else(|| anyhow!("finalized state write count is missing"))?,
             "state write count",
         )?;
-        let checkpoint: Option<CanonicalStateCheckpoint> = self
-            .db
-            .get(&checkpoint_key(id.height))
-            .await?
-            .map(|bytes| decode(&bytes, "canonical state checkpoint"))
-            .transpose()?;
+        let checkpoint: Option<CanonicalStateCheckpoint> =
+            if let Some(bytes) = self.db.get(&checkpoint_key(id.height)).await? {
+                let checkpoint_root: Hash = decode(&bytes, "canonical state checkpoint reference")?;
+                let checkpoint_bytes = self
+                    .db
+                    .get(&checkpoint_content_key(&checkpoint_root))
+                    .await?
+                    .ok_or_else(|| anyhow!("canonical state checkpoint content is missing"))?;
+                let checkpoint: CanonicalStateCheckpoint =
+                    decode(&checkpoint_bytes, "canonical state checkpoint content")?;
+                if checkpoint.state_root != checkpoint_root {
+                    bail!("canonical state checkpoint content does not match its reference");
+                }
+                Some(checkpoint)
+            } else {
+                None
+            };
         if let Some(ref checkpoint) = checkpoint {
             let stored_root: Hash = decode(
                 &self
@@ -1174,7 +1307,7 @@ impl FinalityStore {
     fn required_keys(
         &self,
         finalized: &FinalizedBlockV2,
-        transaction_ids: &[TransactionId],
+        _transaction_ids: &[TransactionId],
         id: &FinalizeTransactionId,
         state_write_count: usize,
         has_checkpoint: bool,
@@ -1182,19 +1315,18 @@ impl FinalityStore {
         let mut keys = vec![
             height_key(id.height),
             record_key(finalized.block.header.block_hash),
-            block_key(finalized.block.header.block_hash),
             certificate_key(id.height),
             CONSENSUS_STATE_KEY.to_vec(),
             state_write_count_key(id.height),
             TIP_KEY.to_vec(),
         ];
-        keys.extend(transaction_ids.iter().map(transaction_key));
         keys.extend((0..state_write_count).map(|index| state_write_key(id.height, index)));
         if has_checkpoint {
             keys.push(STATE_ROOT_KEY.to_vec());
             keys.push(state_root_key(id.height));
             keys.push(STATE_CHECKPOINT_KEY.to_vec());
             keys.push(checkpoint_key(id.height));
+            keys.push(checkpoint_content_key(&finalized.block.header.state_root));
         }
         Ok(keys)
     }
@@ -1209,7 +1341,17 @@ impl FinalityStore {
             .get(&checkpoint_key(height))
             .await?
             .ok_or_else(|| anyhow!("canonical state checkpoint is missing"))?;
-        let actual: CanonicalStateCheckpoint = decode(&stored, "canonical state checkpoint")?;
+        let checkpoint_root: Hash = decode(&stored, "canonical state checkpoint reference")?;
+        if checkpoint_root != expected.state_root {
+            bail!("canonical state checkpoint reference conflicts with durable state");
+        }
+        let checkpoint_bytes = self
+            .db
+            .get(&checkpoint_content_key(&checkpoint_root))
+            .await?
+            .ok_or_else(|| anyhow!("canonical state checkpoint content is missing"))?;
+        let actual: CanonicalStateCheckpoint =
+            decode(&checkpoint_bytes, "canonical state checkpoint content")?;
         if actual != *expected {
             bail!("canonical state checkpoint conflicts with durable state");
         }
@@ -1253,11 +1395,13 @@ impl FinalityStore {
     }
 
     async fn read_presence(&self, keys: &[Vec<u8>]) -> Result<Vec<bool>> {
-        let mut present = Vec::with_capacity(keys.len());
-        for key in keys {
-            present.push(self.db.get(key).await?.is_some());
-        }
-        Ok(present)
+        Ok(self
+            .db
+            .batch_get(keys)
+            .await?
+            .into_iter()
+            .map(|value| value.is_some())
+            .collect())
     }
 }
 
@@ -1267,10 +1411,6 @@ fn height_key(height: u64) -> Vec<u8> {
 
 fn record_key(block_id: Hash) -> Vec<u8> {
     key_with_bytes(RECORD_PREFIX, &block_id.0)
-}
-
-fn block_key(block_id: Hash) -> Vec<u8> {
-    key_with_bytes(BLOCK_PREFIX, &block_id.0)
 }
 
 fn certificate_key(height: u64) -> Vec<u8> {
@@ -1291,12 +1431,12 @@ fn checkpoint_key(height: u64) -> Vec<u8> {
     key_with_bytes(STATE_CHECKPOINT_PREFIX, &height.to_be_bytes())
 }
 
-fn state_root_key(height: u64) -> Vec<u8> {
-    key_with_bytes(STATE_ROOT_PREFIX, &height.to_be_bytes())
+fn checkpoint_content_key(state_root: &Hash) -> Vec<u8> {
+    key_with_bytes(STATE_CHECKPOINT_CONTENT_PREFIX, &state_root.0)
 }
 
-fn transaction_key(transaction_id: &TransactionId) -> Vec<u8> {
-    key_with_bytes(TRANSACTION_PREFIX, &transaction_id.0 .0)
+fn state_root_key(height: u64) -> Vec<u8> {
+    key_with_bytes(STATE_ROOT_PREFIX, &height.to_be_bytes())
 }
 
 fn state_account_key(address: &norn_common::types::Address) -> Vec<u8> {
@@ -1318,26 +1458,12 @@ fn snapshot_key(epoch: u64) -> Vec<u8> {
     key_with_bytes(SNAPSHOT_PREFIX, &epoch.to_be_bytes())
 }
 
-fn canonical_state_entries(
-    checkpoint: &CanonicalStateCheckpoint,
-    state_write_values: &[Vec<u8>],
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+fn canonical_state_entries(state_write_values: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     let mut entries = std::collections::BTreeMap::<Vec<u8>, Vec<u8>>::new();
-    for account in &checkpoint.accounts {
-        entries.insert(state_account_key(&account.address), encode(account)?);
-    }
-    for (address, items) in &checkpoint.storage {
-        for item in items {
-            entries.insert(state_storage_key(address, &item.key), item.value.clone());
-        }
-    }
-    for (hash, code) in &checkpoint.code.codes {
-        entries.insert(state_code_key(hash), code.clone());
-    }
-
-    // Overlay writes also emit tombstones for keys deleted by this block. The
-    // checkpoint remains the authoritative recovery image; these entries make
-    // the granular state namespace reflect the same update/delete operation.
+    // The content-addressed checkpoint is the authoritative recovery image.
+    // The granular namespace only needs this block's delta; rewriting every
+    // account on every (including empty) block caused severe Sled write
+    // amplification and multi-second SD-card stalls.
     for encoded in state_write_values {
         let write: OverlayWrite = decode(encoded, "canonical overlay write")?;
         match write {
@@ -1422,7 +1548,7 @@ fn durable_payload_hash<T: serde::Serialize>(payload: &T) -> Result<Hash> {
     Ok(Hash(Sha256::digest(bytes).into()))
 }
 
-fn durable_block_payload_hash(record: &DurableBlockCandidate) -> Result<Hash> {
+fn durable_block_payload_hash(record: &DurableBlockCandidateRecord) -> Result<Hash> {
     durable_payload_hash(&(
         record.format_version,
         record.height,
@@ -1458,7 +1584,7 @@ fn compare_durable_attempt_refs(
         .then(left.round.cmp(&right.round))
 }
 
-fn validate_durable_block_candidate(record: &DurableBlockCandidate) -> Result<()> {
+fn validate_durable_block_candidate(record: &DurableBlockCandidateRecord) -> Result<()> {
     if record.format_version != SAFETY_RECORD_FORMAT_VERSION
         || record.block_id != BlockId(record.block.header.block_hash)
         || record.block.header.height < 0
@@ -1513,9 +1639,63 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8], name: &str) -> Result<T>
         .map_err(|error| anyhow!("invalid {}: {}", name, error))
 }
 
+fn encode_finalized_record(finalized: &FinalizedBlockV2) -> Result<Vec<u8>> {
+    let raw = encode(finalized)?;
+    if raw.len() > MAX_DURABLE_FINALITY_RECORD_BYTES {
+        bail!("finalized record exceeds the durable encoding limit");
+    }
+    let compressed = zstd::bulk::compress(&raw, 1)
+        .map_err(|error| anyhow!("failed to compress finalized record: {error}"))?;
+    let framed_len = COMPRESSED_FINALITY_MAGIC
+        .len()
+        .checked_add(COMPRESSED_FINALITY_LENGTH_BYTES)
+        .and_then(|len| len.checked_add(compressed.len()))
+        .ok_or_else(|| anyhow!("compressed finalized record length overflow"))?;
+    if framed_len >= raw.len() {
+        return Ok(raw);
+    }
+    let mut framed = Vec::with_capacity(framed_len);
+    framed.extend_from_slice(COMPRESSED_FINALITY_MAGIC);
+    framed.extend_from_slice(&(raw.len() as u64).to_be_bytes());
+    framed.extend_from_slice(&compressed);
+    Ok(framed)
+}
+
+fn decode_finalized_record(bytes: &[u8], name: &str) -> Result<FinalizedBlockV2> {
+    if !bytes.starts_with(COMPRESSED_FINALITY_MAGIC) {
+        return decode(bytes, name);
+    }
+    let length_start = COMPRESSED_FINALITY_MAGIC.len();
+    let payload_start = length_start
+        .checked_add(COMPRESSED_FINALITY_LENGTH_BYTES)
+        .ok_or_else(|| anyhow!("invalid {name}: compressed frame length overflow"))?;
+    let declared_len = u64::from_be_bytes(
+        bytes
+            .get(length_start..payload_start)
+            .ok_or_else(|| anyhow!("invalid {name}: truncated compressed frame"))?
+            .try_into()
+            .map_err(|_| anyhow!("invalid {name}: malformed compressed length"))?,
+    );
+    let declared_len = usize::try_from(declared_len)
+        .map_err(|_| anyhow!("invalid {name}: compressed length exceeds this platform"))?;
+    if declared_len == 0 || declared_len > MAX_DURABLE_FINALITY_RECORD_BYTES {
+        bail!("invalid {name}: compressed length is outside the durable encoding limit");
+    }
+    let compressed = bytes
+        .get(payload_start..)
+        .ok_or_else(|| anyhow!("invalid {name}: compressed payload is missing"))?;
+    let raw = zstd::bulk::decompress(compressed, declared_len)
+        .map_err(|error| anyhow!("invalid {name}: zstd decompression failed: {error}"))?;
+    if raw.len() != declared_len {
+        bail!("invalid {name}: decompressed length does not match its frame");
+    }
+    decode(&raw, name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evm::CodeStorageCheckpoint;
     use async_trait::async_trait;
     use norn_common::consensus_types::{
         CommitCertificate, FinalizedConsensusState, PendingValidatorChange,
@@ -1701,6 +1881,25 @@ mod tests {
             .persist_safety_candidate(&reproposal, &finalized.block, Hash([43; 32]))
             .await
             .unwrap();
+        let mut later_reproposal = reproposal.clone();
+        later_reproposal.round = 2;
+        later_reproposal.valid_round = Some(1);
+        later_reproposal
+            .valid_round_certificate
+            .as_mut()
+            .unwrap()
+            .round = 1;
+        store
+            .persist_safety_candidate(&later_reproposal, &finalized.block, Hash([44; 32]))
+            .await
+            .unwrap();
+        store
+            .persist_pending_proposal(&later_reproposal, &finalized.block)
+            .await
+            .unwrap();
+        let pending = store.recover_pending_proposal(1, 2).await.unwrap().unwrap();
+        assert_eq!(pending.0, later_reproposal);
+        assert_eq!(pending.1, finalized.block);
         let original_attempt = store
             .recover_safety_candidate_attempt(1, 0, finalized.commit.block_id)
             .await
@@ -2010,5 +2209,69 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn checkpoints_are_content_addressed_and_empty_blocks_do_not_rewrite_full_state() {
+        let db = Arc::new(MemoryDb::default());
+        let store = FinalityStore::new(db.clone());
+        store
+            .initialize_genesis_tip(&genesis_block(), StakeSnapshotHash([3; 32]), Hash([7; 32]))
+            .await
+            .unwrap();
+
+        let checkpoint = CanonicalStateCheckpoint {
+            state_root: Hash([5; 32]),
+            accounts: Vec::new(),
+            storage: Vec::new(),
+            code: CodeStorageCheckpoint {
+                codes: Vec::new(),
+                address_to_code: Vec::new(),
+            },
+        };
+        let first = finalized();
+        store
+            .commit_finalized_transaction_with_state_and_checkpoint(&first, &[], Some(&checkpoint))
+            .await
+            .unwrap();
+
+        let mut second = first.clone();
+        second.block.header.height = 2;
+        second.block.header.prev_block_hash = first.block.header.block_hash;
+        second.block.header.parent_randomness = first.consensus_state.next_randomness;
+        second.block.header.block_hash = Hash([20; 32]);
+        second.proposal.height = 2;
+        second.proposal.block_id = BlockId(Hash([20; 32]));
+        second.proposal.parent_block_hash = first.block.header.block_hash;
+        second.commit.height = 2;
+        second.commit.block_id = BlockId(Hash([20; 32]));
+        second.consensus_state.height = 2;
+        second.consensus_state.finalized_block_id = BlockId(Hash([20; 32]));
+        store
+            .commit_finalized_transaction_with_state_and_checkpoint(&second, &[], Some(&checkpoint))
+            .await
+            .unwrap();
+
+        let recovered = store
+            .recover_finalized_v2_with_state_and_checkpoint(2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.2, Some(checkpoint));
+        let values = db.values.lock().await;
+        assert_eq!(
+            values
+                .keys()
+                .filter(|key| key.starts_with(STATE_CHECKPOINT_CONTENT_PREFIX))
+                .count(),
+            1
+        );
+        assert_eq!(
+            values
+                .keys()
+                .filter(|key| key.starts_with(STATE_ACCOUNT_PREFIX))
+                .count(),
+            0
+        );
     }
 }

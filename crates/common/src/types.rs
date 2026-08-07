@@ -356,6 +356,21 @@ pub enum TransactionType {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
 pub struct TransactionId(pub Hash);
 
+impl TransactionId {
+    /// Eight-byte relay identifier used only to locate an already known
+    /// transaction body.  Consensus still authenticates the reconstructed
+    /// block with the full 256-bit Merkle root and block hash, so a short-ID
+    /// collision can only trigger the full-block fallback, never change the
+    /// committed transaction list.
+    pub fn relay_short_id(self) -> u64 {
+        u64::from_be_bytes(
+            self.0 .0[..8]
+                .try_into()
+                .expect("transaction hash prefix is exactly eight bytes"),
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TransactionV2Error {
     #[error("transaction protocol version must be non-zero")]
@@ -412,6 +427,127 @@ pub struct TransactionV2 {
     #[serde(with = "hex_serde_fixed_64")]
     pub signature: [u8; 64],
     pub transaction_id: TransactionId,
+}
+
+/// Bounded transaction-gossip batch. The magic prefix keeps this wire shape
+/// unambiguous from the existing single-transaction bincode payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransactionV2Batch {
+    pub transactions: Vec<TransactionV2>,
+}
+
+impl TransactionV2Batch {
+    pub const MAGIC: &'static [u8; 16] = b"NORN_TX_BATCH_V1";
+    pub const MAX_TRANSACTIONS: usize = 4096;
+
+    pub fn encode(transactions: Vec<TransactionV2>) -> crate::error::Result<Vec<u8>> {
+        use crate::error::{NetworkError, NornError};
+        if transactions.is_empty() || transactions.len() > Self::MAX_TRANSACTIONS {
+            return Err(NornError::Network(NetworkError::Protocol(
+                "transaction batch count is outside the protocol limit".to_owned(),
+            )));
+        }
+        let encoded = bincode::serialize(&Self { transactions }).map_err(|error| {
+            NornError::Serialization(format!("failed to encode TransactionV2 batch: {error}"))
+        })?;
+        let encoded_len = Self::MAGIC
+            .len()
+            .checked_add(encoded.len())
+            .ok_or_else(|| {
+                NornError::Network(NetworkError::Protocol(
+                    "transaction batch byte count overflow".to_owned(),
+                ))
+            })?;
+        if encoded_len > crate::chain_context::MAX_TRANSACTION_BATCH_MESSAGE_BYTES {
+            return Err(NornError::Network(NetworkError::Protocol(
+                "transaction batch exceeds the protocol byte limit".to_owned(),
+            )));
+        }
+        let mut bytes = Vec::with_capacity(encoded_len);
+        bytes.extend_from_slice(Self::MAGIC);
+        bytes.extend_from_slice(&encoded);
+        Ok(bytes)
+    }
+
+    pub fn decode(bytes: &[u8]) -> crate::error::Result<Option<Self>> {
+        use crate::error::{NetworkError, NornError};
+        if !bytes.starts_with(Self::MAGIC) {
+            return Ok(None);
+        }
+        if bytes.len() > crate::chain_context::MAX_TRANSACTION_BATCH_MESSAGE_BYTES {
+            return Err(NornError::Network(NetworkError::Protocol(
+                "transaction batch exceeds the protocol byte limit".to_owned(),
+            )));
+        }
+        // bincode encodes a Vec length as a little-endian u64. Check it before
+        // deserialization so an attacker cannot request an oversized Vec
+        // allocation from a small malicious frame.
+        let count_bytes = bytes
+            .get(Self::MAGIC.len()..Self::MAGIC.len() + 8)
+            .ok_or_else(|| {
+                NornError::Network(NetworkError::Protocol(
+                    "truncated transaction batch".to_owned(),
+                ))
+            })?;
+        let declared_count = u64::from_le_bytes(count_bytes.try_into().expect("8-byte slice"));
+        if declared_count == 0 || declared_count > Self::MAX_TRANSACTIONS as u64 {
+            return Err(NornError::Network(NetworkError::Protocol(
+                "transaction batch count is outside the protocol limit".to_owned(),
+            )));
+        }
+        let batch: Self = bincode::deserialize(&bytes[Self::MAGIC.len()..]).map_err(|error| {
+            NornError::Serialization(format!("invalid TransactionV2 batch: {error}"))
+        })?;
+        if batch.transactions.is_empty() || batch.transactions.len() > Self::MAX_TRANSACTIONS {
+            return Err(NornError::Network(NetworkError::Protocol(
+                "transaction batch count is outside the protocol limit".to_owned(),
+            )));
+        }
+        let canonical = Self::encode(batch.transactions.clone())?;
+        if canonical != bytes {
+            return Err(NornError::Network(NetworkError::Protocol(
+                "non-canonical TransactionV2 batch encoding".to_owned(),
+            )));
+        }
+        Ok(Some(batch))
+    }
+
+    /// Decode a transaction-topic payload and validate every transaction's
+    /// context and self-commitment. Signature verification remains in the
+    /// bounded worker pool so network event dispatch cannot starve consensus.
+    pub fn decode_and_validate(
+        bytes: &[u8],
+        context: &crate::chain_context::ChainContext,
+    ) -> crate::error::Result<Option<Self>> {
+        use crate::error::{NetworkError, NornError, ValidationError};
+        let Some(batch) = Self::decode(bytes)? else {
+            return Ok(None);
+        };
+        for tx in &batch.transactions {
+            if tx.protocol_version != context.protocol_version {
+                return Err(NornError::Network(NetworkError::Protocol(
+                    "transaction protocol version mismatch".to_owned(),
+                )));
+            }
+            if tx.chain_id != context.chain_id {
+                return Err(NornError::Network(NetworkError::Protocol(
+                    "transaction chain ID mismatch".to_owned(),
+                )));
+            }
+            if bincode::serialized_size(tx).map_err(|error| {
+                NornError::Serialization(format!("failed to size TransactionV2: {error}"))
+            })? > TransactionV2::MAX_WIRE_BYTES as u64
+            {
+                return Err(NornError::Network(NetworkError::Protocol(
+                    "transaction wire size is outside the protocol limit".to_owned(),
+                )));
+            }
+            tx.validate().map_err(|error| {
+                NornError::Validation(ValidationError::InvalidTransaction(error.to_string()))
+            })?;
+        }
+        Ok(Some(batch))
+    }
 }
 
 impl Default for TransactionV2 {
@@ -712,6 +848,44 @@ mod transaction_v2_tests {
         );
         assert!(TransactionV2::decode_and_validate(&bytes, &wrong_context).is_err());
         assert!(TransactionV2::decode_and_validate(b"legacy-transaction", &context).is_err());
+    }
+
+    #[test]
+    fn transaction_v2_batch_is_bounded_contextual_and_canonical() {
+        let mut first = unsigned_transaction();
+        first.transaction_id = first.calculate_id().unwrap();
+        let mut second = first.clone();
+        second.nonce += 1;
+        second.transaction_id = second.calculate_id().unwrap();
+        let context = crate::chain_context::ChainContext::new(
+            1,
+            first.protocol_version,
+            first.chain_id,
+            Hash([7; HASH_LENGTH]),
+        );
+
+        let encoded = TransactionV2Batch::encode(vec![first.clone(), second.clone()]).unwrap();
+        let decoded = TransactionV2Batch::decode_and_validate(&encoded, &context)
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.transactions, vec![first, second]);
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(TransactionV2Batch::decode_and_validate(&trailing, &context).is_err());
+
+        let wrong_context = crate::chain_context::ChainContext::new(
+            1,
+            ProtocolVersion(3),
+            context.chain_id,
+            context.genesis_hash,
+        );
+        assert!(TransactionV2Batch::decode_and_validate(&encoded, &wrong_context).is_err());
+
+        let mut oversized_count = TransactionV2Batch::MAGIC.to_vec();
+        oversized_count
+            .extend_from_slice(&(TransactionV2Batch::MAX_TRANSACTIONS as u64 + 1).to_le_bytes());
+        assert!(TransactionV2Batch::decode(&oversized_count).is_err());
     }
 }
 
@@ -1022,18 +1196,32 @@ impl BlockV2 {
     /// already self-contained signed identifiers, so no block inclusion
     /// metadata enters this commitment.
     pub fn calculate_merkle_root(transactions: &[TransactionV2]) -> crate::error::Result<Hash> {
+        let transaction_ids = transactions
+            .iter()
+            .map(|transaction| transaction.transaction_id)
+            .collect::<Vec<_>>();
+        Self::calculate_merkle_root_from_ids(&transaction_ids)
+    }
+
+    /// Build the same canonical Merkle root from an ordered compact proposal.
+    /// Keeping this operation independent of transaction bodies lets peers
+    /// authenticate the exact reconstruction order before expensive block
+    /// validation begins.
+    pub fn calculate_merkle_root_from_ids(
+        transaction_ids: &[TransactionId],
+    ) -> crate::error::Result<Hash> {
         use sha2::{Digest, Sha256};
 
-        if transactions.is_empty() {
+        if transaction_ids.is_empty() {
             return Ok(Hash::default());
         }
 
-        let mut level: Vec<Hash> = transactions
+        let mut level: Vec<Hash> = transaction_ids
             .iter()
-            .map(|tx| {
+            .map(|transaction_id| {
                 let mut hasher = Sha256::new();
                 hasher.update(Self::MERKLE_LEAF_DOMAIN);
-                hasher.update(tx.transaction_id.0 .0);
+                hasher.update(transaction_id.0 .0);
                 Hash(hasher.finalize().into())
             })
             .collect();
@@ -1051,6 +1239,146 @@ impl BlockV2 {
             level = next;
         }
         Ok(level[0])
+    }
+
+    /// Validate the commitments that are available in a compact proposal.
+    /// Transaction byte/gas bounds and signatures are deliberately checked
+    /// again by `validate_structure` after bodies are reconstructed.
+    pub fn validate_compact_structure(
+        header: &BlockHeader,
+        consensus_data: &BlockConsensusData,
+        transaction_ids: &[TransactionId],
+        context: &crate::chain_context::ChainContext,
+        limits: &crate::genesis::ProtocolResourceLimits,
+    ) -> crate::error::Result<()> {
+        use std::collections::HashSet;
+
+        limits.validate()?;
+        if header.protocol_version != context.protocol_version
+            || header.chain_id != context.chain_id
+        {
+            return Err(crate::chain_context::protocol_error(
+                "compact V2 block chain context mismatch",
+            ));
+        }
+        if header.height <= 0 {
+            return Err(crate::chain_context::protocol_error(
+                "compact V2 block height must be non-zero",
+            ));
+        }
+        if header.protocol_version.0 >= 5 && header.timestamp < 0 {
+            return Err(crate::chain_context::protocol_error(
+                "compact V2 block timestamp must be non-negative",
+            ));
+        }
+        if transaction_ids.len() > limits.max_transactions_per_block as usize {
+            return Err(crate::chain_context::protocol_error(
+                "compact V2 block transaction count exceeds Genesis limit",
+            ));
+        }
+        if header.gas_limit < 0 || header.gas_limit as u64 > limits.max_block_gas {
+            return Err(crate::chain_context::protocol_error(
+                "compact V2 block gas limit is outside Genesis bounds",
+            ));
+        }
+        let mut unique = HashSet::with_capacity(transaction_ids.len());
+        if transaction_ids.iter().any(|id| !unique.insert(*id)) {
+            return Err(crate::chain_context::protocol_error(
+                "compact V2 block contains duplicate transaction IDs",
+            ));
+        }
+        if header.protocol_version.0 >= 4 {
+            if consensus_data.builder_vrf_preout == [0u8; 32]
+                || consensus_data.builder_vrf_proof == [0u8; 64]
+            {
+                return Err(crate::chain_context::protocol_error(
+                    "compact V4 block is missing immutable builder VRF material",
+                ));
+            }
+            if consensus_data.builder_round != header.round {
+                return Err(crate::chain_context::protocol_error(
+                    "compact V4 builder VRF round does not match block round",
+                ));
+            }
+            if header.consensus_data_hash != consensus_data.calculate_hash(header.protocol_version)
+            {
+                return Err(crate::chain_context::protocol_error(
+                    "compact V4 consensus data commitment mismatch",
+                ));
+            }
+        }
+        if header.merkle_root != Self::calculate_merkle_root_from_ids(transaction_ids)? {
+            return Err(crate::chain_context::protocol_error(
+                "compact V2 block Merkle root mismatch",
+            ));
+        }
+        if header.block_hash == Hash::default() || header.block_hash != header.calculate_hash()? {
+            return Err(crate::chain_context::protocol_error(
+                "compact V2 block header hash mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate a short-ID compact proposal before transaction bodies are
+    /// resolved.  The short IDs are locators rather than commitments; the
+    /// reconstructed full IDs are checked against the header Merkle root by
+    /// normal block validation before any vote is cast.
+    pub fn validate_short_compact_structure(
+        header: &BlockHeader,
+        consensus_data: &BlockConsensusData,
+        transaction_short_ids: &[u64],
+        context: &crate::chain_context::ChainContext,
+        limits: &crate::genesis::ProtocolResourceLimits,
+    ) -> crate::error::Result<()> {
+        use std::collections::HashSet;
+
+        limits.validate()?;
+        if header.protocol_version != context.protocol_version
+            || header.chain_id != context.chain_id
+        {
+            return Err(crate::chain_context::protocol_error(
+                "short compact V2 block chain context mismatch",
+            ));
+        }
+        if header.height <= 0
+            || (header.protocol_version.0 >= 5 && header.timestamp < 0)
+            || header.gas_limit < 0
+            || header.gas_limit as u64 > limits.max_block_gas
+        {
+            return Err(crate::chain_context::protocol_error(
+                "short compact V2 block header is outside protocol bounds",
+            ));
+        }
+        if transaction_short_ids.len() > limits.max_transactions_per_block as usize {
+            return Err(crate::chain_context::protocol_error(
+                "short compact V2 block transaction count exceeds Genesis limit",
+            ));
+        }
+        let mut unique = HashSet::with_capacity(transaction_short_ids.len());
+        if transaction_short_ids.iter().any(|id| !unique.insert(*id)) {
+            return Err(crate::chain_context::protocol_error(
+                "short compact V2 block contains ambiguous transaction IDs",
+            ));
+        }
+        if header.protocol_version.0 >= 4 {
+            if consensus_data.builder_vrf_preout == [0u8; 32]
+                || consensus_data.builder_vrf_proof == [0u8; 64]
+                || consensus_data.builder_round != header.round
+                || header.consensus_data_hash
+                    != consensus_data.calculate_hash(header.protocol_version)
+            {
+                return Err(crate::chain_context::protocol_error(
+                    "short compact V4 consensus data commitment mismatch",
+                ));
+            }
+        }
+        if header.block_hash == Hash::default() || header.block_hash != header.calculate_hash()? {
+            return Err(crate::chain_context::protocol_error(
+                "short compact V2 block header hash mismatch",
+            ));
+        }
+        Ok(())
     }
 
     /// Recompute the header commitments after the transaction list and state
@@ -1133,9 +1461,9 @@ impl BlockV2 {
                     crate::error::ValidationError::InvalidTransaction(e.to_string()),
                 )
             })?;
-            let encoded = bincode::serialize(tx)
+            let encoded_size = bincode::serialized_size(tx)
                 .map_err(|e| crate::error::NornError::Serialization(e.to_string()))?;
-            if encoded.len() > limits.max_transaction_bytes as usize {
+            if encoded_size > limits.max_transaction_bytes as u64 {
                 return Err(crate::chain_context::protocol_error(
                     "V2 transaction exceeds Genesis byte limit",
                 ));
@@ -1155,9 +1483,9 @@ impl BlockV2 {
             ));
         }
 
-        let encoded = bincode::serialize(self)
+        let encoded_size = bincode::serialized_size(self)
             .map_err(|e| crate::error::NornError::Serialization(e.to_string()))?;
-        if encoded.len() > limits.max_block_bytes as usize {
+        if encoded_size > limits.max_block_bytes as u64 {
             return Err(crate::chain_context::protocol_error(
                 "V2 block exceeds Genesis byte limit",
             ));

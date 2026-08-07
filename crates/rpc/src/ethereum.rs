@@ -1203,6 +1203,15 @@ pub async fn start_ethereum_rpc_server(
         async move { ethereum_rpc.accounts().await }
     })?;
 
+    // Development-network faucet used by integration/performance tests.
+    module.register_async_method("dev_faucet", move |params, ethereum_rpc| {
+        let ethereum_rpc = ethereum_rpc.clone();
+        async move {
+            let (address, amount): (Address, String) = params.parse()?;
+            ethereum_rpc.dev_faucet(address, amount).await
+        }
+    })?;
+
     module.register_async_method("eth_getBalance", move |params, ethereum_rpc| {
         let ethereum_rpc = ethereum_rpc.clone();
         async move {

@@ -16,10 +16,13 @@ prost = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+sha2 = { workspace = true }
+bincode = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+rayon = "1.10"
 
 [build-dependencies]
 tonic-build = { workspace = true }

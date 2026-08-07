@@ -500,6 +500,19 @@ impl ExecutionOverlay {
     ) -> anyhow::Result<V2ExecutionResult> {
         norn_crypto::transaction::verify_transaction_v2(tx)
             .map_err(|e| anyhow::anyhow!("invalid TransactionV2: {}", e))?;
+        self.execute_preverified_transaction_v2(base, tx, context)
+            .await
+    }
+
+    /// Execute a transaction after the containing block has completed its
+    /// parallel cryptographic preflight. State-dependent nonce and balance
+    /// checks remain serial and deterministic.
+    async fn execute_preverified_transaction_v2(
+        &mut self,
+        base: &AccountStateManager,
+        tx: &TransactionV2,
+        context: Option<&V2ExecutionContext>,
+    ) -> anyhow::Result<V2ExecutionResult> {
         if tx.tx_type == TransactionType::EVM {
             let context = context.ok_or_else(|| {
                 anyhow::anyhow!("EVM TransactionV2 requires a deterministic block context")
@@ -706,25 +719,131 @@ pub async fn execute_v2_block(
     if transactions.len() > limits.max_transactions_per_block as usize {
         return Err(anyhow::anyhow!("TransactionV2 count exceeds Genesis limit"));
     }
-    let execution_context = if let Some(context) = context {
-        let code_storage = context
-            .code_storage
-            .fork()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to fork code storage: {e}"))?;
-        Some(V2ExecutionContext {
-            code_storage: Arc::new(code_storage),
-            ..context.clone()
-        })
+    // P-256 verification is independent for every transaction and dominates
+    // the native-transfer path on Raspberry Pi. Verify cache misses across
+    // all cores before entering deterministic, order-sensitive state work.
+    norn_crypto::transaction::verify_transactions_v2(transactions)
+        .map_err(|error| anyhow::anyhow!("invalid TransactionV2: {error}"))?;
+    let native_transfer_only = transactions.iter().all(|tx| {
+        tx.tx_type == TransactionType::Native
+            && tx.receiver.is_some()
+            && tx.data.is_empty()
+            && tx.event.is_empty()
+            && tx.opt.is_empty()
+            && tx.state.is_empty()
+            && tx.access_list.is_empty()
+    });
+    let execution_context = if !native_transfer_only {
+        if let Some(context) = context {
+            let code_storage = context
+                .code_storage
+                .fork()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to fork code storage: {e}"))?;
+            Some(V2ExecutionContext {
+                code_storage: Arc::new(code_storage),
+                ..context.clone()
+            })
+        } else {
+            None
+        }
     } else {
         None
     };
     let mut overlay = ExecutionOverlay::new(limits.max_overlay_writes as usize)?;
     let mut results = Vec::with_capacity(transactions.len());
     let mut gas_used = 0u64;
+
+    // Native transfers commonly touch a small, fixed signer set many times in
+    // one benchmark block. Keep those account states in a local ordered map
+    // and publish each final account once. Transaction checks are still made
+    // in block order, so nonce, balance, self-transfer, and receive-then-spend
+    // semantics are identical to the general overlay executor.
+    if native_transfer_only {
+        let mut accounts = BTreeMap::<[u8; 20], AccountState>::new();
+        for tx in transactions {
+            let tx_bytes = bincode::serialized_size(tx)?;
+            if tx_bytes > limits.max_transaction_bytes as u64 {
+                return Err(anyhow::anyhow!("TransactionV2 exceeds Genesis byte limit"));
+            }
+            if tx.gas_limit > limits.max_transaction_gas {
+                return Err(anyhow::anyhow!("TransactionV2 exceeds Genesis gas limit"));
+            }
+            if tx.gas_limit < 21_000 {
+                return Err(anyhow::anyhow!(
+                    "TransactionV2 gas limit below transfer minimum"
+                ));
+            }
+            let next_gas = gas_used
+                .checked_add(21_000)
+                .ok_or_else(|| anyhow::anyhow!("block gas overflow"))?;
+            if next_gas > limits.max_block_gas {
+                return Err(anyhow::anyhow!("block gas limit exceeded"));
+            }
+
+            let receiver = tx.receiver.expect("native-transfer shape checked above");
+            if !accounts.contains_key(&tx.sender.0) {
+                accounts.insert(tx.sender.0, overlay.get_account(base, &tx.sender).await?);
+            }
+            if !accounts.contains_key(&receiver.0) {
+                accounts.insert(receiver.0, overlay.get_account(base, &receiver).await?);
+            }
+
+            let sender_before = accounts
+                .get(&tx.sender.0)
+                .expect("sender account loaded")
+                .clone();
+            if sender_before.nonce != tx.nonce {
+                return Err(anyhow::anyhow!(
+                    "TransactionV2 nonce mismatch: expected {}, got {}",
+                    sender_before.nonce,
+                    tx.nonce
+                ));
+            }
+            let reserved_gas = BigUint::from(tx.gas_limit) * BigUint::from(tx.max_fee_per_gas);
+            let total_cost = reserved_gas + BigUint::from(tx.value);
+            if sender_before.balance < total_cost {
+                return Err(anyhow::anyhow!(
+                    "TransactionV2 sender balance is insufficient"
+                ));
+            }
+            let actual_gas = BigUint::from(21_000u64) * BigUint::from(tx.max_fee_per_gas);
+            let mut sender_after = sender_before;
+            // Reserving and refunding unused gas is algebraically equivalent
+            // to subtracting the actual transfer fee from the final balance.
+            sender_after.balance -= actual_gas;
+            sender_after.balance -= BigUint::from(tx.value);
+            sender_after.nonce = sender_after
+                .nonce
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("TransactionV2 nonce overflow"))?;
+            accounts.insert(tx.sender.0, sender_after);
+            if receiver != tx.sender {
+                let receiver_after = accounts
+                    .get_mut(&receiver.0)
+                    .expect("receiver account loaded");
+                receiver_after.balance += BigUint::from(tx.value);
+            }
+
+            gas_used = next_gas;
+            results.push(V2ExecutionResult {
+                transaction_id: tx.transaction_id,
+                gas_used: 21_000,
+            });
+        }
+        for (_, state) in accounts {
+            overlay.write_account(base, state.address, state).await?;
+        }
+        return Ok(V2BlockExecution {
+            overlay,
+            results,
+            gas_used,
+        });
+    }
+
     for tx in transactions {
-        let tx_bytes = bincode::serialize(tx)?;
-        if tx_bytes.len() > limits.max_transaction_bytes as usize {
+        let tx_bytes = bincode::serialized_size(tx)?;
+        if tx_bytes > limits.max_transaction_bytes as u64 {
             return Err(anyhow::anyhow!("TransactionV2 exceeds Genesis byte limit"));
         }
         if tx.gas_limit > limits.max_transaction_gas {
@@ -737,7 +856,7 @@ pub async fn execute_v2_block(
             return Err(anyhow::anyhow!("block gas limit exceeded"));
         }
         let result = overlay
-            .execute_transaction_v2(base, tx, execution_context.as_ref())
+            .execute_preverified_transaction_v2(base, tx, execution_context.as_ref())
             .await?;
         gas_used = gas_used
             .checked_add(result.gas_used)
@@ -917,6 +1036,88 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn native_batch_fast_path_matches_serial_overlay_execution() {
+        fn signer_address(keypair: &KeyPair) -> Address {
+            let mut hash = Sha256::new();
+            hash.update(keypair.public_key().to_encoded_point(true).as_bytes());
+            Address(hash.finalize()[..20].try_into().unwrap())
+        }
+
+        fn transfer(
+            keypair: &KeyPair,
+            sender: Address,
+            receiver: Address,
+            nonce: u64,
+            value: u128,
+        ) -> TransactionV2 {
+            let mut transaction = TransactionV2 {
+                protocol_version: ProtocolVersion(2),
+                chain_id: ChainId(norn_common::types::Hash([1; 32])),
+                nonce,
+                sender,
+                receiver: Some(receiver),
+                value,
+                gas_limit: 30_000,
+                max_fee_per_gas: 2,
+                max_priority_fee_per_gas: 1,
+                data: vec![],
+                event: vec![],
+                opt: vec![],
+                state: vec![],
+                expire: None,
+                timestamp: nonce.saturating_add(1),
+                tx_type: TransactionType::Native,
+                access_list: vec![],
+                public_key: PublicKey::default(),
+                signature: [0; 64],
+                transaction_id: TransactionId::default(),
+            };
+            sign_transaction_v2(keypair, &mut transaction).unwrap();
+            transaction
+        }
+
+        let base = AccountStateManager::new(AccountStateConfig::default());
+        let first_key = KeyPair::random();
+        let second_key = KeyPair::random();
+        let first = signer_address(&first_key);
+        let second = signer_address(&second_key);
+        let sink = Address([0x77; 20]);
+        for address in [first, second, sink] {
+            base.set_account(&address, account(address, 1_000_000))
+                .await
+                .unwrap();
+        }
+        let transactions = vec![
+            transfer(&first_key, first, second, 0, 10),
+            // Exercise receive-then-spend ordering in the local account map.
+            transfer(&second_key, second, sink, 0, 7),
+            transfer(&first_key, first, first, 1, 3),
+        ];
+
+        let mut serial = ExecutionOverlay::new(100).unwrap();
+        let mut serial_results = Vec::new();
+        for transaction in &transactions {
+            serial_results.push(
+                serial
+                    .execute_transaction_v2(&base, transaction, None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        let batched = execute_v2_block(
+            &base,
+            &transactions,
+            &ProtocolResourceLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(batched.results, serial_results);
+        assert_eq!(batched.overlay.ordered_writes(), serial.ordered_writes());
     }
 
     #[tokio::test]

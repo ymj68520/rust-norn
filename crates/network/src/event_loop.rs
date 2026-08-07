@@ -7,10 +7,10 @@ use libp2p::PeerId;
 use libp2p::{gossipsub, kad, Swarm};
 use norn_common::chain_context::{
     ChainContext, HandshakeMessage, NetworkHandshake, PeerRole, MAX_BLOCK_MESSAGE_BYTES,
-    MAX_HANDSHAKE_BYTES, MAX_TRANSACTION_MESSAGE_BYTES,
+    MAX_HANDSHAKE_BYTES, MAX_TRANSACTION_BATCH_MESSAGE_BYTES, MAX_TRANSACTION_MESSAGE_BYTES,
 };
 use norn_common::consensus_types::{ConsensusEnvelope, ConsensusMessage};
-use norn_common::types::TransactionV2;
+use norn_common::types::TransactionV2Batch;
 use rand::RngCore;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,6 +19,8 @@ use tracing::{debug, error, info};
 
 const CONSENSUS_GOSSIP_MAGIC: &[u8] = b"NORN_CONSENSUS_GOSSIP_V2";
 const CONSENSUS_GOSSIP_NONCE_BYTES: usize = std::mem::size_of::<u64>();
+const TRANSACTION_GOSSIP_ZSTD_MAGIC: &[u8] = b"NORN_TX_ZSTD_V1";
+const TRANSACTION_GOSSIP_LENGTH_BYTES: usize = std::mem::size_of::<u32>();
 const MAX_REPLAYED_CONSENSUS: usize = 64;
 const VALIDATOR_CHALLENGE_TTL: Duration = Duration::from_secs(10);
 const MAX_PENDING_VALIDATOR_CHALLENGES: usize = 256;
@@ -71,6 +73,7 @@ fn sync_request_allowed(
 
 pub struct EventLoop {
     swarm: Swarm<NornBehaviour>,
+    control_rx: mpsc::Receiver<NetworkCommand>,
     command_rx: mpsc::Receiver<NetworkCommand>,
     event_tx: mpsc::Sender<NetworkEvent>,
     topics: Topics,
@@ -102,6 +105,7 @@ impl EventLoop {
     ) -> Self {
         Self::new_with_context_and_auth(
             swarm,
+            mpsc::channel(1).1,
             command_rx,
             event_tx,
             context,
@@ -114,6 +118,7 @@ impl EventLoop {
 
     pub fn new_with_context_and_auth(
         swarm: Swarm<NornBehaviour>,
+        control_rx: mpsc::Receiver<NetworkCommand>,
         command_rx: mpsc::Receiver<NetworkCommand>,
         event_tx: mpsc::Sender<NetworkEvent>,
         context: ChainContext,
@@ -133,6 +138,7 @@ impl EventLoop {
             .unwrap_or_default();
         Self {
             swarm,
+            control_rx,
             command_rx,
             event_tx,
             topics: Topics::for_context(&context),
@@ -170,12 +176,12 @@ impl EventLoop {
         let _ = self
             .swarm
             .behaviour_mut()
-            .gossipsub
+            .control_gossipsub
             .subscribe(&self.topics.consensus);
         let _ = self
             .swarm
             .behaviour_mut()
-            .gossipsub
+            .control_gossipsub
             .subscribe(&self.topics.handshake);
 
         let mut consensus_tick = tokio::time::interval(Duration::from_secs(1));
@@ -185,6 +191,12 @@ impl EventLoop {
 
         loop {
             tokio::select! {
+                biased;
+                command = self.control_rx.recv() => {
+                    if let Some(cmd) = command {
+                        self.handle_command(cmd).await;
+                    }
+                }
                 event = self.swarm.next() => {
                     self.handle_swarm_event(event).await;
                 }
@@ -249,7 +261,7 @@ impl EventLoop {
                 match self
                     .swarm
                     .behaviour_mut()
-                    .gossipsub
+                    .control_gossipsub
                     .publish(self.topics.handshake.clone(), data)
                 {
                     Ok(_) => true,
@@ -311,17 +323,41 @@ impl EventLoop {
                 }
             }
             NetworkCommand::BroadcastTransaction(data) => {
-                if let Err(e) = TransactionV2::decode_and_validate(&data, &self.context) {
-                    error!("Refused to broadcast invalid TransactionV2: {}", e);
+                // The command channel is an in-process trust boundary: RPC
+                // and node admission have already decoded and verified these
+                // transactions. Repeating full batch decoding and canonical
+                // ID calculation here blocks the one swarm event loop and
+                // delays otherwise independent consensus streams under load.
+                // Remote peers still perform structural and cryptographic
+                // admission; this layer only enforces the transport ceiling.
+                let byte_limit = if data.starts_with(TransactionV2Batch::MAGIC) {
+                    MAX_TRANSACTION_BATCH_MESSAGE_BYTES
+                } else {
+                    MAX_TRANSACTION_MESSAGE_BYTES
+                };
+                if data.is_empty() || data.len() > byte_limit {
+                    error!(
+                        "Refused to broadcast transaction gossip outside byte bounds: {} > {}",
+                        data.len(),
+                        byte_limit
+                    );
                     return;
                 }
-                if let Err(e) = self
+                let data = encode_transaction_gossip(data);
+                match self
                     .swarm
                     .behaviour_mut()
                     .gossipsub
                     .publish(self.topics.transaction.clone(), data)
                 {
-                    error!("Broadcast transaction failed: {:?}", e);
+                    Ok(_) => {}
+                    Err(gossipsub::PublishError::Duplicate) => {
+                        // RPC replication and compact repair are idempotent.
+                        // The transaction is already in the local pool, and
+                        // gossipsub has already accepted this exact payload.
+                        debug!("Transaction gossip was already published");
+                    }
+                    Err(error) => error!("Broadcast transaction failed: {:?}", error),
                 }
             }
             NetworkCommand::BroadcastConsensus(data) => {
@@ -375,6 +411,13 @@ impl EventLoop {
                     message_id: _,
                     message,
                 }),
+            ))
+            | Some(libp2p::swarm::SwarmEvent::Behaviour(
+                crate::behaviour::NornBehaviourEvent::ControlGossipsub(gossipsub::Event::Message {
+                    propagation_source,
+                    message_id: _,
+                    message,
+                }),
             )) => {
                 if message.topic == self.topics.handshake.hash() {
                     self.handle_handshake(propagation_source, &message.data)
@@ -392,22 +435,46 @@ impl EventLoop {
                         .send(NetworkEvent::BlockReceived(message.data))
                         .await;
                 } else if message.topic == self.topics.transaction.hash() {
-                    if message.data.len() > MAX_TRANSACTION_MESSAGE_BYTES {
+                    if message.data.len() > MAX_TRANSACTION_BATCH_MESSAGE_BYTES {
+                        debug!(
+                            "Dropped oversized transaction wire message from {:?}",
+                            propagation_source
+                        );
+                        return;
+                    }
+                    let Some(transaction_data) = decode_transaction_gossip(&message.data) else {
+                        debug!(
+                            "Dropped malformed compressed transaction message from {:?}",
+                            propagation_source
+                        );
+                        return;
+                    };
+                    let byte_limit = if transaction_data.starts_with(TransactionV2Batch::MAGIC) {
+                        MAX_TRANSACTION_BATCH_MESSAGE_BYTES
+                    } else {
+                        MAX_TRANSACTION_MESSAGE_BYTES
+                    };
+                    if transaction_data.len() > byte_limit {
                         debug!(
                             "Dropped oversized transaction message from {:?}",
                             propagation_source
                         );
                         return;
                     }
-                    if let Err(e) = TransactionV2::decode_and_validate(&message.data, &self.context)
-                    {
-                        debug!("Dropped invalid TransactionV2: {}", e);
-                        return;
-                    }
-                    let _ = self
+                    // Full structural decoding and signature verification are
+                    // owned by the node's bounded transaction workers. Doing
+                    // that CPU work here, or awaiting a full transaction event
+                    // queue, blocks this same swarm task from delivering BFT
+                    // votes during a transaction burst.
+                    if let Err(error) = self
                         .event_tx
-                        .send(NetworkEvent::TransactionReceived(message.data))
-                        .await;
+                        .try_send(NetworkEvent::TransactionReceived(transaction_data))
+                    {
+                        debug!(
+                            "Dropped transaction gossip because node ingress is saturated: {}",
+                            error
+                        );
+                    }
                 } else if message.topic == self.topics.consensus.hash() {
                     let Some(consensus_data) = Self::decode_consensus_gossip(&message.data) else {
                         debug!("Dropped malformed or unsupported consensus gossip frame");
@@ -455,7 +522,8 @@ impl EventLoop {
                     }
                     if matches!(
                         decoded_envelope.payload,
-                        ConsensusMessage::BlockRequest { .. }
+                        ConsensusMessage::CompactTransactionRequestV2 { .. }
+                            | ConsensusMessage::BlockRequest { .. }
                             | ConsensusMessage::FinalityRequest { .. }
                     ) && !sync_request_allowed(
                         &mut self.sync_request_budget,
@@ -468,14 +536,15 @@ impl EventLoop {
                         );
                         return;
                     }
-                    if let Err(error) =
-                        self.event_tx
-                            .try_send(NetworkEvent::ConsensusMessageReceived(
-                                consensus_data.to_vec(),
-                            ))
+                    if let Err(error) = self
+                        .event_tx
+                        .send(NetworkEvent::ConsensusMessageReceived(
+                            consensus_data.to_vec(),
+                        ))
+                        .await
                     {
                         debug!(
-                            "Dropped context-valid consensus message after node ingress queue filled: {}",
+                            "Failed to deliver context-valid consensus message: {}",
                             error
                         );
                     }
@@ -499,9 +568,12 @@ impl EventLoop {
                     .behaviour_mut()
                     .gossipsub
                     .add_explicit_peer(&peer_id);
+                self.swarm
+                    .behaviour_mut()
+                    .control_gossipsub
+                    .add_explicit_peer(&peer_id);
                 self.handshake.session_nonce = self.handshake.session_nonce.wrapping_add(1);
                 self.connected_peers.insert(peer_id);
-                self.replay_published_consensus();
                 self.handshake_pending = true;
                 self.handshake_due = Some(Instant::now() + INITIAL_HANDSHAKE_DELAY);
                 let _ = self.event_tx.try_send(NetworkEvent::PeerConnected(peer_id));
@@ -770,13 +842,20 @@ impl EventLoop {
     }
 
     async fn mark_authenticated(&mut self, peer: PeerId, role: PeerRole) {
-        self.authenticated_peers.insert(peer, role);
+        let newly_authenticated = self.authenticated_peers.insert(peer, role).is_none();
         let _ = self.event_tx.try_send(NetworkEvent::PeerAuthenticated {
             peer_id: peer,
             role,
         });
         info!("Authenticated {:?} as {:?}", peer, role);
         if self.connected_peers.contains(&peer) {
+            // Replaying proposals/votes to every unauthenticated TCP identity
+            // amplified stale consensus traffic during load tests. Replay
+            // only once the peer has proven a configured validator identity.
+            if newly_authenticated && role == PeerRole::Validator {
+                self.replay_published_consensus();
+                self.flush_pending_consensus();
+            }
             self.handshake_pending = true;
             if self.handshake_due.is_none() {
                 self.handshake_due = Some(Instant::now() + HANDSHAKE_RETRY_DELAY);
@@ -790,6 +869,11 @@ impl EventLoop {
         // A later retry is then incorrectly treated as a duplicate. Keep the
         // exact signed bytes until a connection is established instead.
         self.queue_consensus(data);
+        // Consensus commands originate on the node's latency-sensitive
+        // driver path. Publish immediately when peers are authenticated;
+        // retaining a one-second polling delay here adds that delay once for
+        // the proposal, again for prevotes, and again for precommits.
+        self.flush_pending_consensus();
     }
 
     fn encode_consensus_gossip(&mut self, data: &[u8]) -> Vec<u8> {
@@ -877,7 +961,7 @@ impl EventLoop {
             let result = self
                 .swarm
                 .behaviour_mut()
-                .gossipsub
+                .control_gossipsub
                 .publish(self.topics.consensus.clone(), framed);
             match result {
                 Ok(_) => {
@@ -909,6 +993,44 @@ impl EventLoop {
     }
 }
 
+fn encode_transaction_gossip(data: Vec<u8>) -> Vec<u8> {
+    if data.len() < 1024 || !data.starts_with(TransactionV2Batch::MAGIC) {
+        return data;
+    }
+    let Ok(original_len) = u32::try_from(data.len()) else {
+        return data;
+    };
+    let Ok(compressed) = zstd::bulk::compress(&data, 1) else {
+        return data;
+    };
+    let framed_len =
+        TRANSACTION_GOSSIP_ZSTD_MAGIC.len() + TRANSACTION_GOSSIP_LENGTH_BYTES + compressed.len();
+    if framed_len >= data.len() {
+        return data;
+    }
+    let mut framed = Vec::with_capacity(framed_len);
+    framed.extend_from_slice(TRANSACTION_GOSSIP_ZSTD_MAGIC);
+    framed.extend_from_slice(&original_len.to_be_bytes());
+    framed.extend_from_slice(&compressed);
+    framed
+}
+
+fn decode_transaction_gossip(data: &[u8]) -> Option<Vec<u8>> {
+    if !data.starts_with(TRANSACTION_GOSSIP_ZSTD_MAGIC) {
+        return Some(data.to_vec());
+    }
+    let length_start = TRANSACTION_GOSSIP_ZSTD_MAGIC.len();
+    let payload_start = length_start.checked_add(TRANSACTION_GOSSIP_LENGTH_BYTES)?;
+    let declared_len =
+        u32::from_be_bytes(data.get(length_start..payload_start)?.try_into().ok()?) as usize;
+    if declared_len == 0 || declared_len > MAX_TRANSACTION_BATCH_MESSAGE_BYTES {
+        return None;
+    }
+    let decoded = zstd::bulk::decompress(data.get(payload_start..)?, declared_len).ok()?;
+    (decoded.len() == declared_len && decoded.starts_with(TransactionV2Batch::MAGIC))
+        .then_some(decoded)
+}
+
 /// A FullNode may originate V2 synchronization requests and responses, but it
 /// cannot originate a proposal, vote, or certificate. Incoming consensus
 /// messages are deliberately not filtered by this local-role check: gossipsub
@@ -918,7 +1040,8 @@ fn local_consensus_broadcast_allowed(role: PeerRole, payload: &ConsensusMessage)
     role == PeerRole::Validator
         || matches!(
             payload,
-            ConsensusMessage::BlockRequest { .. }
+            ConsensusMessage::CompactTransactionRequestV2 { .. }
+                | ConsensusMessage::BlockRequest { .. }
                 | ConsensusMessage::BlockResponse { .. }
                 | ConsensusMessage::FinalityRequest { .. }
                 | ConsensusMessage::FinalityResponse { .. }
@@ -928,9 +1051,10 @@ fn local_consensus_broadcast_allowed(role: PeerRole, payload: &ConsensusMessage)
 #[cfg(test)]
 mod tests {
     use super::{
-        challenge_slot_available, connection_slot_available, local_consensus_broadcast_allowed,
-        sync_request_allowed, PendingChallenge, MAX_CONNECTED_PEERS,
-        MAX_PENDING_VALIDATOR_CHALLENGES, MAX_SYNC_REQUESTS_PER_PEER,
+        challenge_slot_available, connection_slot_available, decode_transaction_gossip,
+        encode_transaction_gossip, local_consensus_broadcast_allowed, sync_request_allowed,
+        PendingChallenge, MAX_CONNECTED_PEERS, MAX_PENDING_VALIDATOR_CHALLENGES,
+        MAX_SYNC_REQUESTS_PER_PEER, TRANSACTION_GOSSIP_ZSTD_MAGIC,
     };
     use libp2p::identity::Keypair;
     use libp2p::PeerId;
@@ -938,6 +1062,21 @@ mod tests {
     use norn_common::types::{BlockId, Hash};
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn transaction_gossip_compression_is_bounded_and_round_trips() {
+        let mut batch = norn_common::types::TransactionV2Batch::MAGIC.to_vec();
+        batch.extend(std::iter::repeat_n(0x2a, 32 * 1024));
+        let encoded = encode_transaction_gossip(batch.clone());
+        assert!(encoded.starts_with(TRANSACTION_GOSSIP_ZSTD_MAGIC));
+        assert!(encoded.len() < batch.len());
+        assert_eq!(decode_transaction_gossip(&encoded), Some(batch));
+
+        let mut malformed = TRANSACTION_GOSSIP_ZSTD_MAGIC.to_vec();
+        malformed.extend_from_slice(&u32::MAX.to_be_bytes());
+        malformed.push(0);
+        assert_eq!(decode_transaction_gossip(&malformed), None);
+    }
 
     #[test]
     fn challenge_table_prunes_expired_entries_and_enforces_capacity() {

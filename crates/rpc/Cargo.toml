@@ -10,6 +10,7 @@ prost = { workspace = true }
 tracing = { workspace = true }
 norn-common = { workspace = true }
 norn-core = { workspace = true }
+norn-network = { workspace = true }
 norn-crypto = { workspace = true }
 hex = { workspace = true }
 jsonrpsee = { workspace = true }
@@ -27,6 +28,7 @@ futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+bincode = { workspace = true }
 
 [dev-dependencies]
 norn-storage = { workspace = true }

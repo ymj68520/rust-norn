@@ -61,9 +61,21 @@ impl Default for ConsensusConfig {
             unbonding_delay: 1,
             key_rotation_delay: 1,
             slashing_activation_delay: 1,
-            timeout_propose_ms: 3000,
-            timeout_prevote_ms: 2000,
-            timeout_precommit_ms: 2000,
+            // Raspberry Pi validators can finish process initialization a
+            // few seconds apart because SD-card and network startup latency
+            // varies.  A three-second first-round deadline lets an early
+            // node cast NIL before the elected proposer has even entered the
+            // round, permanently phase-shifting a small devnet.  Eight
+            // seconds also leaves room for validating a maximum-size block
+            // without affecting the normal fast path (the timer is cancelled
+            // as soon as the proposal is accepted).
+            timeout_propose_ms: 8000,
+            // Remote validators need enough time to verify and relay a V2
+            // proposal before a NIL precommit is irrevocably signed. These
+            // are upper bounds only: a normal Polka/precommit still advances
+            // immediately, so the slack does not slow healthy rounds.
+            timeout_prevote_ms: 6000,
+            timeout_precommit_ms: 4000,
             target_numerator: 1,
             target_denominator: 1,
             max_certificate_members: 1024,
@@ -195,5 +207,13 @@ mod tests {
         assert_eq!(config.epoch_for_height(3).unwrap(), 7);
         assert_eq!(config.epoch_for_height(4).unwrap(), 8);
         assert_eq!(config.epoch_for_height(7).unwrap(), 9);
+    }
+
+    #[test]
+    fn default_vote_timeouts_leave_validation_and_relay_slack() {
+        let config = ConsensusConfig::default();
+        assert_eq!(config.timeout_propose_ms, 8000);
+        assert_eq!(config.timeout_prevote_ms, 6000);
+        assert_eq!(config.timeout_precommit_ms, 4000);
     }
 }

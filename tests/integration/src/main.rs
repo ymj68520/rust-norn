@@ -1,5 +1,5 @@
-use norn_storage::SledDB;
 use norn_common::traits::DBInterface;
+use norn_storage::SledDB;
 use tempfile::TempDir;
 
 #[tokio::main]
@@ -26,7 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Retrieve data
     let value = db.get(b"test_key_1").await?;
     assert_eq!(value, Some(b"test_value_1".to_vec()));
-    println!("✅ Retrieved test_key_1: {:?}", std::str::from_utf8(&value.unwrap()));
+    println!(
+        "✅ Retrieved test_key_1: {:?}",
+        std::str::from_utf8(&value.unwrap())
+    );
 
     // Test contains_key
     let exists = db.contains_key(b"test_key_2").await?;

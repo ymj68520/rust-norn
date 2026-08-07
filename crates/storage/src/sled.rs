@@ -11,7 +11,19 @@ pub struct SledDB {
 
 impl SledDB {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let db = sled::open(path).context("Failed to open Sled database")?;
+        // Finality appends multi-megabyte block records while updating a
+        // comparatively small canonical key set. Sled's default LowSpace
+        // mode rewrites fragmented segments aggressively, which creates
+        // multi-second compaction pauses on Raspberry Pi SD storage. Prefer
+        // write throughput for a blockchain database. Also avoid the 1 GiB
+        // default page cache: on small validators it can force reclaim/swap
+        // exactly while consensus is trying to persist the next height.
+        let db = sled::Config::new()
+            .path(path)
+            .mode(sled::Mode::HighThroughput)
+            .cache_capacity(128 * 1024 * 1024)
+            .open()
+            .context("Failed to open Sled database")?;
 
         // Use the default tree for now, could support multiple trees later
         let tree = db
@@ -41,6 +53,27 @@ impl DBInterface for SledDB {
             Ok(Some(value)) => Ok(Some(value.to_vec())),
             Ok(None) => Ok(None),
             Err(e) => Err(anyhow::anyhow!("Failed to get from SledDB: {}", e)),
+        })
+        .await?
+    }
+
+    async fn batch_get(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<Vec<u8>>>> {
+        let db = self.db.clone();
+        let keys = keys.to_vec();
+
+        // Keep the complete read set in one blocking task.  In particular,
+        // finality may probe thousands of transaction markers; spawning one
+        // Tokio blocking task per marker dominates commit latency on ARM.
+        tokio::task::spawn_blocking(move || {
+            keys.iter()
+                .map(|key| {
+                    db.get(key)
+                        .map(|value| value.map(|value| value.to_vec()))
+                        .map_err(|error| {
+                            anyhow::anyhow!("Failed to batch get from SledDB: {}", error)
+                        })
+                })
+                .collect()
         })
         .await?
     }
@@ -231,6 +264,12 @@ mod tests {
 
         // Test batch insert
         db.batch_insert(&keys, &values).await.unwrap();
+
+        let batch_values = db.batch_get(&keys).await.unwrap();
+        assert_eq!(
+            batch_values,
+            values.iter().cloned().map(Some).collect::<Vec<_>>()
+        );
 
         // Verify all values were inserted
         for (i, key) in keys.iter().enumerate() {

@@ -23,3 +23,7 @@ curve25519-dalek = "4.1"
 rand = "0.8"
 serde = { workspace = true }
 async-trait = { workspace = true }
+once_cell = { workspace = true }
+moka = { workspace = true }
+ring = "0.17"
+rayon = "1.10"

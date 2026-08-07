@@ -437,6 +437,10 @@ pub struct PoVFEngine {
     pub state_machine: Arc<RwLock<TendermintStateMachine>>,
     pub candidate_blocks: Arc<RwLock<HashMap<(u64, BlockId), Block>>>,
     pub candidate_cache_v2: Arc<RwLock<V2CandidateCache>>,
+    /// Execution overlays produced during proposal validation. Finality for
+    /// the same immutable block can consume this result instead of executing
+    /// every transaction a second time against the unchanged parent state.
+    validated_executions_v2: Arc<RwLock<HashMap<BlockId, (u64, V2BlockExecution)>>>,
     pub finalized_blocks: Arc<RwLock<HashMap<Hash, FinalizedBlock>>>,
     pub finalized_blocks_v2: Arc<RwLock<HashMap<Hash, FinalizedBlockV2>>>,
     pub current_height: Arc<RwLock<u64>>,
@@ -553,6 +557,7 @@ impl PoVFEngine {
             candidate_cache_v2: Arc::new(RwLock::new(V2CandidateCache::new(
                 V2CandidateCacheLimits::from(&resource_limits),
             ))),
+            validated_executions_v2: Arc::new(RwLock::new(HashMap::new())),
             finalized_blocks: Arc::new(RwLock::new(HashMap::new())),
             finalized_blocks_v2: Arc::new(RwLock::new(HashMap::new())),
             current_height: Arc::new(RwLock::new(1)),
@@ -573,6 +578,23 @@ impl PoVFEngine {
             .read()
             .ok()
             .and_then(|store| store.clone())
+    }
+
+    /// Seed the validation/finality execution cache with the deterministic
+    /// result that the local producer just used to construct the block.  The
+    /// producer and verifier run in the same trusted process against the same
+    /// finalized parent, so executing thousands of transactions a second
+    /// time before broadcasting the local proposal only burns the ARM core.
+    pub(crate) async fn remember_locally_built_execution(
+        &self,
+        block_id: BlockId,
+        height: u64,
+        execution: V2BlockExecution,
+    ) {
+        let mut cached = self.validated_executions_v2.write().await;
+        let minimum_height = height.saturating_sub(1);
+        cached.retain(|_, (cached_height, _)| *cached_height >= minimum_height);
+        cached.insert(block_id, (height, execution));
     }
 
     async fn persist_candidate_durably(
@@ -652,14 +674,26 @@ impl PoVFEngine {
             block_gas_limit: limits.max_block_gas,
             code_storage: code_storage.clone(),
         };
-        let execution = execute_v2_block(
-            state_manager,
-            &block.transactions,
-            limits,
-            Some(&evm_context),
-        )
-        .await
-        .map_err(|e| NornError::ConsensusError(format!("V2 execution rejected: {e}")))?;
+        let block_id = BlockId(block.header.block_hash);
+        let cached_execution = self
+            .validated_executions_v2
+            .read()
+            .await
+            .get(&block_id)
+            .filter(|(height, _)| *height == proposal.height)
+            .map(|(_, execution)| execution.clone());
+        let execution = if let Some(execution) = cached_execution {
+            execution
+        } else {
+            execute_v2_block(
+                state_manager,
+                &block.transactions,
+                limits,
+                Some(&evm_context),
+            )
+            .await
+            .map_err(|e| NornError::ConsensusError(format!("V2 execution rejected: {e}")))?
+        };
         let projected_state_root = execution
             .overlay
             .projected_state_root(state_manager)
@@ -791,16 +825,9 @@ impl PoVFEngine {
         context: &ChainContext,
         code_storage: &Arc<CodeStorage>,
     ) -> Result<ValidatedCandidate> {
-        if block.header.block_hash != block.header.calculate_hash()? {
-            return Err(NornError::ConsensusError(
-                "V2 proposal header hash mismatch".into(),
-            ));
-        }
-        if block.header.merkle_root != BlockV2::calculate_merkle_root(&block.transactions)? {
-            return Err(NornError::ConsensusError(
-                "V2 proposal Merkle root mismatch".into(),
-            ));
-        }
+        // `validate_structure` already verifies both header and Merkle
+        // commitments. Repeating those full-block passes was measurable on
+        // 8192-transaction Raspberry Pi proposals.
         block.validate_structure(context, limits)?;
         let evm_context = V2ExecutionContext {
             block_number: block.header.height.max(0) as u64,
@@ -813,14 +840,26 @@ impl PoVFEngine {
             block_gas_limit: limits.max_block_gas,
             code_storage: code_storage.clone(),
         };
-        let execution = execute_v2_block(
-            state_manager,
-            &block.transactions,
-            limits,
-            Some(&evm_context),
-        )
-        .await
-        .map_err(|e| NornError::ConsensusError(format!("V2 execution rejected: {e}")))?;
+        let block_id = BlockId(block.header.block_hash);
+        let cached_execution = self
+            .validated_executions_v2
+            .read()
+            .await
+            .get(&block_id)
+            .filter(|(height, _)| *height == proposal.height)
+            .map(|(_, execution)| execution.clone());
+        let execution = if let Some(execution) = cached_execution {
+            execution
+        } else {
+            execute_v2_block(
+                state_manager,
+                &block.transactions,
+                limits,
+                Some(&evm_context),
+            )
+            .await
+            .map_err(|e| NornError::ConsensusError(format!("V2 execution rejected: {e}")))?
+        };
         let projected_state_root = execution
             .overlay
             .projected_state_root(state_manager)
@@ -844,6 +883,12 @@ impl PoVFEngine {
             .await
             .validate_proposal_v2_without_vote(&proposal, &block)
             .map_err(|error| NornError::ConsensusError(error.to_string()))?;
+        {
+            let mut cached = self.validated_executions_v2.write().await;
+            let minimum_height = proposal.height.saturating_sub(1);
+            cached.retain(|_, (height, _)| *height >= minimum_height);
+            cached.insert(proposal.block_id, (proposal.height, execution));
+        }
         Ok(ValidatedCandidate {
             proposal,
             block,
@@ -1106,6 +1151,14 @@ impl PoVFEngine {
         context: &ChainContext,
         code_storage: &Arc<CodeStorage>,
     ) -> Result<V2BlockExecution> {
+        let block_id = BlockId(block.header.block_hash);
+        if let Some((height, execution)) =
+            self.validated_executions_v2.write().await.remove(&block_id)
+        {
+            if block.header.height >= 0 && height == block.header.height as u64 {
+                return Ok(execution);
+            }
+        }
         if block.header.block_hash != block.header.calculate_hash()? {
             return Err(NornError::ConsensusError(
                 "V2 finality header hash mismatch".into(),

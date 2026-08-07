@@ -1,13 +1,53 @@
 use crate::ecdsa::{verify, KeyPair};
 use anyhow::Result;
+use moka::sync::Cache;
 use norn_common::types::{
     Address, Hash, PublicKey, Transaction, TransactionBody, TransactionType, TransactionV2,
     TransactionV2Error, PUBLIC_KEY_LENGTH,
 };
+use once_cell::sync::Lazy;
+use p256::ecdsa::Signature;
 use p256::ecdsa::VerifyingKey;
-use p256::ecdsa::{signature::Verifier, Signature};
+use rayon::prelude::*;
+use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+/// A transaction ID commits to every signed field and the final signature,
+/// so a successful verification can be reused safely throughout admission,
+/// proposal validation and finality.  Keeping this cache bounded prevents a
+/// public RPC peer from turning the optimization into unbounded memory use.
+static VERIFIED_V2_TRANSACTIONS: Lazy<Cache<norn_common::types::TransactionId, ()>> =
+    Lazy::new(|| Cache::builder().max_capacity(200_000).build());
+
+fn hardware_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(2)
+}
+
+/// Consensus verification has its own queue. Admission bursts must never put
+/// proposal verification behind thousands of unrelated gossip signatures.
+static V2_CONSENSUS_VERIFICATION_POOL: Lazy<rayon::ThreadPool> = Lazy::new(|| {
+    let hardware_threads = hardware_threads();
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(hardware_threads.saturating_sub(1).max(1))
+        .thread_name(|index| format!("norn-v2-consensus-verify-{index}"))
+        .build()
+        .expect("build bounded V2 consensus verification pool")
+});
+
+/// Admission uses at most half of the machine. On a four-core Raspberry Pi,
+/// two ingress workers can verify over 3,000 first-seen P-256 transactions per
+/// second while leaving CPU available for networking, timers and consensus.
+static V2_INGRESS_VERIFICATION_POOL: Lazy<rayon::ThreadPool> = Lazy::new(|| {
+    let hardware_threads = hardware_threads();
+    rayon::ThreadPoolBuilder::new()
+        .num_threads((hardware_threads / 2).max(1))
+        .thread_name(|index| format!("norn-v2-ingress-verify-{index}"))
+        .build()
+        .expect("build bounded V2 ingress verification pool")
+});
 
 #[derive(Error, Debug)]
 pub enum TxError {
@@ -53,9 +93,33 @@ pub fn sign_transaction_v2(
 /// and canonical low-S ECDSA signature.
 pub fn verify_transaction_v2(tx: &TransactionV2) -> Result<(), TxError> {
     tx.validate().map_err(|_| TxError::InvalidFormat)?;
+    if VERIFIED_V2_TRANSACTIONS.contains_key(&tx.transaction_id) {
+        return Ok(());
+    }
+    verify_transaction_v2_signature(tx)?;
+    VERIFIED_V2_TRANSACTIONS.insert(tx.transaction_id, ());
+    Ok(())
+}
+
+/// Perform a real cryptographic verification even if this transaction ID is
+/// already hot in the process cache. Intended for target-CPU benchmarking and
+/// explicit audit paths, not normal block execution.
+pub fn verify_transaction_v2_uncached(tx: &TransactionV2) -> Result<(), TxError> {
+    tx.validate().map_err(|_| TxError::InvalidFormat)?;
+    verify_transaction_v2_signature(tx)
+}
+
+fn verify_transaction_v2_signature(tx: &TransactionV2) -> Result<(), TxError> {
     let verifying_key =
         VerifyingKey::from_sec1_bytes(&tx.public_key.0).map_err(|_| TxError::InvalidFormat)?;
-    let derived_sender = public_key_to_address(&verifying_key);
+    let mut sender_hasher = Sha256::new();
+    sender_hasher.update(tx.public_key.0);
+    let sender_digest = sender_hasher.finalize();
+    let derived_sender = Address(
+        sender_digest[..20]
+            .try_into()
+            .map_err(|_| TxError::InvalidFormat)?,
+    );
     if derived_sender != tx.sender {
         return Err(TxError::VerificationFailed);
     }
@@ -64,17 +128,32 @@ pub fn verify_transaction_v2(tx: &TransactionV2) -> Result<(), TxError> {
     if signature.normalize_s().is_some() {
         return Err(TxError::VerificationFailed);
     }
-    let valid = verifying_key
-        .verify(
-            &tx.signing_bytes().map_err(|_| TxError::InvalidFormat)?,
-            &signature,
-        )
+    let signing_bytes = tx.signing_bytes().map_err(|_| TxError::InvalidFormat)?;
+    // ring uses optimized per-architecture P-256 assembly on ARM64. The
+    // protocol retains its SEC1 compressed-key wire format; convert only the
+    // already-validated point to ring's uncompressed verification input.
+    let uncompressed_key = verifying_key.to_encoded_point(false);
+    let valid = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, uncompressed_key.as_bytes())
+        .verify(&signing_bytes, &tx.signature)
         .is_ok();
     if valid {
         Ok(())
     } else {
         Err(TxError::VerificationFailed)
     }
+}
+
+/// Verify a consensus-critical batch on the independent high-priority queue.
+pub fn verify_transactions_v2(transactions: &[TransactionV2]) -> Result<(), TxError> {
+    V2_CONSENSUS_VERIFICATION_POOL
+        .install(|| transactions.par_iter().try_for_each(verify_transaction_v2))
+}
+
+/// Verify transactions arriving through RPC or gossip without occupying all
+/// validator cores or queueing work ahead of consensus proposal validation.
+pub fn verify_transactions_v2_ingress(transactions: &[TransactionV2]) -> Result<(), TxError> {
+    V2_INGRESS_VERIFICATION_POOL
+        .install(|| transactions.par_iter().try_for_each(verify_transaction_v2))
 }
 
 pub struct TransactionSigner {

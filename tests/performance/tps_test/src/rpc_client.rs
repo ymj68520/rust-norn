@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tonic::transport::Channel;
 use tonic::Request;
 
-use norn_common::types::{Transaction, Hash, TransactionType};
+use norn_common::types::{Address, Hash, Transaction, TransactionType, TransactionV2};
 
 // 生成的 protobuf 代码
 pub mod blockchain {
@@ -10,9 +12,13 @@ pub mod blockchain {
 }
 
 use blockchain::blockchain_service_client::BlockchainServiceClient;
-use blockchain::{Empty, GetBlockReq, SendTransactionWithDataReq, Transaction as ProtoTransaction};
+use blockchain::{
+    Empty, GetBlockReq, SendTransactionV2Req, SendTransactionWithDataReq, SendTransactionsV2Req,
+    Transaction as ProtoTransaction,
+};
 
 /// RPC 客户端
+#[derive(Clone)]
 pub struct BlockchainRpcClient {
     client: BlockchainServiceClient<Channel>,
 }
@@ -41,18 +47,17 @@ impl BlockchainRpcClient {
     }
 
     /// 根据高度获取区块
-    pub async fn get_block_by_number(&mut self, height: i64) -> Result<Option<norn_common::types::Block>> {
+    pub async fn get_block_by_number(
+        &mut self,
+        height: i64,
+    ) -> Result<Option<norn_common::types::Block>> {
         let request = Request::new(GetBlockReq {
             number: height as u64,
             hash: String::new(),
             full: true,
         });
 
-        match self
-            .client
-            .get_block_by_number(request)
-            .await
-        {
+        match self.client.get_block_by_number(request).await {
             Ok(response) => {
                 let resp = response.into_inner();
                 if let Some(proto_block) = resp.body {
@@ -72,7 +77,10 @@ impl BlockchainRpcClient {
     }
 
     /// 根据哈希获取区块
-    pub async fn get_block_by_hash(&mut self, hash: &Hash) -> Result<Option<norn_common::types::Block>> {
+    pub async fn get_block_by_hash(
+        &mut self,
+        hash: &Hash,
+    ) -> Result<Option<norn_common::types::Block>> {
         let request = Request::new(GetBlockReq {
             number: 0,
             hash: hex::encode(hash.0),
@@ -115,8 +123,74 @@ impl BlockchainRpcClient {
         Ok(response.into_inner().tx_hash)
     }
 
+    /// Send a canonical, signed protocol-V2 transaction.
+    pub async fn send_transaction_v2(&mut self, tx: &TransactionV2) -> Result<String> {
+        let request = Request::new(SendTransactionV2Req {
+            transaction: bincode::serialize(tx).context("Failed to encode TransactionV2")?,
+        });
+
+        let response = self
+            .client
+            .send_transaction_v2(request)
+            .await
+            .context("Failed to send TransactionV2")?;
+
+        Ok(response.into_inner().tx_hash)
+    }
+
+    /// Submit one pre-signed V2 batch. The validator verifies the batch on a
+    /// bounded CPU pool and emits one gossip message for the whole batch.
+    pub async fn send_transactions_v2(
+        &mut self,
+        transactions: &[TransactionV2],
+    ) -> Result<Vec<String>> {
+        let encoded = transactions
+            .iter()
+            .map(|tx| bincode::serialize(tx).context("Failed to encode TransactionV2"))
+            .collect::<Result<Vec<_>>>()?;
+        let response = self
+            .client
+            .send_transactions_v2(Request::new(SendTransactionsV2Req {
+                transactions: encoded,
+            }))
+            .await
+            .context("Failed to send TransactionV2 batch")?;
+        Ok(response.into_inner().tx_hashes)
+    }
+
+    /// Fund a benchmark signer through the node's development faucet.
+    ///
+    /// This is bootstrap-only: it directly mutates local state, so callers
+    /// must invoke it on every validator before any BFT proposal is produced.
+    pub async fn fund_account(eth_rpc_addr: &str, address: &Address) -> Result<()> {
+        let mut stream = TcpStream::connect(eth_rpc_addr)
+            .await
+            .with_context(|| format!("Failed to connect to Ethereum RPC {}", eth_rpc_addr))?;
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"dev_faucet","params":["0x{}","100000000000"]}}"#,
+            hex::encode(address.0)
+        );
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            eth_rpc_addr,
+            body.len(),
+            body
+        );
+        stream.write_all(request.as_bytes()).await?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await?;
+        let response = String::from_utf8_lossy(&response);
+        if !response.contains(r#""result":true"#) {
+            anyhow::bail!("dev_faucet failed at {}: {}", eth_rpc_addr, response);
+        }
+        Ok(())
+    }
+
     /// 发送批量交易
-    pub async fn send_batch(&mut self, transactions: &[Transaction]) -> Result<Vec<Result<String>>> {
+    pub async fn send_batch(
+        &mut self,
+        transactions: &[Transaction],
+    ) -> Result<Vec<Result<String>>> {
         let mut results = Vec::with_capacity(transactions.len());
 
         for tx in transactions {
@@ -255,27 +329,22 @@ impl From<blockchain::Block> for norn_common::types::Block {
                 }
                 hash
             },
-            state_root: Hash::default(), // Not provided by proto
+            state_root: Hash::default(),
             height: proto_header.height as i64,
-            public_key: {
-                let mut key = PublicKey::default();
-                if let Ok(bytes) = hex::decode(&proto_header.public) {
-                    if bytes.len() == 33 {
-                        key.0.copy_from_slice(&bytes);
-                    }
-                }
-                key
-            },
-            params: hex::decode(&proto_header.params).unwrap_or_default(),
+            protocol_version: ProtocolVersion::default(),
+            chain_id: ChainId::default(),
+            epoch: 0,
+            round: 0,
+            block_builder: ValidatorId::default(),
+            stake_snapshot_hash: StakeSnapshotHash::default(),
+            parent_randomness: Hash::default(),
             gas_limit: proto_header.gas_limit as i64,
-            base_fee: 0, // Default base fee
+            base_fee: 0,
+            consensus_data_hash: Hash::default(),
         };
 
-        let transactions: Vec<Transaction> = proto
-            .transactions
-            .into_iter()
-            .map(|tx| tx.into())
-            .collect();
+        let transactions: Vec<Transaction> =
+            proto.transactions.into_iter().map(|tx| tx.into()).collect();
 
         Block {
             header,

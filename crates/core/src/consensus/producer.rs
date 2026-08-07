@@ -19,6 +19,8 @@ use norn_common::types::{
     Transaction, TransactionV2,
 };
 use norn_crypto::vrf::{VRFCalculator, VRFKeyPair, VrfContext};
+use num_bigint::BigUint;
+use std::collections::{HashMap, HashSet};
 
 use crate::blockchain::Blockchain;
 use crate::consensus::povf::PoVFEngine;
@@ -39,6 +41,10 @@ pub struct BlockProducerConfig {
     pub block_interval: u64,
     /// Maximum transactions per block
     pub max_txs_per_block: usize,
+    /// Local execution cap for V2 transactions in one proposal.  Genesis
+    /// remains the protocol maximum; this cap keeps ARM validators from
+    /// spending an entire consensus round executing an oversized template.
+    pub max_v2_txs_per_block: usize,
     /// Maximum gas per block
     pub max_gas_per_block: i64,
     /// Maximum serialized block size from Genesis resource parameters
@@ -54,7 +60,8 @@ impl Default for BlockProducerConfig {
         Self {
             block_interval: 5,
             max_txs_per_block: 1000,
-            max_gas_per_block: 10_000_000,
+            max_v2_txs_per_block: 8192,
+            max_gas_per_block: 250_000_000,
             max_block_bytes: 8 * 1024 * 1024,
             max_transaction_bytes: 256 * 1024,
             is_validator: false,
@@ -161,15 +168,23 @@ impl BlockProducer {
 
     /// Check if local node is the current BFT proposer
     pub async fn should_produce(&self) -> bool {
+        self.proposal_slot().await.is_some()
+    }
+
+    /// Return the exact height/round for which this validator is currently
+    /// eligible to produce. The proposer decision and slot are read under one
+    /// state-machine lock so callers cannot pair eligibility from one round
+    /// with a proposal slot from another.
+    pub async fn proposal_slot(&self) -> Option<(u64, u32)> {
         if !self.config.is_validator {
             info!("V2 producer disabled because node is not a validator");
-            return false;
+            return None;
         }
 
         let last = self.last_produced.read().await;
         if let Some(last_time) = *last {
             if last_time.elapsed() < Duration::from_secs(self.config.block_interval) {
-                return false;
+                return None;
             }
         }
 
@@ -189,10 +204,12 @@ impl BlockProducer {
                     "V2 producer eligible at height {} round {} for validator {:?}",
                     sm.height, sm.round, sm.local_validator_id
                 );
+                Some((sm.height, sm.round))
+            } else {
+                None
             }
-            selected
         } else {
-            true
+            Some((0, 0))
         }
     }
 
@@ -341,12 +358,27 @@ impl BlockProducer {
         context: &ChainContext,
         limits: &ProtocolResourceLimits,
     ) -> Result<BlockV2> {
+        self.produce_v2_block_for_slot(context, limits, None).await
+    }
+
+    /// Build a V2 template for a caller-supplied consensus slot.  A local
+    /// proposer captures its slot before it starts work and must use the same
+    /// round in both the block and the proposal; reading the round again after
+    /// execution can otherwise create an internally inconsistent pair.
+    async fn produce_v2_block_for_slot(
+        &self,
+        context: &ChainContext,
+        limits: &ProtocolResourceLimits,
+        expected_slot: Option<(u64, u32)>,
+    ) -> Result<BlockV2> {
         {
             let mut state = self.state.write().await;
             *state = ProducerState::Preparing;
         }
 
-        let result = self.produce_v2_block_inner(context, limits).await;
+        let result = self
+            .produce_v2_block_inner(context, limits, expected_slot)
+            .await;
         match result {
             Ok(block) => {
                 let mut state = self.state.write().await;
@@ -367,6 +399,7 @@ impl BlockProducer {
         &self,
         context: &ChainContext,
         limits: &ProtocolResourceLimits,
+        expected_slot: Option<(u64, u32)>,
     ) -> Result<BlockV2> {
         limits.validate()?;
         let tx_pool = self
@@ -391,6 +424,15 @@ impl BlockProducer {
         let new_height = tip
             .next_height()
             .map_err(|error| anyhow!(error.to_string()))?;
+        if let Some((expected_height, _)) = expected_slot {
+            if new_height != expected_height {
+                return Err(anyhow!(
+                    "canonical height advanced while building V2 block: expected {}, got {}",
+                    expected_height,
+                    new_height
+                ));
+            }
+        }
         let prev_hash = tip.block_id.0;
         let parent_base_fee = tip.base_fee;
 
@@ -399,8 +441,20 @@ impl BlockProducer {
             .as_ref()
             .expect("V2 production checked consensus engine above");
         let sm = engine.state_machine.read().await;
+        if let Some((expected_height, _)) = expected_slot {
+            if sm.height != expected_height {
+                return Err(anyhow!(
+                    "consensus height advanced while building V2 block: expected {}, got {}",
+                    expected_height,
+                    sm.height
+                ));
+            }
+        }
         let epoch = sm.current_epoch()?;
-        let round = sm.round;
+        // Preserve the round captured by produce_v2_proposal.  The state
+        // machine may advance while a template is executing, but a template
+        // for the earlier slot must never be labelled as a later-round block.
+        let round = expected_slot.map(|(_, round)| round).unwrap_or(sm.round);
         let snapshot = sm.snapshot.clone();
         if snapshot.snapshot_hash != tip.active_snapshot_hash {
             return Err(anyhow!(
@@ -508,6 +562,13 @@ impl BlockProducer {
         if gas_used > block.header.gas_limit {
             return Err(anyhow!("V2 execution gas exceeds block gas limit"));
         }
+        engine
+            .remember_locally_built_execution(
+                BlockId(block.header.block_hash),
+                new_height,
+                execution,
+            )
+            .await;
         Ok(block)
     }
 
@@ -516,29 +577,95 @@ impl BlockProducer {
         tx_pool: &TransactionV2Pool,
         limits: &ProtocolResourceLimits,
     ) -> Vec<TransactionV2> {
-        let mut selected = Vec::with_capacity(limits.max_transactions_per_block as usize);
+        let configured_max = u32::try_from(self.config.max_v2_txs_per_block).unwrap_or(u32::MAX);
+        let max_transactions = limits.max_transactions_per_block.min(configured_max) as usize;
+        let mut selected = Vec::with_capacity(max_transactions);
         let mut total_bytes = 0usize;
         let mut total_gas = 0u64;
-        for tx in tx_pool.select(limits.max_transactions_per_block as usize) {
-            let Ok(tx_bytes) = bincode::serialize(&tx) else {
+        let accounts = self.state_manager.accounts_map();
+        let canonical_nonces = accounts
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().nonce))
+            .collect();
+        let mut balances = accounts
+            .iter()
+            .map(|entry| (*entry.key(), entry.value().balance.clone()))
+            .collect::<HashMap<_, _>>();
+        let mut blocked_senders = HashSet::new();
+        let mut invalid_frontiers = HashMap::<Address, u64>::new();
+        for tx in tx_pool.select_with_base_nonces(max_transactions, &canonical_nonces) {
+            if blocked_senders.contains(&tx.sender) {
+                continue;
+            }
+            let Ok(tx_bytes) = bincode::serialized_size(&tx) else {
+                blocked_senders.insert(tx.sender);
+                invalid_frontiers.insert(tx.sender, tx.nonce);
                 continue;
             };
-            let Some(next_bytes) = total_bytes.checked_add(tx_bytes.len()) else {
+            let Ok(tx_bytes) = usize::try_from(tx_bytes) else {
+                blocked_senders.insert(tx.sender);
+                invalid_frontiers.insert(tx.sender, tx.nonce);
+                continue;
+            };
+            let Some(next_bytes) = total_bytes.checked_add(tx_bytes) else {
                 break;
             };
             let Some(next_gas) = total_gas.checked_add(tx.gas_limit) else {
                 break;
             };
-            if tx_bytes.len() > limits.max_transaction_bytes as usize
-                || next_bytes > limits.max_block_bytes as usize
+            if tx_bytes > limits.max_transaction_bytes as usize
                 || tx.gas_limit > limits.max_transaction_gas
-                || next_gas > limits.max_block_gas
             {
+                blocked_senders.insert(tx.sender);
+                invalid_frontiers.insert(tx.sender, tx.nonce);
                 continue;
+            }
+            if next_bytes > limits.max_block_bytes as usize || next_gas > limits.max_block_gas {
+                break;
+            }
+
+            // Native transfers are the high-throughput path and can be
+            // state-filtered cheaply before deterministic block execution.
+            // Without this guard one unfunded sender was selected forever,
+            // every proposal failed, and the chain stopped advancing.
+            if tx.tx_type == norn_common::types::TransactionType::Native
+                && tx.data.is_empty()
+                && tx.event.is_empty()
+                && tx.opt.is_empty()
+                && tx.state.is_empty()
+                && tx.access_list.is_empty()
+            {
+                let Some(receiver) = tx.receiver else {
+                    blocked_senders.insert(tx.sender);
+                    invalid_frontiers.insert(tx.sender, tx.nonce);
+                    continue;
+                };
+                if tx.gas_limit < 21_000 {
+                    blocked_senders.insert(tx.sender);
+                    invalid_frontiers.insert(tx.sender, tx.nonce);
+                    continue;
+                }
+                let sender_balance = balances.entry(tx.sender).or_default().clone();
+                let reserved = BigUint::from(tx.gas_limit) * BigUint::from(tx.max_fee_per_gas)
+                    + BigUint::from(tx.value);
+                if sender_balance < reserved {
+                    blocked_senders.insert(tx.sender);
+                    invalid_frontiers.insert(tx.sender, tx.nonce);
+                    continue;
+                }
+                let charged = BigUint::from(21_000u64) * BigUint::from(tx.max_fee_per_gas)
+                    + BigUint::from(tx.value);
+                balances.insert(tx.sender, sender_balance - charged);
+                if receiver != tx.sender {
+                    *balances.entry(receiver).or_default() += BigUint::from(tx.value);
+                }
             }
             selected.push(tx);
             total_bytes = next_bytes;
             total_gas = next_gas;
+        }
+        for (sender, first_nonce) in invalid_frontiers {
+            tx_pool.discard_sender_from_nonce(sender, first_nonce);
         }
         selected
     }
@@ -551,6 +678,20 @@ impl BlockProducer {
         &self,
         context: &ChainContext,
         limits: &ProtocolResourceLimits,
+    ) -> Result<(Proposal, BlockV2)> {
+        self.produce_v2_proposal_for_slot(context, limits, None)
+            .await
+    }
+
+    /// Produce a V2 proposal for one captured consensus slot.  Callers which
+    /// already made the local-proposer decision must pass that same slot so a
+    /// round transition cannot turn an otherwise valid template into a stale
+    /// proposal before it reaches the consensus driver.
+    pub async fn produce_v2_proposal_for_slot(
+        &self,
+        context: &ChainContext,
+        limits: &ProtocolResourceLimits,
+        expected_slot: Option<(u64, u32)>,
     ) -> Result<(Proposal, BlockV2)> {
         debug!("Starting V2 proposal production");
         let engine = self
@@ -578,6 +719,17 @@ impl BlockProducer {
                 sm.valid_round_certificate.clone(),
             )
         };
+        if let Some((expected_height, expected_round)) = expected_slot {
+            if (height, round) != (expected_height, expected_round) {
+                return Err(anyhow!(
+                    "consensus slot advanced while preparing V2 proposal: expected {}:{}, got {}:{}",
+                    expected_height,
+                    expected_round,
+                    height,
+                    round
+                ));
+            }
+        }
         let block = if let Some(valid_block_id) = valid_block {
             let candidate = engine
                 .candidate_cache_v2
@@ -602,11 +754,13 @@ impl BlockProducer {
                     "valid-round certificate exists without a valid block"
                 ));
             }
-            self.produce_v2_block(context, limits).await?
+            self.produce_v2_block_for_slot(context, limits, Some((height, round)))
+                .await?
         };
         info!(
-            "V2 block template produced at height {}",
-            block.header.height
+            "V2 block template produced at height {}; transactions={}",
+            block.header.height,
+            block.transactions.len()
         );
         let proposer = self
             .proposal_signer
@@ -728,6 +882,7 @@ impl BlockProducer {
 mod tests {
     use super::*;
     use crate::state::AccountStateManager;
+    use norn_common::types::{ChainId, ProtocolVersion, TransactionId, TransactionType};
     use norn_storage::SledDB;
 
     #[test]
@@ -790,5 +945,55 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(tx_pool_v2.len(), 0);
         assert_eq!(producer.get_state().await, ProducerState::Idle);
+    }
+
+    #[tokio::test]
+    async fn v2_selection_discards_an_unfunded_sender_without_stalling_production() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(SledDB::new(temp_dir.path().to_str().unwrap()).unwrap());
+        let blockchain = Blockchain::new_with_fixed_genesis(db).await;
+        let tx_pool = Arc::new(TxPool::new());
+        let tx_pool_v2 = Arc::new(TransactionV2Pool::new());
+        let state_manager = Arc::new(AccountStateManager::default());
+        let mut producer = BlockProducer::new(
+            BlockProducerConfig::default(),
+            blockchain,
+            tx_pool,
+            VRFKeyPair::generate(),
+            state_manager,
+            None,
+            None,
+        );
+        producer.attach_v2_pool(tx_pool_v2.clone());
+
+        let mut transaction = TransactionV2 {
+            protocol_version: ProtocolVersion(2),
+            chain_id: ChainId(Hash([1; 32])),
+            nonce: 0,
+            sender: Address([9; 20]),
+            receiver: Some(Address([8; 20])),
+            value: 1,
+            gas_limit: 21_000,
+            max_fee_per_gas: 1,
+            max_priority_fee_per_gas: 1,
+            data: Vec::new(),
+            event: Vec::new(),
+            opt: Vec::new(),
+            state: Vec::new(),
+            expire: None,
+            timestamp: 1,
+            tx_type: TransactionType::Native,
+            access_list: Vec::new(),
+            public_key: PublicKey([4; 33]),
+            signature: [1; 64],
+            transaction_id: TransactionId::default(),
+        };
+        transaction.transaction_id = transaction.calculate_id().unwrap();
+        tx_pool_v2.add_bypass_validation(transaction);
+
+        let genesis = norn_common::genesis::GenesisConfig::from_fixed_genesis();
+        let selected = producer.select_v2_transactions(&tx_pool_v2, &genesis.resource_limits);
+        assert!(selected.is_empty());
+        assert!(tx_pool_v2.is_empty());
     }
 }

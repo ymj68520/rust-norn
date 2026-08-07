@@ -1,5 +1,5 @@
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// 交易跟踪器
@@ -26,11 +26,18 @@ pub struct TestStatistics {
     /// 实际打包的交易数
     packed_transactions: Arc<AtomicU64>,
 
-    /// 区块链实际 TPS
-    actual_tps: Arc<AtomicU64>,
+    /// 区块链实际 TPS，以毫 TPS 保存，避免丢失小数精度。
+    actual_tps_milli: Arc<AtomicU64>,
+
+    /// 首尾含交易区块之间的提交窗口，单位为毫秒。
+    blockchain_span_millis: Arc<AtomicU64>,
 
     /// 总区块数
     total_blocks: Arc<AtomicU64>,
+
+    // Submission phase only; finality-settlement polling must not dilute
+    // injection TPS.
+    submission_span_millis: Arc<AtomicU64>,
 
     /// 测试开始时间
     test_start: Option<Instant>,
@@ -48,8 +55,10 @@ impl TestStatistics {
             submitted_transactions: Arc::new(AtomicU64::new(0)),
             failed_transactions: Arc::new(AtomicU64::new(0)),
             packed_transactions: Arc::new(AtomicU64::new(0)),
-            actual_tps: Arc::new(AtomicU64::new(0)),
+            actual_tps_milli: Arc::new(AtomicU64::new(0)),
+            blockchain_span_millis: Arc::new(AtomicU64::new(0)),
             total_blocks: Arc::new(AtomicU64::new(0)),
+            submission_span_millis: Arc::new(AtomicU64::new(0)),
             test_start: Some(Instant::now()),
             _completed: Arc::new(AtomicBool::new(false)),
         }
@@ -65,11 +74,43 @@ impl TestStatistics {
         self.failed_transactions.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record the elapsed time spent submitting the measured stream before
+    /// the later canonical-settlement phase begins.
+    pub fn set_submission_duration(&self, duration: Duration) {
+        self.submission_span_millis.store(
+            duration.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Submission throughput, independent of any consensus-settlement wait.
+    pub fn submission_tps(&self) -> f64 {
+        let millis = self.submission_span_millis.load(Ordering::Relaxed);
+        if millis == 0 {
+            0.0
+        } else {
+            self.submitted() as f64 * 1_000.0 / millis as f64
+        }
+    }
+
     /// 设置区块链指标
-    pub fn set_blockchain_metrics(&self, total_tx: u64, total_blocks: u64, actual_tps: f64, _time_span: f64) {
+    pub fn set_blockchain_metrics(
+        &self,
+        total_tx: u64,
+        total_blocks: u64,
+        actual_tps: f64,
+        time_span: f64,
+    ) {
         self.packed_transactions.store(total_tx, Ordering::Relaxed);
         self.total_blocks.store(total_blocks, Ordering::Relaxed);
-        self.actual_tps.store(actual_tps as u64, Ordering::Relaxed);
+        self.actual_tps_milli.store(
+            (actual_tps.max(0.0) * 1_000.0).round() as u64,
+            Ordering::Relaxed,
+        );
+        self.blockchain_span_millis.store(
+            (time_span.max(0.0) * 1_000.0).round() as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// 获取已提交交易数
@@ -88,8 +129,13 @@ impl TestStatistics {
     }
 
     /// 获取实际 TPS
-    pub fn actual_tps(&self) -> u64 {
-        self.actual_tps.load(Ordering::Relaxed)
+    pub fn actual_tps(&self) -> f64 {
+        self.actual_tps_milli.load(Ordering::Relaxed) as f64 / 1_000.0
+    }
+
+    /// 获取首尾含交易区块的时间跨度，单位为秒。
+    pub fn blockchain_time_span(&self) -> f64 {
+        self.blockchain_span_millis.load(Ordering::Relaxed) as f64 / 1_000.0
     }
 
     /// 获取区块数
@@ -112,7 +158,7 @@ impl TestStatistics {
     /// 计算达成率（实际 TPS / 目标 TPS）
     pub fn achievement_rate(&self) -> f64 {
         if self.target_tps > 0 {
-            (self.actual_tps() as f64 / self.target_tps as f64) * 100.0
+            (self.actual_tps() / self.target_tps as f64) * 100.0
         } else {
             0.0
         }
@@ -132,7 +178,10 @@ impl TestStatistics {
 
     /// 打印统计报告
     pub fn print_report(&self) {
-        let elapsed = self.test_start.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+        let elapsed = self
+            .test_start
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
 
         println!("📊 测试配置:");
         println!("   ├─ 目标 TPS: {}", self.target_tps);
@@ -143,13 +192,13 @@ impl TestStatistics {
         println!("   ├─ 已提交: {} 笔", self.submitted());
         println!("   ├─ 失败: {} 笔", self.failed());
         println!("   ├─ 成功率: {:.2}%", self.success_rate());
-        println!("   └─ 提交速率: {:.2} TPS",
-            self.submitted() as f64 / elapsed.as_secs_f64().max(1.0));
+        println!("   └─ 提交速率: {:.2} TPS", self.submission_tps());
 
         println!("\n⛓️  区块链打包统计:");
         println!("   ├─ 打包交易: {} 笔", self.packed());
-        println!("   ├─ 产生区块: {} 个", self.total_blocks());
-        println!("   ├─ 实际 TPS: {:.2}", self.actual_tps() as f64);
+        println!("   ├─ 含交易区块: {} 个", self.total_blocks());
+        println!("   ├─ 打包窗口: {:.2} 秒", self.blockchain_time_span());
+        println!("   ├─ 实际 TPS: {:.2}", self.actual_tps());
         println!("   ├─ 达成率: {:.2}%", self.achievement_rate());
         println!("   └─ 平均每块交易: {:.2}", self.avg_tx_per_block());
 
@@ -183,7 +232,10 @@ impl TestStatistics {
 
     /// 生成 CSV 格式的报告
     pub fn to_csv(&self) -> String {
-        let elapsed = self.test_start.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+        let elapsed = self
+            .test_start
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
 
         format!(
             "{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2}\n",
@@ -197,7 +249,7 @@ impl TestStatistics {
             self.success_rate(),
             self.achievement_rate(),
             self.avg_tx_per_block(),
-            self.submitted() as f64 / elapsed.as_secs_f64().max(1.0)
+            self.submission_tps()
         )
     }
 
@@ -231,6 +283,16 @@ mod tests {
         let stats = TestStatistics::new(100, 0);
         stats.track_failed_submission();
         assert_eq!(stats.failed(), 1);
+    }
+
+    #[test]
+    fn submission_tps_excludes_finality_settlement_time() {
+        let stats = TestStatistics::new(100, 0);
+        stats.track_submission(0);
+        stats.track_submission(0);
+        stats.set_submission_duration(Duration::from_millis(500));
+
+        assert!((stats.submission_tps() - 4.0).abs() < f64::EPSILON);
     }
 
     #[test]

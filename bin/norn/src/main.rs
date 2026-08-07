@@ -16,7 +16,8 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Some(cli::Commands::GenerateKey { out }) => {
             let path = out.unwrap_or_else(|| PathBuf::from("node.key"));
-            let _ = keys::load_or_generate_keypair(&path)?;
+            let keypair = keys::load_or_generate_keypair(&path)?;
+            println!("PeerID: {}", keypair.public().to_peer_id());
             info!("Keypair generated at {:?}", path);
             return Ok(());
         }
@@ -30,6 +31,7 @@ async fn main() -> anyhow::Result<()> {
     // Load Keypair
     let key_path = PathBuf::from(&config.data_dir).join("node.key");
     let keypair = keys::load_or_generate_keypair(&key_path)?;
+    println!("Node PeerID: {}", keypair.public().to_peer_id());
 
     // Initialize Node
     let node = NornNode::new(config, keypair).await?;

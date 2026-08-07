@@ -1,0 +1,16 @@
+[package]
+name = "crypto_bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "crypto_bench"
+path = "src/main.rs"
+
+[dependencies]
+norn-common = { workspace = true }
+norn-core = { workspace = true }
+norn-crypto = { workspace = true }
+sha2 = { workspace = true }
+bincode = { workspace = true }
+anyhow = { workspace = true }

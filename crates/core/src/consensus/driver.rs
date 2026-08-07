@@ -14,7 +14,8 @@ use norn_common::consensus_types::{
     CommitCertificate, FinalizedBlockV2, Proposal, SignedVote, StakeSnapshot,
 };
 use norn_common::types::{BlockV2, Hash, StakeSnapshotHash};
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -23,6 +24,9 @@ use tracing::{error, warn};
 const HIGH_PRIORITY_BUDGET: usize = 32;
 const MAX_ACTION_RETRIES: usize = 3;
 const ACTION_RETRY_BASE: Duration = Duration::from_millis(50);
+const MAX_DEFERRED_CONSENSUS_MESSAGES: usize = 1024;
+const MAX_DEFERRED_FUTURE_HEIGHT: u64 = 1;
+const MAX_DEFERRED_FUTURE_ROUND: u32 = 64;
 
 /// An action may opt into bounded retry only when the action is idempotent
 /// (currently Commit/Vote broadcast). Unknown errors remain fatal and stop
@@ -334,6 +338,22 @@ struct DriverState {
     active_snapshot_hash: Option<StakeSnapshotHash>,
     pending: HashMap<ValidationRequestId, ConsensusContextToken>,
     pending_finality: HashMap<ValidationRequestId, PendingFinality>,
+    deferred_messages: VecDeque<DeferredConsensusMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum DeferredConsensusMessage {
+    Proposal { proposal: Proposal, block: BlockV2 },
+    Vote(SignedVote),
+}
+
+impl DeferredConsensusMessage {
+    fn slot(&self) -> (u64, u32) {
+        match self {
+            Self::Proposal { proposal, .. } => (proposal.height, proposal.round),
+            Self::Vote(vote) => (vote.height, vote.round),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -654,6 +674,99 @@ fn register_context(state: &mut DriverState, context: &ConsensusContextToken) ->
     true
 }
 
+fn proposal_validation_action(
+    state: &mut DriverState,
+    proposal: Proposal,
+    block: BlockV2,
+) -> Option<ConsensusDriverAction> {
+    let request_id = next_request_id(state);
+    let context = proposal_context(state, &proposal);
+    if !register_context(state, &context) {
+        return None;
+    }
+    state.pending.insert(request_id, context);
+    Some(ConsensusDriverAction::ValidateProposal {
+        request_id,
+        context,
+        proposal,
+        block,
+    })
+}
+
+fn vote_validation_action(
+    state: &mut DriverState,
+    vote: SignedVote,
+) -> Option<ConsensusDriverAction> {
+    let request_id = next_request_id(state);
+    let context = vote_context(state, &vote);
+    if !register_context(state, &context) {
+        return None;
+    }
+    state.pending.insert(request_id, context);
+    Some(ConsensusDriverAction::ValidateVote {
+        request_id,
+        context,
+        vote,
+    })
+}
+
+fn defer_if_bounded_future(state: &mut DriverState, message: DeferredConsensusMessage) -> bool {
+    let Some((active_height, active_round)) = state.active_height.zip(state.active_round) else {
+        return false;
+    };
+    let (height, round) = message.slot();
+    if (height, round) <= (active_height, active_round)
+        || height > active_height.saturating_add(MAX_DEFERRED_FUTURE_HEIGHT)
+        || (height == active_height
+            && round > active_round.saturating_add(MAX_DEFERRED_FUTURE_ROUND))
+        || (height > active_height && round > MAX_DEFERRED_FUTURE_ROUND)
+    {
+        return false;
+    }
+    if state
+        .deferred_messages
+        .iter()
+        .any(|queued| queued == &message)
+    {
+        return true;
+    }
+    if state.deferred_messages.len() >= MAX_DEFERRED_CONSENSUS_MESSAGES {
+        warn!(
+            height,
+            round, "dropping bounded-future consensus message because the deferred queue is full"
+        );
+        return true;
+    }
+    state.deferred_messages.push_back(message);
+    true
+}
+
+fn activate_deferred_for_current_slot(state: &mut DriverState) -> Vec<ConsensusDriverAction> {
+    let Some(active_slot) = state.active_height.zip(state.active_round) else {
+        return Vec::new();
+    };
+    let mut ready = Vec::new();
+    let mut retained = VecDeque::with_capacity(state.deferred_messages.len());
+    while let Some(message) = state.deferred_messages.pop_front() {
+        match message.slot().cmp(&active_slot) {
+            Ordering::Less => {}
+            Ordering::Equal => ready.push(message),
+            Ordering::Greater => retained.push_back(message),
+        }
+    }
+    state.deferred_messages = retained;
+
+    ready
+        .into_iter()
+        .filter_map(|message| match message {
+            DeferredConsensusMessage::Proposal { proposal, block } => {
+                proposal_validation_action(state, proposal, block)
+            }
+            DeferredConsensusMessage::Vote(vote) => vote_validation_action(state, vote),
+        })
+        .collect()
+}
+
 fn context_is_current(state: &DriverState, context: &ConsensusContextToken) -> bool {
     context.generation == state.generation
         && state.active_height == Some(context.height)
@@ -661,11 +774,18 @@ fn context_is_current(state: &DriverState, context: &ConsensusContextToken) -> b
         && state.active_snapshot_hash.map_or(true, |snapshot_hash| {
             snapshot_hash == context.stake_snapshot_hash
         })
-        && state
-            .active_parent_block_hash
-            .map_or(true, |parent_block_hash| {
-                parent_block_hash == context.parent_block_hash
-            })
+        // Votes do not carry a parent hash.  A vote may therefore enter the
+        // validation queue before the proposal for the round establishes the
+        // driver's parent context.  Such a vote is still current provided its
+        // height, round, generation, and stake snapshot are current; treating
+        // the placeholder hash as authoritative drops valid reordered votes
+        // and can prevent a 2/3 quorum.
+        && (context.parent_block_hash == Hash::default()
+            || state
+                .active_parent_block_hash
+                .map_or(true, |parent_block_hash| {
+                    parent_block_hash == context.parent_block_hash
+                }))
 }
 
 fn invalidate_after_finality(
@@ -710,33 +830,39 @@ async fn process_event(
     event: ConsensusDriverEvent,
 ) -> Result<Vec<ConsensusDriverAction>> {
     let actions = match event {
-        ConsensusDriverEvent::NetworkProposal { proposal, block }
-        | ConsensusDriverEvent::LocalProposalBuilt { proposal, block } => {
-            let request_id = next_request_id(state);
-            let context = proposal_context(state, &proposal);
-            if !register_context(state, &context) {
-                return Ok(Vec::new());
+        ConsensusDriverEvent::NetworkProposal { proposal, block } => {
+            let slot_is_current = state
+                .active_height
+                .zip(state.active_round)
+                .map_or(true, |slot| slot == (proposal.height, proposal.round));
+            if !slot_is_current {
+                defer_if_bounded_future(
+                    state,
+                    DeferredConsensusMessage::Proposal { proposal, block },
+                );
+                Vec::new()
+            } else {
+                proposal_validation_action(state, proposal, block)
+                    .into_iter()
+                    .collect()
             }
-            state.pending.insert(request_id, context);
-            vec![ConsensusDriverAction::ValidateProposal {
-                request_id,
-                context,
-                proposal,
-                block,
-            }]
+        }
+        ConsensusDriverEvent::LocalProposalBuilt { proposal, block } => {
+            proposal_validation_action(state, proposal, block)
+                .into_iter()
+                .collect()
         }
         ConsensusDriverEvent::NetworkVote(vote) => {
-            let request_id = next_request_id(state);
-            let context = vote_context(state, &vote);
-            if !register_context(state, &context) {
-                return Ok(Vec::new());
+            let slot_is_current = state
+                .active_height
+                .zip(state.active_round)
+                .map_or(true, |slot| slot == (vote.height, vote.round));
+            if !slot_is_current {
+                defer_if_bounded_future(state, DeferredConsensusMessage::Vote(vote));
+                Vec::new()
+            } else {
+                vote_validation_action(state, vote).into_iter().collect()
             }
-            state.pending.insert(request_id, context);
-            vec![ConsensusDriverAction::ValidateVote {
-                request_id,
-                context,
-                vote,
-            }]
         }
         ConsensusDriverEvent::NetworkCommit(commit) => {
             let request_id = next_request_id(state);
@@ -756,7 +882,11 @@ async fn process_event(
             height,
             round,
             deadline,
-        } => replace_timeout(state, height, round, TimeoutStep::Propose, deadline),
+        } => {
+            let mut actions = replace_timeout(state, height, round, TimeoutStep::Propose, deadline);
+            actions.extend(activate_deferred_for_current_slot(state));
+            actions
+        }
         ConsensusDriverEvent::StepStarted {
             height,
             round,
@@ -842,6 +972,20 @@ async fn process_event(
             }
             match result {
                 CommitValidationResult::Accepted => {
+                    // A commit is commonly received both from the local
+                    // certificate path and from gossip.  Only one durable
+                    // finality preparation may be in flight for a concrete
+                    // (height, round, block) tuple: concurrent duplicate
+                    // preparations can both write the checkpoint, and the
+                    // loser then mistakes the already-applied state for a
+                    // conflicting durable state and fail-stops consensus.
+                    if state.pending_finality.values().any(|pending| {
+                        pending.height == commit.height
+                            && pending.round == commit.round
+                            && pending.block_id == commit.block_id
+                    }) {
+                        return Ok(Vec::new());
+                    }
                     state.pending_finality.insert(
                         request_id,
                         PendingFinality {
@@ -901,10 +1045,18 @@ async fn process_event(
                 }
                 FinalityPreparationResult::AlreadyDurable(commit) => {
                     let mut actions = invalidate_after_finality(state, commit.height);
+                    actions.extend(activate_deferred_for_current_slot(state));
                     actions.push(ConsensusDriverAction::BroadcastCommit(commit));
                     actions
                 }
-                FinalityPreparationResult::Rejected(_) => {
+                FinalityPreparationResult::Rejected(reason) => {
+                    warn!(
+                        height = pending.height,
+                        round = pending.round,
+                        block_id = ?pending.block_id,
+                        "finality preparation rejected: {}",
+                        reason
+                    );
                     vec![ConsensusDriverAction::UnpinPendingFinality {
                         height: pending.height,
                         round: pending.round,
@@ -920,10 +1072,11 @@ async fn process_event(
         ConsensusDriverEvent::FinalityPersisted(commit)
         | ConsensusDriverEvent::FinalityDurable(commit) => {
             let mut actions = invalidate_after_finality(state, commit.height);
-            actions.reserve(2);
+            actions.reserve(2 + state.deferred_messages.len());
             if let Some(previous) = state.active_timeout.take() {
                 actions.push(ConsensusDriverAction::CancelTimeout(previous));
             }
+            actions.extend(activate_deferred_for_current_slot(state));
             actions.push(ConsensusDriverAction::BroadcastCommit(commit));
             actions
         }
@@ -1176,6 +1329,175 @@ mod tests {
         .await
         .unwrap();
         assert!(stale_parent.is_empty());
+    }
+
+    #[tokio::test]
+    async fn vote_received_before_proposal_is_not_discarded_when_parent_is_learned() {
+        let mut state = DriverState::default();
+        let incoming_vote = vote(1, 2);
+        let vote_actions = process_event(
+            &mut state,
+            ConsensusDriverEvent::NetworkVote(incoming_vote.clone()),
+        )
+        .await
+        .unwrap();
+        let (vote_request_id, vote_context) = match &vote_actions[0] {
+            ConsensusDriverAction::ValidateVote {
+                request_id,
+                context,
+                ..
+            } => (*request_id, *context),
+            other => panic!("unexpected action: {other:?}"),
+        };
+        assert_eq!(vote_context.parent_block_hash, Hash::default());
+
+        let round_proposal = proposal(1, 0, 1);
+        let proposal_actions = process_event(
+            &mut state,
+            ConsensusDriverEvent::NetworkProposal {
+                proposal: round_proposal.clone(),
+                block: BlockV2::default(),
+            },
+        )
+        .await
+        .unwrap();
+        let (proposal_request_id, proposal_context) = match &proposal_actions[0] {
+            ConsensusDriverAction::ValidateProposal {
+                request_id,
+                context,
+                ..
+            } => (*request_id, *context),
+            other => panic!("unexpected action: {other:?}"),
+        };
+        assert_ne!(proposal_context.parent_block_hash, Hash::default());
+
+        let proposal_completion = process_event(
+            &mut state,
+            ConsensusDriverEvent::ProposalValidationCompleted {
+                request_id: proposal_request_id,
+                context: proposal_context,
+                result: ProposalValidationResult::Accepted(ValidatedCandidate {
+                    proposal: round_proposal,
+                    block: BlockV2::default(),
+                    derived_randomness: Hash([4; 32]),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            proposal_completion.as_slice(),
+            [ConsensusDriverAction::ApplyValidatedProposal { .. }]
+        ));
+
+        let vote_completion = process_event(
+            &mut state,
+            ConsensusDriverEvent::VoteValidationCompleted {
+                request_id: vote_request_id,
+                context: vote_context,
+                vote: incoming_vote,
+                result: VoteValidationResult::Accepted,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            vote_completion.as_slice(),
+            [ConsensusDriverAction::ApplyValidatedVote { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn next_height_proposal_and_vote_are_replayed_after_finality_activation() {
+        let driver = ConsensusDriver::start(8).unwrap();
+        driver
+            .dispatch(ConsensusDriverEvent::RoundStarted {
+                height: 1,
+                round: 0,
+                deadline: tokio::time::Instant::now(),
+            })
+            .await
+            .unwrap();
+
+        let next_proposal = proposal(2, 0, 2);
+        let next_vote = vote(2, 2);
+        assert!(driver
+            .dispatch(ConsensusDriverEvent::NetworkProposal {
+                proposal: next_proposal,
+                block: BlockV2::default(),
+            })
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(driver
+            .dispatch(ConsensusDriverEvent::NetworkVote(next_vote))
+            .await
+            .unwrap()
+            .is_empty());
+
+        let actions = driver
+            .dispatch(ConsensusDriverEvent::FinalityPersisted(commit(1, 0, 1)))
+            .await
+            .unwrap();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            ConsensusDriverAction::ValidateProposal { context, .. }
+                if (context.height, context.round) == (2, 0)
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            ConsensusDriverAction::ValidateVote { context, .. }
+                if (context.height, context.round) == (2, 0)
+        )));
+    }
+
+    #[tokio::test]
+    async fn future_round_proposal_and_vote_are_replayed_when_round_starts() {
+        let driver = ConsensusDriver::start(8).unwrap();
+        driver
+            .dispatch(ConsensusDriverEvent::RoundStarted {
+                height: 1,
+                round: 0,
+                deadline: tokio::time::Instant::now(),
+            })
+            .await
+            .unwrap();
+
+        let next_proposal = proposal(1, 1, 2);
+        let mut next_vote = vote(1, 2);
+        next_vote.round = 1;
+        assert!(driver
+            .dispatch(ConsensusDriverEvent::NetworkProposal {
+                proposal: next_proposal,
+                block: BlockV2::default(),
+            })
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(driver
+            .dispatch(ConsensusDriverEvent::NetworkVote(next_vote))
+            .await
+            .unwrap()
+            .is_empty());
+
+        let actions = driver
+            .dispatch(ConsensusDriverEvent::RoundStarted {
+                height: 1,
+                round: 1,
+                deadline: tokio::time::Instant::now(),
+            })
+            .await
+            .unwrap();
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            ConsensusDriverAction::ValidateProposal { context, .. }
+                if (context.height, context.round) == (1, 1)
+        )));
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            ConsensusDriverAction::ValidateVote { context, .. }
+                if (context.height, context.round) == (1, 1)
+        )));
     }
 
     #[tokio::test]

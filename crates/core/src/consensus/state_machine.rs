@@ -1504,10 +1504,21 @@ impl TendermintStateMachine {
         state_after: Option<DurableConsensusSafetyState>,
     ) -> Result<SignedVote> {
         let intent = self.build_vote_intent(step, block_id)?;
+        let persistence_started = std::time::Instant::now();
         let signed_vote = self
             .safety_store
             .sign_vote_once_with_state(intent.request.clone(), signer, state_after)
             .map_err(|e| anyhow!("Safety store signing error: {:?}", e))?;
+        let persistence_elapsed_ms = persistence_started.elapsed().as_millis();
+        if persistence_elapsed_ms >= 100 {
+            info!(
+                height = intent.request.height,
+                round = intent.request.round,
+                ?step,
+                persistence_elapsed_ms,
+                "Durable consensus vote persistence was slow"
+            );
+        }
         let event = ConsensusEvent::VotePersisted(signed_vote);
         self.apply_consensus_event(&intent, event)
     }
@@ -1755,7 +1766,7 @@ fn validate_v2_proposal_builder_relation(
             if valid_round < proposal.round
                 && certificate.round == valid_round
                 && certificate.block_id == proposal.block_id
-                && block_header.round == valid_round => {}
+                && block_header.round <= valid_round => {}
         (None, Some(_)) => {
             return Err(anyhow!(
                 "fresh V2 proposal cannot carry a valid-round certificate"

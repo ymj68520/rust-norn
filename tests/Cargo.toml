@@ -6,6 +6,7 @@ members = [
     "integration",
     "unit",
     "performance/tps_test",
+    "performance/crypto_bench",
     "performance/scalability_test",
 ]
 
@@ -37,6 +38,8 @@ chrono = "0.4"
 tempfile = "3.8"
 hex = "0.4"
 rand = "0.8"
+sha2 = "0.10"
+bincode = "1.3"
 tonic = { version = "0.11" }
 prost = { version = "0.12" }
 tonic-build = { version = "0.11" }

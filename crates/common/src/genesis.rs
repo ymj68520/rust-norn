@@ -60,7 +60,9 @@ impl Default for ProtocolResourceLimits {
         Self {
             max_block_bytes: 8 * 1024 * 1024,
             max_transactions_per_block: 10_000,
-            max_block_gas: 10_000_000,
+            // 10M gas limited a block to 476 native transfers. This permits
+            // the 10k transaction protocol maximum plus mixed EVM traffic.
+            max_block_gas: 250_000_000,
             max_transaction_bytes: 256 * 1024,
             max_transaction_gas: 10_000_000,
             max_overlay_writes: 100_000,

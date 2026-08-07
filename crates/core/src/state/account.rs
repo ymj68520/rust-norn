@@ -7,7 +7,7 @@ use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, warn};
 
 /// 账户状态
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -554,6 +554,13 @@ impl AccountStateManager {
         Ok(())
     }
 
+    /// Record a state root that has already been recomputed and verified by
+    /// the canonical V2 finality path.  This avoids hashing the complete state
+    /// yet again after applying a deterministic finalized write set.
+    pub async fn set_verified_state_root(&self, state_root: Hash) {
+        *self.state_root.write().await = state_root;
+    }
+
     /// 创建状态快照
     pub async fn create_snapshot(&self, snapshot_id: u64) -> Result<StateSnapshot> {
         debug!("Creating state snapshot: {}", snapshot_id);
@@ -694,14 +701,14 @@ impl AccountStateManager {
         // 发送到tracing系统作为日志
         match &change {
             StateChange::AccountCreated { address, .. } => {
-                info!("Account created: {:?}", hex::encode(address));
+                debug!("Account created: {:?}", hex::encode(address));
             }
             StateChange::AccountUpdated {
                 address,
                 old_account,
                 new_account,
             } => {
-                info!(
+                debug!(
                     "Account updated: {:?}, old_nonce={}, new_nonce={}",
                     hex::encode(address),
                     old_account.nonce,
@@ -712,7 +719,7 @@ impl AccountStateManager {
                 address,
                 old_account,
             } => {
-                info!("Account deleted: {:?}", hex::encode(address));
+                debug!("Account deleted: {:?}", hex::encode(address));
                 let _ = old_account;
             }
             StateChange::BalanceChanged {
@@ -720,7 +727,7 @@ impl AccountStateManager {
                 old_balance,
                 new_balance,
             } => {
-                info!(
+                debug!(
                     "Balance changed: {:?}, {} -> {}",
                     hex::encode(address),
                     old_balance,
@@ -728,14 +735,14 @@ impl AccountStateManager {
                 );
             }
             StateChange::StorageSet { address, key, .. } => {
-                info!(
+                debug!(
                     "Storage set: {:?}, key={}",
                     hex::encode(address),
                     hex::encode(key)
                 );
             }
             StateChange::StorageDeleted { address, key, .. } => {
-                info!(
+                debug!(
                     "Storage deleted: {:?}, key={}",
                     hex::encode(address),
                     hex::encode(key)

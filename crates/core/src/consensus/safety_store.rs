@@ -2,7 +2,7 @@
 //!
 //! Ensures that before broadcasting any Prevote or Precommit vote, the vote
 //! is atomically checked for double-signing conflicts, committed to disk
-//! with `sync_all()` and `flush()`, and signed fail-closed.
+//! with an explicit data sync and flush, and signed fail-closed.
 
 use super::types::ConsensusStep;
 use anyhow::Result;
@@ -327,7 +327,8 @@ impl ConsensusSafetyStore for MemorySafetyStore {
     }
 }
 
-/// Disk-backed Persistent ConsensusSafetyStore with mandatory `sync_all()` for crash resilience
+/// Disk-backed Persistent ConsensusSafetyStore with mandatory durable data sync
+/// for crash resilience.
 pub struct PersistentSafetyStore {
     #[allow(dead_code)]
     file_path: PathBuf,
@@ -601,19 +602,30 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
         writer
             .write_all(&encoded)
             .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
-        writer
-            .flush()
-            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
-
         map.insert(key, record);
 
-        let signature = signer
-            .sign_canonical_bytes(&sign_bytes)
-            .map_err(|e| SafetyError::SigningError(e.to_string()))?;
+        // The vote cannot escape this method before the completion frame is
+        // durable. On the successful path, therefore, the intent and its
+        // completion can share one fsync without weakening write-ahead-before-
+        // broadcast safety. The previous two-fsync sequence added roughly a
+        // second to every Prevote and Precommit on Raspberry Pi SD cards.
+        // If signing fails, persist the intent by itself: an external signer
+        // may have consumed the request even though it returned an error, so
+        // a conflicting retry must still fail closed.
+        let signature = match signer.sign_canonical_bytes(&sign_bytes) {
+            Ok(signature) => signature,
+            Err(error) => {
+                writer
+                    .flush()
+                    // `sync_data` has the same durability guarantee for the
+                    // bytes (and file-size metadata needed to retrieve them)
+                    // without forcing unrelated inode metadata. On ext4 SD
+                    // cards, `sync_all` regularly delayed a vote by seconds.
+                    .and_then(|_| writer.get_ref().sync_data())
+                    .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
+                return Err(SafetyError::SigningError(error.to_string()));
+            }
+        };
 
         let signed_vote = SignedVote {
             signature,
@@ -641,7 +653,7 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
             .write_all(&completion_len.to_le_bytes())
             .and_then(|_| writer.write_all(&completion_encoded))
             .and_then(|_| writer.flush())
-            .and_then(|_| writer.get_ref().sync_all())
+            .and_then(|_| writer.get_ref().sync_data())
             .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
         map.insert(key, completion);
 
@@ -687,7 +699,7 @@ impl ConsensusSafetyStore for PersistentSafetyStore {
         file.write_all(&len.to_le_bytes())
             .and_then(|_| file.write_all(&encoded))
             .and_then(|_| file.flush())
-            .and_then(|_| file.sync_all())
+            .and_then(|_| file.sync_data())
             .map_err(|e| SafetyError::StorageIoError(e.to_string()))?;
         *state_guard = (Some(state.clone()), state.sequence);
         Ok(())
